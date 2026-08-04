@@ -2,20 +2,13 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-if __package__:
-    from .dataset_reader import EpisodeMeta, read_episode_metadata
-    from .frame_sampler import sample_episode_frames
-    from .result_writer import ensure_output_dirs, save_episode_result, write_summary
-    from .review_policy import ReviewConfig, apply_review_policy
-    from .vlm_client import LocalVLMClient, fallback_result
-else:
-    from dataset_reader import EpisodeMeta, read_episode_metadata
-    from frame_sampler import sample_episode_frames
-    from result_writer import ensure_output_dirs, save_episode_result, write_summary
-    from review_policy import ReviewConfig, apply_review_policy
-    from vlm_client import LocalVLMClient, fallback_result
+if TYPE_CHECKING:
+    if __package__:
+        from .dataset_reader import EpisodeMeta
+    else:
+        from dataset_reader import EpisodeMeta
 
 
 def parse_args() -> argparse.Namespace:
@@ -99,6 +92,19 @@ def merge_result(episode: EpisodeMeta, vlm_result: dict[str, Any]) -> dict[str, 
 
 def main() -> int:
     args = parse_args()
+    if __package__:
+        from .dataset_reader import read_episode_metadata
+        from .frame_sampler import sample_episode_frames
+        from .result_writer import ensure_output_dirs, save_episode_result, write_summary
+        from .review_policy import ReviewConfig, apply_review_policy
+        from .vlm_client import LocalVLMClient, fallback_result
+    else:
+        from dataset_reader import read_episode_metadata
+        from frame_sampler import sample_episode_frames
+        from result_writer import ensure_output_dirs, save_episode_result, write_summary
+        from review_policy import ReviewConfig, apply_review_policy
+        from vlm_client import LocalVLMClient, fallback_result
+
     output_dir = args.output_dir.expanduser()
     episode_dir, frame_root = ensure_output_dirs(output_dir)
     review_config = ReviewConfig(

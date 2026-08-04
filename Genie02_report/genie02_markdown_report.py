@@ -3,20 +3,33 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Sequence
+from collections.abc import Sequence
 from datetime import date
+from pathlib import Path
+from typing import Any
 
-from genie02_eval_common import (
-    EvaluationError,
-    load_episode_metrics,
-    load_episodes,
-    load_metrics_core,
-    load_session,
-    parse_session_args,
-    prepare_output_dir,
-    require_session_dir,
-)
+if __package__:
+    from .genie02_eval_common import (
+        EvaluationError,
+        load_episode_metrics,
+        load_episodes,
+        load_metrics_core,
+        load_session,
+        parse_session_args,
+        prepare_output_dir,
+        require_session_dir,
+    )
+else:
+    from genie02_eval_common import (
+        EvaluationError,
+        load_episode_metrics,
+        load_episodes,
+        load_metrics_core,
+        load_session,
+        parse_session_args,
+        prepare_output_dir,
+        require_session_dir,
+    )
 
 
 SMOOTHNESS_CHART = "smoothness_curve.svg"
@@ -152,7 +165,7 @@ def build_report(
     right_smoothness = smoothness["right"]
     mean_smoothness = _mean_number(row["smoothness"] for row in episode_metrics)
     lines = [
-        f"# 真机评测报告",
+        "# 真机评测报告",
         "",
         "## 1. 评测配置",
         "",
@@ -167,7 +180,7 @@ def build_report(
         "- 评测公式：<br>"
         "&emsp;&emsp;1. GSR = 成功 Episode 数 / Episode 总数<br>"
         "&emsp;&emsp;2. TTS = 成功 Episode 的 duration_s 均值<br>"
-        "&emsp;&emsp;3. 报告平滑度 $S=log10(E+1)$，原始平滑度 $E=Σ||j_k||² \cdot Δt$，其中 $j_k≈(x_k-3x_{k-1}+3x_{k-2}-x_{k-3})/(Δt)^3$ <br>"
+        "&emsp;&emsp;3. 报告平滑度 $S=log10(E+1)$，原始平滑度 $E=Σ||j_k||² \\cdot Δt$，其中 $j_k≈(x_k-3x_{k-1}+3x_{k-2}-x_{k-3})/(Δt)^3$ <br>"
         "&emsp;&emsp;&emsp;参数：$S$ 为报告展示的平滑度，$E$ 为平滑度原始量，$k$ 为帧索引，$j_k$ 为第 k 帧 jerk，$x_k$ 为第 k 帧末端 xyz 位置向量，$Δt$ 为相邻轨迹帧时间间隔；综合与左右臂分别计算，越小越平滑",
         "",
         "## 2. 核心指标",
