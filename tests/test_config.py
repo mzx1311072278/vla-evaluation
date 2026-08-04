@@ -25,7 +25,7 @@ def _valid_config(tmp_path: Path) -> dict[str, Any]:
 
 def _write_config(tmp_path: Path, raw: Any) -> Path:
     path = tmp_path / "app.yaml"
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     return path
 
 
@@ -155,6 +155,24 @@ def test_load_config_rejects_invalid_remote_source_name(tmp_path: Path, source_n
         load_config(_write_config(tmp_path, raw))
 
 
+def test_load_config_rejects_whitespace_around_remote_source_name(tmp_path: Path):
+    raw = _valid_config(tmp_path)
+    source = raw["remote_sources"].pop("lab-a")
+    raw["remote_sources"][" lab "] = source
+
+    with pytest.raises(ValueError, match="leading or trailing whitespace"):
+        load_config(_write_config(tmp_path, raw))
+
+
+def test_load_config_rejects_normalized_remote_source_name_collision(tmp_path: Path):
+    raw = _valid_config(tmp_path)
+    source = raw["remote_sources"].pop("lab-a")
+    raw["remote_sources"] = {"lab": source, " lab ": source.copy()}
+
+    with pytest.raises(ValueError, match="collision"):
+        load_config(_write_config(tmp_path, raw))
+
+
 def test_load_config_rejects_non_mapping_remote_source(tmp_path: Path):
     raw = _valid_config(tmp_path)
     raw["remote_sources"]["lab-a"] = "not-a-mapping"
@@ -209,6 +227,29 @@ def test_load_config_rejects_invalid_remote_source_roots(tmp_path: Path, roots: 
         load_config(_write_config(tmp_path, raw))
 
 
+@pytest.mark.parametrize(
+    "root",
+    [
+        "data/rollouts",
+        "/data/../secret",
+        "/data/\nrollouts",
+        "/data/\x7frollouts",
+        "/data/\x85rollouts",
+        "/data//rollouts",
+        "/data/./rollouts",
+        "/data/rollouts/",
+        "//data/rollouts",
+        "/data/rollouts ",
+    ],
+)
+def test_load_config_rejects_unsafe_or_non_normalized_remote_root(tmp_path: Path, root: str):
+    raw = _valid_config(tmp_path)
+    raw["remote_sources"]["lab-a"]["roots"] = [root]
+
+    with pytest.raises(ValueError, match="roots"):
+        load_config(_write_config(tmp_path, raw))
+
+
 def test_load_config_uses_url_defaults_for_null_values(tmp_path: Path):
     raw = _valid_config(tmp_path)
     raw.update(database_url=None, redis_url=None)
@@ -226,6 +267,16 @@ def test_load_config_rejects_non_string_url(tmp_path: Path, field_name: str, val
     raw[field_name] = value
 
     with pytest.raises(TypeError, match=field_name):
+        load_config(_write_config(tmp_path, raw))
+
+
+@pytest.mark.parametrize("field_name", ["database_url", "redis_url"])
+@pytest.mark.parametrize("value", ["", " \t "])
+def test_load_config_rejects_blank_url(tmp_path: Path, field_name: str, value: str):
+    raw = _valid_config(tmp_path)
+    raw[field_name] = value
+
+    with pytest.raises(ValueError, match=field_name):
         load_config(_write_config(tmp_path, raw))
 
 

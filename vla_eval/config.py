@@ -1,7 +1,8 @@
 import os
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any
 
@@ -46,7 +47,26 @@ def _optional_string(raw: Mapping[str, Any], field_name: str, default: str) -> s
         return default
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be a string or null")
+    if not value.strip():
+        raise ValueError(f"{field_name} must not be blank")
     return value
+
+
+def _remote_root(value: Any, field_name: str) -> str:
+    root = _nonempty_string(value, field_name)
+    if root != value:
+        raise ValueError(f"{field_name} must not have leading or trailing whitespace")
+    if any(unicodedata.category(character) == "Cc" for character in root):
+        raise ValueError(f"{field_name} must not contain control characters")
+
+    path = PurePosixPath(root)
+    if not path.is_absolute() or root.startswith("//"):
+        raise ValueError(f"{field_name} must be an absolute POSIX path")
+    if ".." in path.parts:
+        raise ValueError(f"{field_name} must not contain '..' components")
+    if str(path) != root:
+        raise ValueError(f"{field_name} must be a normalized POSIX path")
+    return root
 
 
 def _load_remote_sources(value: Any) -> dict[str, RemoteSource]:
@@ -58,6 +78,10 @@ def _load_remote_sources(value: Any) -> dict[str, RemoteSource]:
     sources: dict[str, RemoteSource] = {}
     for name, item in value.items():
         source_name = _nonempty_string(name, "remote source name")
+        if source_name in sources:
+            raise ValueError(f"remote source name collision after normalization: {source_name!r}")
+        if source_name != name:
+            raise ValueError("remote source name must not have leading or trailing whitespace")
         field_prefix = f"remote_sources.{source_name}"
         if not isinstance(item, Mapping):
             raise TypeError(f"{field_prefix} must be a mapping")
@@ -69,7 +93,7 @@ def _load_remote_sources(value: Any) -> dict[str, RemoteSource]:
         roots = item.get("roots")
         if not isinstance(roots, list) or not roots:
             raise ValueError(f"{field_prefix}.roots must be a nonempty list of strings")
-        normalized_roots = tuple(_nonempty_string(root, f"{field_prefix}.roots") for root in roots)
+        normalized_roots = tuple(_remote_root(root, f"{field_prefix}.roots") for root in roots)
 
         sources[source_name] = RemoteSource(
             name=source_name,
