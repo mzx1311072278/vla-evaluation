@@ -2,7 +2,8 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import TypeDecorator
 
@@ -61,9 +62,11 @@ class Dataset(PersistedModel, Base):
     kind: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(32))
     fingerprint: Mapped[str | None] = mapped_column(String(64), default=None)
-    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     episode_count: Mapped[int] = mapped_column(Integer, default=0)
-    inspection_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    inspection_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON), default=dict
+    )
 
     evaluation_jobs: Mapped[list["EvaluationJob"]] = relationship(back_populates="dataset")
 
@@ -83,7 +86,7 @@ class ImportJob(PersistedModel, Base):
 class EvaluationJob(PersistedModel, Base):
     __tablename__ = "evaluation_jobs"
 
-    dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id"))
+    dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id"), index=True)
     profile_name: Mapped[str] = mapped_column(String(255))
     profile_version: Mapped[str] = mapped_column(String(64), default="unknown")
     vlm_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -94,8 +97,10 @@ class EvaluationJob(PersistedModel, Base):
     output_dir: Mapped[str | None] = mapped_column(Text, default=None)
     error_code: Mapped[str | None] = mapped_column(String(64), default=None)
     error_message: Mapped[str | None] = mapped_column(Text, default=None)
-    params_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    provenance_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    params_json: Mapped[dict[str, Any]] = mapped_column(MutableDict.as_mutable(JSON), default=dict)
+    provenance_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON), default=dict
+    )
     created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), default=None)
     cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
 

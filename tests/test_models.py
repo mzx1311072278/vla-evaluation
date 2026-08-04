@@ -1,9 +1,11 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from uuid import UUID
 
 import pytest
-from sqlalchemy import JSON, inspect, select
+from sqlalchemy import JSON, BigInteger, inspect, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import selectinload
 
 import vla_eval.db as db_module
 from vla_eval.db import create_engine_for_url, init_db, session_scope
@@ -84,6 +86,114 @@ def test_json_fields_use_sqlalchemy_json_columns():
     assert isinstance(evaluation_columns.provenance_json.type, JSON)
 
 
+def test_dataset_size_uses_big_integer_and_persists_large_values(tmp_path):
+    engine = create_engine_for_url(f"sqlite:///{tmp_path / 'app.db'}")
+    init_db(engine)
+    large_size = 2**40
+
+    assert isinstance(inspect(Dataset).columns.size_bytes.type, BigInteger)
+
+    with session_scope(engine) as session:
+        session.add(
+            Dataset(
+                name="large-run",
+                path="/data/large-run",
+                kind="lerobot",
+                status="READY",
+                size_bytes=large_size,
+            )
+        )
+
+    with session_scope(engine) as session:
+        assert session.scalar(select(Dataset.size_bytes)) == large_size
+
+
+def test_json_in_place_updates_are_persisted(tmp_path):
+    engine = create_engine_for_url(f"sqlite:///{tmp_path / 'app.db'}")
+    init_db(engine)
+
+    with session_scope(engine) as session:
+        dataset = Dataset(name="run-1", path="/data/run-1", kind="lerobot", status="READY")
+        session.add(dataset)
+        session.flush()
+        job = EvaluationJob(dataset_id=dataset.id, profile_name="genie02-full")
+        session.add(job)
+        session.flush()
+        dataset_id = dataset.id
+        job_id = job.id
+
+    with session_scope(engine) as session:
+        dataset = session.get_one(Dataset, dataset_id)
+        job = session.get_one(EvaluationJob, job_id)
+        dataset.inspection_json["checked"] = True
+        job.params_json["temperature"] = 0.2
+        job.provenance_json["git_sha"] = "abc123"
+
+    with session_scope(engine) as session:
+        dataset = session.get_one(Dataset, dataset_id)
+        job = session.get_one(EvaluationJob, job_id)
+        assert dataset.inspection_json == {"checked": True}
+        assert job.params_json == {"temperature": 0.2}
+        assert job.provenance_json == {"git_sha": "abc123"}
+
+
+def test_evaluation_job_dataset_id_is_indexed():
+    indexes = inspect(EvaluationJob).local_table.indexes
+
+    assert any(tuple(index.columns.keys()) == ("dataset_id",) for index in indexes)
+
+
+@pytest.mark.parametrize("url", ["sqlite://", "sqlite+pysqlite:///:memory:"])
+def test_in_memory_sqlite_schema_and_data_are_visible_across_threads(url):
+    engine = create_engine_for_url(url)
+    init_db(engine)
+
+    with session_scope(engine) as session:
+        session.add(User(username="shared", password_hash="hash"))
+
+    def read_username() -> str | None:
+        with session_scope(engine) as session:
+            return session.scalar(select(User.username))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        assert executor.submit(read_username).result() == "shared"
+
+
+def test_session_scope_keeps_new_model_scalars_available_after_commit(tmp_path):
+    engine = create_engine_for_url(f"sqlite:///{tmp_path / 'app.db'}")
+    init_db(engine)
+
+    with session_scope(engine) as session:
+        dataset = Dataset(name="run-1", path="/data/run-1", kind="lerobot", status="READY")
+        session.add(dataset)
+        session.flush()
+        job = EvaluationJob(dataset_id=dataset.id, profile_name="genie02-full")
+        session.add(job)
+
+    assert str(UUID(dataset.id)) == dataset.id
+    assert job.state == "QUEUED"
+
+
+def test_session_scope_keeps_explicitly_loaded_data_available_after_commit(tmp_path):
+    engine = create_engine_for_url(f"sqlite:///{tmp_path / 'app.db'}")
+    init_db(engine)
+
+    with session_scope(engine) as session:
+        dataset = Dataset(name="run-1", path="/data/run-1", kind="lerobot", status="READY")
+        session.add(dataset)
+        session.flush()
+        session.add(EvaluationJob(dataset_id=dataset.id, profile_name="genie02-full"))
+
+    with session_scope(engine) as session:
+        job = session.scalar(
+            select(EvaluationJob).options(selectinload(EvaluationJob.dataset))
+        )
+        assert job is not None
+
+    assert job.state == "QUEUED"
+    assert job.dataset.name == "run-1"
+
+
 def test_sqlite_enables_wal_and_foreign_keys(tmp_path):
     engine = create_engine_for_url(f"sqlite:///{tmp_path / 'app.db'}")
     init_db(engine)
@@ -122,4 +232,5 @@ def test_non_sqlite_engine_does_not_receive_sqlite_connect_args(monkeypatch):
     engine = create_engine_for_url("postgresql://db.example/vla_eval")
 
     assert engine is not None
-    assert received == {"url": "postgresql://db.example/vla_eval"}
+    assert str(received.pop("url")) == "postgresql://db.example/vla_eval"
+    assert received == {}
