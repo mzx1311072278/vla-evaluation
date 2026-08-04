@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vla-eval"
+version = "0.1.0"
+description = "Single-server VLA evaluation web application"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "fastapi>=0.116,<1",
+  "uvicorn[standard]>=0.35,<1",
+  "jinja2>=3.1,<4",
+  "python-multipart>=0.0.20,<1",
+  "sqlalchemy>=2.0,<3",
+  "pydantic-settings>=2.10,<3",
+  "pyyaml>=6.0,<7",
+  "redis>=6.2,<7",
+  "rq>=2.5,<3",
+  "pwdlib[argon2]>=0.2,<1",
+  "itsdangerous>=2.2,<3",
+  "paramiko>=4,<5",
+  "typer>=0.16,<1",
+  "numpy==2.3.5",
+  "pandas==2.3.3",
+  "pyarrow==21.0.0",
+]
+
+[project.optional-dependencies]
+gpu = [
+  "torch",
+  "transformers",
+  "accelerate",
+  "qwen-vl-utils",
+  "opencv-python-headless",
+  "pillow",
+  "av",
+]
+dev = [
+  "pytest>=8,<9",
+  "pytest-cov>=6,<7",
+  "httpx>=0.28,<1",
+  "ruff>=0.12,<1",
+  "playwright>=1.54,<2",
+  "fakeredis>=2.30,<3",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["vla_eval", "Genie02_report"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100

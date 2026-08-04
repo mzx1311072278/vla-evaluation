@@ -1,0 +1,8 @@
+transformers
+accelerate
+qwen-vl-utils
+opencv-python
+pandas
+pyarrow
+pillow
+tqdm
