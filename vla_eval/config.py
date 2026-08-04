@@ -1,6 +1,8 @@
 import os
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import yaml
@@ -25,44 +27,103 @@ class AppConfig:
     data_root: Path
     database_url: str
     redis_url: str
-    session_secret: str
-    remote_sources: dict[str, RemoteSource]
+    session_secret: str = field(repr=False)
+    remote_sources: Mapping[str, RemoteSource]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "remote_sources", MappingProxyType(dict(self.remote_sources)))
+
+
+def _nonempty_string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a nonempty string")
+    return value.strip()
+
+
+def _optional_string(raw: Mapping[str, Any], field_name: str, default: str) -> str:
+    value = raw.get(field_name)
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be a string or null")
+    return value
+
+
+def _load_remote_sources(value: Any) -> dict[str, RemoteSource]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise TypeError("remote_sources must be a mapping")
+
+    sources: dict[str, RemoteSource] = {}
+    for name, item in value.items():
+        source_name = _nonempty_string(name, "remote source name")
+        field_prefix = f"remote_sources.{source_name}"
+        if not isinstance(item, Mapping):
+            raise TypeError(f"{field_prefix} must be a mapping")
+
+        port = item.get("port", 22)
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValueError(f"{field_prefix}.port must be an integer from 1 to 65535")
+
+        roots = item.get("roots")
+        if not isinstance(roots, list) or not roots:
+            raise ValueError(f"{field_prefix}.roots must be a nonempty list of strings")
+        normalized_roots = tuple(_nonempty_string(root, f"{field_prefix}.roots") for root in roots)
+
+        sources[source_name] = RemoteSource(
+            name=source_name,
+            host=_nonempty_string(item.get("host"), f"{field_prefix}.host"),
+            port=port,
+            username=_nonempty_string(item.get("username"), f"{field_prefix}.username"),
+            key_path=Path(_nonempty_string(item.get("key_path"), f"{field_prefix}.key_path")),
+            known_hosts_path=Path(
+                _nonempty_string(item.get("known_hosts_path"), f"{field_prefix}.known_hosts_path")
+            ),
+            roots=normalized_roots,
+        )
+    return sources
 
 
 def load_config(path: Path) -> AppConfig:
-    raw: dict[str, Any] = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    data_root = Path(raw["data_root"]).expanduser().resolve()
-    configured_secret = str(raw.get("session_secret") or "")
+    loaded: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if loaded is None:
+        raw: Mapping[str, Any] = {}
+    elif isinstance(loaded, Mapping):
+        raw = loaded
+    else:
+        raise ValueError("configuration must be a top-level mapping")
+
+    data_root = Path(_nonempty_string(raw.get("data_root"), "data_root")).expanduser().resolve()
+    secret_value = raw.get("session_secret")
+    if secret_value is None:
+        configured_secret = ""
+    elif isinstance(secret_value, str):
+        configured_secret = secret_value.strip()
+    else:
+        raise ValueError("session_secret must be a string or null")
     environment_secret = os.environ.get(SESSION_SECRET_ENV_VAR, "")
     if environment_secret and configured_secret in ("", SESSION_SECRET_PLACEHOLDER):
         configured_secret = environment_secret
-    sources = {
-        name: RemoteSource(
-            name=name,
-            host=str(item["host"]),
-            port=int(item.get("port", 22)),
-            username=str(item["username"]),
-            key_path=Path(item["key_path"]),
-            known_hosts_path=Path(item["known_hosts_path"]),
-            roots=tuple(str(value) for value in item["roots"]),
-        )
-        for name, item in (raw.get("remote_sources") or {}).items()
-    }
+    default_database_url = f"sqlite:///{data_root / 'db/app.sqlite3'}"
     return AppConfig(
         data_root=data_root,
-        database_url=str(raw.get("database_url", f"sqlite:///{data_root / 'db/app.sqlite3'}")),
-        redis_url=str(raw.get("redis_url", "redis://redis:6379/0")),
+        database_url=_optional_string(raw, "database_url", default_database_url),
+        redis_url=_optional_string(raw, "redis_url", "redis://redis:6379/0"),
         session_secret=configured_secret,
-        remote_sources=sources,
+        remote_sources=_load_remote_sources(raw.get("remote_sources")),
     )
 
 
 def require_session_secret(config: AppConfig) -> None:
-    if not config.session_secret.strip() or config.session_secret == SESSION_SECRET_PLACEHOLDER:
+    normalized_secret = config.session_secret.strip()
+    if not normalized_secret or normalized_secret == SESSION_SECRET_PLACEHOLDER:
         raise ValueError("session_secret must be set before server startup")
 
 
 def resolve_local_dataset_path(root: Path, relative: str) -> Path:
+    if Path(relative).is_absolute():
+        raise ValueError("path must be relative to allowed root")
     candidate = (root / relative).resolve()
     allowed = root.resolve()
     if candidate != allowed and allowed not in candidate.parents:
