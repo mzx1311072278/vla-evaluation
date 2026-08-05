@@ -226,6 +226,81 @@ def test_atomic_summary_write_preserves_previous_files_on_write_failure(
     assert list(output_dir.glob(".*.tmp")) == []
 
 
+@pytest.mark.parametrize("preexisting", [True, False])
+def test_summary_commit_rolls_back_both_files_when_second_replace_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, preexisting: bool
+):
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    json_path = output_dir / "attempt_summary.json"
+    csv_path = output_dir / "attempt_summary.csv"
+    old_json = b"old-json\x00\xff"
+    old_csv = b"old-csv\r\n\x80"
+    if preexisting:
+        json_path.write_bytes(old_json)
+        csv_path.write_bytes(old_csv)
+
+    real_replace = result_writer.os.replace
+    final_replace_count = 0
+
+    def fail_second_final_replace(source: Path, destination: Path) -> None:
+        nonlocal final_replace_count
+        if Path(destination) in {json_path, csv_path}:
+            final_replace_count += 1
+            if final_replace_count == 2:
+                raise OSError("second final replace failed")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(result_writer.os, "replace", fail_second_final_replace)
+
+    with pytest.raises(OSError, match="second final replace failed"):
+        result_writer.write_summary(output_dir, [_valid_vlm_result()])
+
+    if preexisting:
+        assert json_path.read_bytes() == old_json
+        assert csv_path.read_bytes() == old_csv
+    else:
+        assert not json_path.exists()
+        assert not csv_path.exists()
+    assert list(output_dir.glob(".*.tmp")) == []
+
+
+def test_summary_commit_reports_compound_error_when_rollback_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    json_path = output_dir / "attempt_summary.json"
+    csv_path = output_dir / "attempt_summary.csv"
+    json_path.write_bytes(b"old-json")
+    csv_path.write_bytes(b"old-csv")
+    commit_error = OSError("second final replace failed")
+    real_replace = result_writer.os.replace
+    final_replace_count = 0
+
+    def fail_commit_and_rollback(source: Path, destination: Path) -> None:
+        nonlocal final_replace_count
+        if Path(destination) in {json_path, csv_path}:
+            final_replace_count += 1
+            if final_replace_count == 2:
+                raise commit_error
+            if final_replace_count == 3:
+                raise OSError("rollback failed")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(result_writer.os, "replace", fail_commit_and_rollback)
+
+    with (
+        caplog.at_level(logging.ERROR, logger=result_writer.__name__),
+        pytest.raises(result_writer.SummaryPersistenceError, match="rollback") as caught,
+    ):
+        result_writer.write_summary(output_dir, [_valid_vlm_result()])
+
+    assert caught.value.__cause__ is commit_error
+    assert "rollback failed" in caplog.text
+    assert list(output_dir.glob(".*.tmp")) == []
+
+
 def test_attempt_eval_config_is_frozen(tmp_path: Path):
     config = AttemptEvalConfig(dataset_root=tmp_path, model_path=tmp_path / "model")
 
@@ -904,6 +979,119 @@ def test_client_cancellation_is_not_converted_to_episode_fallback(
 
     assert not (config.output_dir / "attempt_summary.json").exists()
     assert not (config.output_dir / "episode_results/episode_000.json").exists()
+
+
+def test_client_close_failure_preserves_active_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    cancellation = EvaluationCancelled("cancelled in client")
+    monkeypatch.setattr(
+        service,
+        "_sample_episode_frames",
+        lambda *_args, **_kwargs: ([tmp_path / "frame.jpg"], []),
+    )
+
+    class CancellingClient:
+        def analyze(self, *_args):
+            raise cancellation
+
+        def close(self):
+            raise RuntimeError("close failed")
+
+    config = AttemptEvalConfig(
+        dataset_root=tmp_path,
+        model_path=tmp_path / "model",
+        output_dir=tmp_path / "out",
+    )
+
+    with (
+        caplog.at_level(logging.ERROR, logger=service.__name__),
+        pytest.raises(EvaluationCancelled) as caught,
+    ):
+        run_attempt_evaluation(
+            config,
+            episodes=[_episode(tmp_path, 0)],
+            client_factory=lambda *_args, **_kwargs: CancellingClient(),
+        )
+
+    assert caught.value is cancellation
+    assert "client cleanup failed" in caplog.text
+    assert "close failed" in caplog.text
+    assert not (config.output_dir / "attempt_summary.json").exists()
+
+
+def test_close_failure_after_inference_fallback_is_fatal_without_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        service,
+        "_sample_episode_frames",
+        lambda *_args, **_kwargs: ([tmp_path / "frame.jpg"], []),
+    )
+
+    class BrokenClient:
+        def analyze(self, *_args):
+            raise RuntimeError("analyze failed")
+
+        def close(self):
+            raise LookupError("close failed")
+
+    output_dir = tmp_path / "out"
+    progress: list[tuple[int, int, str]] = []
+    config = AttemptEvalConfig(
+        dataset_root=tmp_path,
+        model_path=tmp_path / "model",
+        output_dir=output_dir,
+    )
+
+    with pytest.raises(LookupError, match="close failed"):
+        run_attempt_evaluation(
+            config,
+            episodes=[_episode(tmp_path, 0)],
+            client_factory=lambda *_args, **_kwargs: BrokenClient(),
+            progress=lambda done, total, stage: progress.append((done, total, stage)),
+        )
+
+    assert (output_dir / "episode_results/episode_000.json").is_file()
+    assert not (output_dir / "attempt_summary.json").exists()
+    assert progress == [(0, 1, "initial"), (1, 1, "episode_complete")]
+
+
+def test_close_only_failure_is_fatal_without_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        service,
+        "_sample_episode_frames",
+        lambda *_args, **_kwargs: ([tmp_path / "frame.jpg"], []),
+    )
+
+    class CloseFailingClient:
+        def analyze(self, *_args):
+            return _valid_vlm_result(), True
+
+        def close(self):
+            raise RuntimeError("close failed")
+
+    output_dir = tmp_path / "out"
+    progress: list[tuple[int, int, str]] = []
+    config = AttemptEvalConfig(
+        dataset_root=tmp_path,
+        model_path=tmp_path / "model",
+        output_dir=output_dir,
+    )
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        run_attempt_evaluation(
+            config,
+            episodes=[_episode(tmp_path, 0)],
+            client_factory=lambda *_args, **_kwargs: CloseFailingClient(),
+            progress=lambda done, total, stage: progress.append((done, total, stage)),
+        )
+
+    assert (output_dir / "episode_results/episode_000.json").is_file()
+    assert not (output_dir / "attempt_summary.json").exists()
+    assert progress == [(0, 1, "initial"), (1, 1, "episode_complete")]
 
 
 def test_progress_callback_exceptions_propagate_without_success_summary(tmp_path: Path):

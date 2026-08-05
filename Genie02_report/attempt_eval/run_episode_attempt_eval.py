@@ -248,7 +248,13 @@ def run_attempt_evaluation(
             results.append(result)
             if progress is not None:
                 progress(done, total, "episode_complete")
-    finally:
+    except BaseException:
+        try:
+            _close_vlm_client(vlm)
+        except BaseException:
+            logger.exception("VLM client cleanup failed while preserving primary exception")
+        raise
+    else:
         _close_vlm_client(vlm)
 
     _raise_if_cancelled(should_cancel)

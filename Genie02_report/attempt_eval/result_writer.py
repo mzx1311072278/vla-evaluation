@@ -3,10 +3,18 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+class SummaryPersistenceError(RuntimeError):
+    """Raised when a summary commit fails and cannot be fully rolled back."""
 
 CSV_COLUMNS = [
     "episode_index",
@@ -88,6 +96,27 @@ def _stage_text(path: Path, text: str, *, newline: str | None = None) -> Path:
         raise
 
 
+def _stage_backup(path: Path) -> Path | None:
+    _reject_symlink(path)
+    if not path.exists():
+        return None
+    fd, temp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.backup.",
+        suffix=".tmp",
+    )
+    temp_path = Path(temp_name)
+    try:
+        with path.open("rb") as source, os.fdopen(fd, "wb") as destination:
+            shutil.copyfileobj(source, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+        return temp_path
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
 def _replace_staged(temp_path: Path, path: Path) -> None:
     _reject_symlink(path)
     os.replace(temp_path, path)
@@ -143,16 +172,45 @@ def write_summary(output_dir: Path, results: list[dict[str, Any]]) -> None:
 
     json_text = json.dumps(results, ensure_ascii=False, indent=2)
     csv_text = _summary_csv(results)
-    json_temp = csv_temp = None
+    targets = (json_path, csv_path)
+    staged: dict[Path, Path | None] = {json_path: None, csv_path: None}
+    backups: dict[Path, Path | None] = {}
     try:
-        json_temp = _stage_text(json_path, json_text)
-        csv_temp = _stage_text(csv_path, csv_text, newline="")
-        _replace_staged(json_temp, json_path)
-        json_temp = None
-        _replace_staged(csv_temp, csv_path)
-        csv_temp = None
+        staged[json_path] = _stage_text(json_path, json_text)
+        staged[csv_path] = _stage_text(csv_path, csv_text, newline="")
+        for path in targets:
+            backups[path] = _stage_backup(path)
+
+        try:
+            for path in targets:
+                temp_path = staged[path]
+                if temp_path is None:
+                    raise RuntimeError(f"summary artifact was not staged: {path}")
+                _replace_staged(temp_path, path)
+                staged[path] = None
+        except BaseException as commit_error:
+            rollback_errors: list[tuple[Path, BaseException]] = []
+            for path in targets:
+                backup_path = backups[path]
+                try:
+                    if backup_path is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        _replace_staged(backup_path, path)
+                        backups[path] = None
+                except BaseException as rollback_error:
+                    logger.exception("summary rollback failed for %s", path)
+                    rollback_errors.append((path, rollback_error))
+            if rollback_errors:
+                details = "; ".join(
+                    f"{path.name}: {type(error).__name__}: {error}"
+                    for path, error in rollback_errors
+                )
+                raise SummaryPersistenceError(
+                    f"summary commit failed and rollback was incomplete: {details}"
+                ) from commit_error
+            raise
     finally:
-        if json_temp is not None:
-            json_temp.unlink(missing_ok=True)
-        if csv_temp is not None:
-            csv_temp.unlink(missing_ok=True)
+        for temp_path in (*staged.values(), *backups.values()):
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
