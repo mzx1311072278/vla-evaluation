@@ -1,13 +1,16 @@
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import replace
 from inspect import signature
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
+from vla_eval import import_jobs
 from vla_eval.config import RemoteSource
 from vla_eval.datasets import DatasetInspection, DatasetKind
 from vla_eval.import_jobs import (
@@ -168,7 +171,7 @@ def test_replace_happens_after_ready_inspection_and_preserves_fingerprint(tmp_pa
     spec = import_spec(tmp_path / "staging/job-1", tmp_path / "inbox/alice/run-1")
     inspection = DatasetInspection(DatasetKind.LEROBOT, True, "9" * 64, 7, 1, ())
     inspected = False
-    real_replace = Path.replace
+    real_rename = import_jobs._rename_no_replace
 
     def fake_transfer(_argv, _progress):
         spec.staging_path.mkdir(parents=True)
@@ -180,13 +183,13 @@ def test_replace_happens_after_ready_inspection_and_preserves_fingerprint(tmp_pa
         inspected = True
         return inspection
 
-    def checked_replace(path, target):
+    def checked_rename(path, target):
         assert inspected is True
         assert path == spec.staging_path
         assert target == spec.target_path
-        return real_replace(path, target)
+        return real_rename(path, target)
 
-    monkeypatch.setattr(Path, "replace", checked_replace)
+    monkeypatch.setattr(import_jobs, "_rename_no_replace", checked_rename)
 
     result = execute_import(spec, transfer=fake_transfer, inspector=fake_inspector)
 
@@ -251,6 +254,35 @@ class FakeSelector:
         return None
 
 
+class DelayedExitFakeProcess(FakeProcess):
+    def __init__(self, output: str, timeouts_before_exit: int):
+        super().__init__(output)
+        self.timeouts_before_exit = timeouts_before_exit
+        self.wait_timeouts = []
+
+    def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
+        if self.terminated or self.killed:
+            return -15
+        if len(self.wait_timeouts) <= self.timeouts_before_exit:
+            raise subprocess.TimeoutExpired(["rsync"], timeout)
+        return self.returncode
+
+
+class RegisterFailingSelector:
+    instances: ClassVar[list] = []
+
+    def __init__(self):
+        self.closed = False
+        self.__class__.instances.append(self)
+
+    def register(self, _file, _events):
+        raise OSError("selector does not support this pipe")
+
+    def close(self):
+        self.closed = True
+
+
 def test_run_rsync_uses_exact_argv_without_shell(monkeypatch):
     process = FakeProcess("")
     captured = {}
@@ -310,6 +342,47 @@ def test_run_rsync_nonzero_error_has_bounded_sanitized_tail(monkeypatch):
     assert "\x1b" not in rendered
 
 
+def test_run_rsync_redacts_path_variants_and_complete_credentials(monkeypatch):
+    key = "/private/credentials/../credentials/id_ed25519/"
+    known_hosts = "/private/known_hosts"
+    output = "\n".join(
+        [
+            "/private/credentials/id_ed25519",
+            f"{known_hosts}/",
+            "Authorization: Bearer bearer-secret",
+            "Bearer second-bearer-secret",
+            "api-key=api-secret-value",
+            "token: token-secret-value",
+            "password = password-secret-value",
+            "secret=generic-secret-value\x1b[31m",
+        ]
+    )
+    process = FakeProcess(output, returncode=23)
+    monkeypatch.setattr("vla_eval.import_jobs.subprocess.Popen", lambda *_a, **_kw: process)
+    argv = [
+        "rsync",
+        "-e",
+        f"ssh -i {key} -o UserKnownHostsFile={known_hosts}",
+    ]
+
+    with pytest.raises(TransferError) as caught:
+        run_rsync(argv, lambda _progress: None)
+
+    rendered = "\n".join(caught.value.safe_tail)
+    for leaked in (
+        "/private/credentials/id_ed25519",
+        known_hosts,
+        "bearer-secret",
+        "second-bearer-secret",
+        "api-secret-value",
+        "token-secret-value",
+        "password-secret-value",
+        "generic-secret-value",
+        "\x1b",
+    ):
+        assert leaked not in rendered
+
+
 def test_run_rsync_cleans_up_process_when_progress_callback_fails(monkeypatch):
     process = FakeProcess("  1,000  20% 1MB/s\rremaining")
     monkeypatch.setattr("vla_eval.import_jobs.subprocess.Popen", lambda *_a, **_kw: process)
@@ -359,6 +432,69 @@ def test_run_rsync_quiet_poll_cancellation_terminates_without_fake_progress(monk
     assert progress == []
 
 
+def test_run_rsync_polls_cancellation_while_waiting_after_stdout_eof(monkeypatch):
+    process = DelayedExitFakeProcess("", timeouts_before_exit=2)
+    monkeypatch.setattr("vla_eval.import_jobs.subprocess.Popen", lambda *_a, **_kw: process)
+    polls = []
+
+    run_rsync(["rsync"], lambda _progress: None, on_poll=lambda: polls.append("poll"))
+
+    assert polls == ["poll", "poll"]
+    assert process.wait_timeouts == [0.1, 0.1, 0.1]
+
+
+def test_run_rsync_eof_wait_cancellation_terminates_process(monkeypatch):
+    process = DelayedExitFakeProcess("", timeouts_before_exit=100)
+    monkeypatch.setattr("vla_eval.import_jobs.subprocess.Popen", lambda *_a, **_kw: process)
+
+    with pytest.raises(TransferError, match="cancelled"):
+        run_rsync(
+            ["rsync"],
+            lambda _progress: None,
+            on_poll=lambda: (_ for _ in ()).throw(TransferError("cancelled")),
+        )
+
+    assert process.terminated is True
+
+
+def test_selector_registration_failure_closes_and_uses_safe_fallback(monkeypatch):
+    RegisterFailingSelector.instances.clear()
+    process = FakeProcess("")
+    process.stdout = SelectableFakeStream("12%\r")
+    monkeypatch.setattr("vla_eval.import_jobs.subprocess.Popen", lambda *_a, **_kw: process)
+    monkeypatch.setattr(
+        "vla_eval.import_jobs.selectors.DefaultSelector",
+        RegisterFailingSelector,
+    )
+    progress = []
+
+    run_rsync(["rsync"], progress.append)
+
+    assert progress == [12.0]
+    assert RegisterFailingSelector.instances[0].closed is True
+
+
+def test_run_rsync_bounds_newline_free_pending_output():
+    pending_sizes = []
+    argv = [
+        sys.executable,
+        "-c",
+        "import sys;sys.stdout.buffer.write(b'x'*(8*1024*1024));sys.stdout.flush();sys.exit(23)",
+    ]
+    started = time.monotonic()
+
+    with pytest.raises(TransferError):
+        run_rsync(
+            argv,
+            lambda _progress: None,
+            on_pending_size=pending_sizes.append,
+        )
+
+    assert time.monotonic() - started < 10
+    assert pending_sizes
+    assert max(pending_sizes) <= 8192
+
+
 def test_run_rsync_observes_flushed_cr_before_local_child_exits():
     progress_seen = threading.Event()
     finished = threading.Event()
@@ -386,6 +522,16 @@ def test_run_rsync_observes_flushed_cr_before_local_child_exits():
 
     assert not thread.is_alive()
     assert errors == []
+
+
+def test_run_rsync_rejects_unrelated_percent_records(monkeypatch):
+    process = FakeProcess("12%\r  1,000  42% 1MB/s\r2026 99% packet loss\r")
+    monkeypatch.setattr("vla_eval.import_jobs.subprocess.Popen", lambda *_a, **_kw: process)
+    progress = []
+
+    run_rsync(["rsync"], progress.append)
+
+    assert progress == [12.0, 42.0]
 
 
 @pytest.mark.parametrize(
@@ -621,7 +767,7 @@ def test_cancellation_immediately_before_replace_keeps_staging(tmp_path, monkeyp
         nonlocal replace_called
         replace_called = True
 
-    monkeypatch.setattr(Path, "replace", forbidden_replace)
+    monkeypatch.setattr(import_jobs, "_rename_no_replace", forbidden_replace)
 
     with pytest.raises(TransferError, match="cancelled"):
         execute_import(
@@ -662,6 +808,73 @@ def test_success_does_not_poll_cancellation_after_replace(tmp_path):
     assert result.dataset_path.exists()
 
 
+def test_publish_target_appearing_at_final_moment_is_never_replaced(tmp_path, monkeypatch):
+    spec = import_spec(tmp_path / "staging/job-1", tmp_path / "inbox/run-1")
+    inspection = DatasetInspection(DatasetKind.LEROBOT, True, "2" * 64, 4, 1, ())
+
+    def fake_transfer(_argv, _progress):
+        spec.staging_path.mkdir(parents=True)
+        (spec.staging_path / "received").write_text("staging", encoding="utf-8")
+
+    def race_rename(_source, target):
+        target.mkdir()
+        (target / "owner").write_text("other job", encoding="utf-8")
+        raise FileExistsError("target appeared")
+
+    monkeypatch.setattr(import_jobs, "_rename_no_replace", race_rename, raising=False)
+
+    with pytest.raises(FileExistsError, match="target appeared"):
+        execute_import(spec, transfer=fake_transfer, inspector=lambda _path: inspection)
+
+    assert (spec.target_path / "owner").read_text(encoding="utf-8") == "other job"
+    assert (spec.staging_path / "received").read_text(encoding="utf-8") == "staging"
+
+
+def test_no_replace_publish_fails_closed_on_unsupported_platform(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    monkeypatch.setattr(import_jobs.sys, "platform", "unsupported-os")
+
+    with pytest.raises(OSError, match="not supported"):
+        import_jobs._rename_no_replace(source, target)
+
+    assert source.exists()
+    assert not target.exists()
+
+
+def test_post_publish_verification_failure_rolls_back_before_failed_state(tmp_path, monkeypatch):
+    spec = import_spec(tmp_path / "staging/job-1", tmp_path / "inbox/run-1")
+    inspection = DatasetInspection(DatasetKind.LEROBOT, True, "3" * 64, 4, 1, ())
+    states = []
+
+    def fake_transfer(_argv, _progress):
+        spec.staging_path.mkdir(parents=True)
+        (spec.staging_path / "received").write_text("staging", encoding="utf-8")
+
+    def fail_verification(_spec, _target, _production):
+        raise RuntimeError("post-publish verification failed")
+
+    monkeypatch.setattr(
+        import_jobs,
+        "_verify_published_target",
+        fail_verification,
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="post-publish verification failed"):
+        execute_import(
+            spec,
+            transfer=fake_transfer,
+            inspector=lambda _path: inspection,
+            callbacks=ImportCallbacks(on_state=states.append),
+        )
+
+    assert states[-1] == FAILED
+    assert spec.staging_path.exists()
+    assert not spec.target_path.exists()
+
+
 def test_ready_callback_failure_rolls_target_back_to_staging(tmp_path):
     spec = import_spec(tmp_path / "staging/job-1", tmp_path / "inbox/run-1")
     inspection = DatasetInspection(DatasetKind.LEROBOT, True, "f" * 64, 4, 1, ())
@@ -692,7 +905,7 @@ def test_ready_callback_failure_rolls_target_back_to_staging(tmp_path):
 def test_ready_callback_and_rollback_failures_are_both_observable(tmp_path, monkeypatch):
     spec = import_spec(tmp_path / "staging/job-1", tmp_path / "inbox/run-1")
     inspection = DatasetInspection(DatasetKind.LEROBOT, True, "1" * 64, 4, 1, ())
-    real_replace = Path.replace
+    real_rename = import_jobs._rename_no_replace
     replace_calls = 0
 
     def fake_transfer(_argv, _progress):
@@ -704,13 +917,13 @@ def test_ready_callback_and_rollback_failures_are_both_observable(tmp_path, monk
         replace_calls += 1
         if replace_calls == 2:
             raise OSError("rollback failed")
-        return real_replace(path, target)
+        return real_rename(path, target)
 
     def on_state(state):
         if state == READY:
             raise RuntimeError("ready persistence failed")
 
-    monkeypatch.setattr(Path, "replace", fail_rollback)
+    monkeypatch.setattr(import_jobs, "_rename_no_replace", fail_rollback)
 
     with pytest.raises(ExceptionGroup) as caught:
         execute_import(
@@ -762,6 +975,17 @@ def test_production_target_must_be_within_trusted_inbox(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="trusted root"):
         execute_import(spec)
+
+
+def test_production_staging_must_be_strict_descendant_of_trusted_root(tmp_path):
+    spec = production_spec(tmp_path)
+    spec = replace(spec, staging_path=spec.trusted_staging_root)
+
+    with pytest.raises(ValueError, match="strict descendant"):
+        execute_import(
+            spec,
+            transfer=lambda _argv, _progress: pytest.fail("transfer must not start"),
+        )
 
 
 def test_production_rejects_symlinked_inbox_component(tmp_path, monkeypatch):

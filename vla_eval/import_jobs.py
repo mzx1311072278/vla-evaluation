@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import codecs
+import ctypes
+import errno
 import math
 import os
 import re
@@ -10,6 +12,7 @@ import selectors
 import shlex
 import stat
 import subprocess
+import sys
 import unicodedata
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -34,10 +37,12 @@ READY: Final = "READY"
 FAILED: Final = "FAILED"
 IMPORT_STATE_ORDER: Final = (CONNECTING, TRANSFERRING, VERIFYING, PREFLIGHT, READY)
 
-_PROGRESS_PATTERN = re.compile(r"\s*(\d{1,3})%")
-_PROGRESS_PREFIX_PATTERN = re.compile(r"[\s\d,.]*\Z")
+_PERCENT_ONLY_PATTERN = re.compile(r"\s*(\d{1,3})%\s*\Z")
+_PROGRESS2_PATTERN = re.compile(r"\s*[\d,.]+\s+(\d{1,3})%\s+[\d,.]+\s*[A-Za-z]+/s(?:\s+.*)?\s*\Z")
+_BEARER_CREDENTIAL_PATTERN = re.compile(r"(?i)(?:\bauthorization\s*:\s*)?\bbearer\s+\S+")
 _SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
-    r"(?i)\b(password|passwd|secret|token|credential|authorization)\b(\s*[:=]\s*)(\S+)"
+    r"(?i)\b(api[-_]?key|password|passwd|secret|token|credential)\b"
+    r"(\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|\S+)"
 )
 _MAX_TAIL_LINES = 200
 _MAX_TAIL_LINE_LENGTH = 500
@@ -45,6 +50,11 @@ _MAX_VALIDATION_ERRORS = 8
 _MAX_VALIDATION_ERROR_LENGTH = 240
 _PROCESS_WAIT_SECONDS = 2.0
 _PROCESS_POLL_SECONDS = 0.1
+_MAX_PENDING_OUTPUT = 8192
+_PENDING_OVERLAP = 512
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+_RENAME_EXCL = 0x00000004
 
 StateCallback = Callable[[str], None]
 ProgressCallback = Callable[[float], None]
@@ -63,6 +73,10 @@ def _ignore_progress(_progress: float) -> None:
 
 def _not_cancelled() -> bool:
     return False
+
+
+def _ignore_pending_size(_size: int) -> None:
+    return None
 
 
 @dataclass(frozen=True)
@@ -148,26 +162,38 @@ def _sanitize_text(value: str, secrets: Sequence[str] = ()) -> str:
     )
     for secret in sorted((secret for secret in secrets if secret), key=len, reverse=True):
         sanitized = sanitized.replace(secret, "[redacted]")
+    sanitized = _BEARER_CREDENTIAL_PATTERN.sub("[redacted bearer credential]", sanitized)
     sanitized = _SENSITIVE_ASSIGNMENT_PATTERN.sub(r"\1\2[redacted]", sanitized)
     return sanitized[:_MAX_TAIL_LINE_LENGTH]
+
+
+def _secret_path_variants(value: str) -> set[str]:
+    variants = {value}
+    without_separator = value.rstrip("/\\")
+    if without_separator:
+        variants.update({without_separator, f"{without_separator}/"})
+    if value.startswith("/"):
+        resolved = str(Path(without_separator or value).resolve(strict=False))
+        variants.update({resolved, f"{resolved}/"})
+    return variants
 
 
 def _argv_secrets(argv: Sequence[str]) -> tuple[str, ...]:
     secrets: set[str] = set()
     for argument in argv:
         if len(argument) > 4:
-            secrets.add(argument)
+            secrets.update(_secret_path_variants(argument))
         try:
             tokens = shlex.split(argument)
         except ValueError:
             tokens = []
         for index, token in enumerate(tokens):
             if token == "-i" and index + 1 < len(tokens):
-                secrets.add(tokens[index + 1])
+                secrets.update(_secret_path_variants(tokens[index + 1]))
             if token.startswith("UserKnownHostsFile="):
-                secrets.add(token.partition("=")[2])
+                secrets.update(_secret_path_variants(token.partition("=")[2]))
             if token.startswith("/"):
-                secrets.add(token)
+                secrets.update(_secret_path_variants(token))
     return tuple(secrets)
 
 
@@ -227,7 +253,12 @@ def _selector_stream(
     on_poll: Callable[[], None],
 ) -> None:
     selector = selectors.DefaultSelector()
-    selector.register(descriptor, selectors.EVENT_READ)
+    try:
+        selector.register(descriptor, selectors.EVENT_READ)
+    except (KeyError, OSError, ValueError):
+        selector.close()
+        _fallback_stream(output, feed_text)
+        return
     encoding = getattr(output, "encoding", None) or "utf-8"
     decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
     primary: BaseException | None = None
@@ -257,11 +288,23 @@ def _selector_stream(
         raise primary
 
 
+def _wait_for_exit(
+    process: subprocess.Popen[str],
+    on_poll: Callable[[], None],
+) -> int:
+    while True:
+        try:
+            return process.wait(timeout=_PROCESS_POLL_SECONDS)
+        except subprocess.TimeoutExpired:
+            on_poll()
+
+
 def run_rsync(
     argv: Sequence[str],
     on_progress: ProgressCallback,
     *,
     on_poll: Callable[[], None] | None = None,
+    on_pending_size: Callable[[int], None] | None = None,
 ) -> None:
     """Run one argv-only rsync process and stream progress2 updates."""
     normalized_argv = _normalize_argv(argv)
@@ -294,31 +337,41 @@ def run_rsync(
     tail: deque[str] = deque(maxlen=_MAX_TAIL_LINES)
     secrets = _argv_secrets(normalized_argv)
     pending = ""
+    pending_was_truncated = False
     last_progress = 0.0
-    poll_callback = on_poll or getattr(on_progress, "poll", _not_cancelled)
+    poll_callback = on_poll if on_poll is not None else getattr(on_progress, "poll", _not_cancelled)
+    pending_size_callback = on_pending_size or _ignore_pending_size
 
-    def consume_record(record: str) -> None:
+    def consume_record(record: str, *, parse_progress: bool = True) -> None:
         nonlocal last_progress
         if record:
             tail.append(_sanitize_text(record, secrets))
-        if "|" in record:
+        if not parse_progress or "|" in record:
             return
-        for match in _PROGRESS_PATTERN.finditer(record):
-            if _PROGRESS_PREFIX_PATTERN.fullmatch(record[: match.start()]) is None:
-                continue
-            value = min(100.0, max(0.0, float(match.group(1))))
-            last_progress = max(last_progress, value)
-            on_progress(last_progress)
+        match = _PERCENT_ONLY_PATTERN.fullmatch(record)
+        if match is None:
+            match = _PROGRESS2_PATTERN.fullmatch(record)
+        if match is None:
             return
+        value = min(100.0, max(0.0, float(match.group(1))))
+        last_progress = max(last_progress, value)
+        on_progress(last_progress)
 
     def feed_text(chunk: str) -> None:
-        nonlocal pending
-        for character in chunk:
-            if character in "\r\n":
-                consume_record(pending)
-                pending = ""
+        nonlocal pending, pending_was_truncated
+        records = re.split(r"[\r\n]", pending + chunk)
+        for index, record in enumerate(records[:-1]):
+            if index == 0 and pending_was_truncated:
+                pending_was_truncated = False
             else:
-                pending += character
+                consume_record(record)
+        pending = records[-1]
+        if len(pending) > _MAX_PENDING_OUTPUT:
+            if not pending_was_truncated:
+                tail.append("[truncated newline-free output]")
+            pending_was_truncated = True
+            pending = pending[-_PENDING_OVERLAP:]
+        pending_size_callback(len(pending))
 
     try:
         try:
@@ -327,8 +380,9 @@ def run_rsync(
             _fallback_stream(output, feed_text)
         else:
             _selector_stream(output, descriptor, feed_text, poll_callback)
-        consume_record(pending)
-        returncode = process.wait()
+        if not pending_was_truncated:
+            consume_record(pending)
+        returncode = _wait_for_exit(process, poll_callback)
     except BaseException as primary:
         cleanup_errors = _terminate_process(process)
         try:
@@ -422,6 +476,72 @@ def _create_under_root(destination: Path, root: Path, field_name: str) -> None:
     _validate_protected_directory(destination, field_name)
 
 
+def _raise_rename_error(destination: Path) -> None:
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(
+            error_number,
+            "import target already exists",
+            destination,
+        )
+    if error_number in {errno.ENOSYS, errno.ENOTSUP}:
+        raise OSError(
+            error_number,
+            "atomic no-replace rename is unavailable on this platform",
+            destination,
+        )
+    raise OSError(error_number, os.strerror(error_number), destination)
+
+
+def _rename_no_replace(source: Path, destination: Path) -> None:
+    """Atomically rename without replacing an existing destination."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    encoded_source = os.fsencode(source)
+    encoded_destination = os.fsencode(destination)
+    if sys.platform.startswith("linux"):
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "atomic no-replace rename requires Linux renameat2",
+                destination,
+            )
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            _AT_FDCWD,
+            encoded_source,
+            _AT_FDCWD,
+            encoded_destination,
+            _RENAME_NOREPLACE,
+        )
+    elif sys.platform == "darwin":
+        renamex_np = getattr(libc, "renamex_np", None)
+        if renamex_np is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "atomic no-replace rename requires macOS renamex_np",
+                destination,
+            )
+        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex_np.restype = ctypes.c_int
+        result = renamex_np(encoded_source, encoded_destination, _RENAME_EXCL)
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            "atomic no-replace rename is not supported on this platform",
+            destination,
+        )
+    if result != 0:
+        _raise_rename_error(destination)
+
+
 def _ensure_safe_injected_directory(path: Path, field_name: str) -> None:
     path = _absolute_path(path, field_name)
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -466,6 +586,8 @@ def _prepare_paths(spec: ImportSpec, staging: Path, target: Path, production: bo
         assert spec.trusted_inbox_root is not None
         staging_root = _absolute_path(spec.trusted_staging_root, "trusted staging root")
         inbox_root = _absolute_path(spec.trusted_inbox_root, "trusted inbox root")
+        if staging == staging_root:
+            raise ValueError("staging path must be a strict descendant of trusted staging root")
         _create_under_root(staging, staging_root, "staging path")
         _create_under_root(target.parent, inbox_root, "inbox path")
     else:
@@ -550,6 +672,38 @@ def _emit_state(callbacks: ImportCallbacks, state: str) -> None:
     callbacks.on_state(state)
 
 
+def _verify_published_target(spec: ImportSpec, target: Path, production: bool) -> None:
+    if not target.exists():
+        raise OSError("published dataset target is missing")
+    if production:
+        assert spec.trusted_inbox_root is not None
+        resolved_root = spec.trusted_inbox_root.resolve(strict=True)
+        if not _is_contained(target.resolve(strict=True), resolved_root):
+            raise OSError("published dataset escaped trusted inbox root")
+
+
+def _publish_and_report_ready(
+    spec: ImportSpec,
+    staging: Path,
+    target: Path,
+    production: bool,
+    callbacks: ImportCallbacks,
+) -> None:
+    _rename_no_replace(staging, target)
+    try:
+        _verify_published_target(spec, target, production)
+        callbacks.on_state(READY)
+    except BaseException as publish_error:
+        try:
+            _rename_no_replace(target, staging)
+        except BaseException as rollback_error:  # noqa: BLE001 - preserve rollback failures
+            raise BaseExceptionGroup(
+                "dataset publication and rollback both failed",
+                [publish_error, rollback_error],
+            ) from publish_error
+        raise
+
+
 def execute_import(
     spec: ImportSpec,
     *,
@@ -566,7 +720,6 @@ def execute_import(
     production = False
     failure_callback_needed = False
     injected_transfer_started = False
-    published = False
     try:
         production = _is_production_mode(spec, transfer)
         staging, target = _validate_spec(spec)
@@ -616,33 +769,11 @@ def execute_import(
         _verify_target_parent(spec, target, production)
         _ensure_same_filesystem(staging, target.parent)
         report_progress.poll()
-        staging.replace(target)
-        published = True
-
-        if not target.exists():
-            raise OSError("published dataset target is missing")
-        if production:
-            assert spec.trusted_inbox_root is not None
-            resolved_root = spec.trusted_inbox_root.resolve(strict=True)
-            if not _is_contained(target.resolve(strict=True), resolved_root):
-                raise OSError("published dataset escaped trusted inbox root")
-
-        try:
-            callbacks.on_state(READY)
-        except Exception as ready_error:
-            try:
-                target.replace(staging)
-            except Exception as rollback_error:  # noqa: BLE001 - report compound publish failure
-                raise ExceptionGroup(
-                    "READY callback failed and dataset rollback failed",
-                    [ready_error, rollback_error],
-                ) from ready_error
-            published = False
-            raise
+        _publish_and_report_ready(spec, staging, target, production, callbacks)
         failure_callback_needed = False
         return ImportResult(dataset_path=target, inspection=inspection)
     except BaseException as original:
-        if not production and injected_transfer_started and not published:
+        if not production and injected_transfer_started and not os.path.lexists(spec.target_path):
             staging_path = Path(spec.staging_path)
             if staging_path.is_absolute() and not os.path.lexists(staging_path):
                 try:
