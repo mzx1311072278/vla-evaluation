@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -147,6 +148,18 @@ def _import_cancel_requested(runtime: TaskRuntime, import_id: str) -> bool:
         return session.get_one(ImportJob, import_id).cancel_requested
 
 
+def _record_publish_fingerprint(
+    runtime: TaskRuntime,
+    import_id: str,
+    fingerprint: str,
+) -> None:
+    with session_scope(runtime.engine) as session:
+        job = session.get_one(ImportJob, import_id)
+        if job.dataset_id is not None:
+            raise RuntimeError("cannot publish an import that already has a dataset")
+        job.publish_fingerprint = fingerprint
+
+
 def _record_import_success(
     runtime: TaskRuntime,
     import_id: str,
@@ -155,6 +168,13 @@ def _record_import_success(
 ) -> None:
     inspection = result.inspection
     with session_scope(runtime.engine) as session:
+        job = session.get_one(ImportJob, import_id)
+        if job.dataset_id is not None:
+            raise RuntimeError("import already has a published dataset")
+        if job.state not in {"PREFLIGHT", "INTERRUPTED"}:
+            raise ValueError("import state changed before READY commit")
+        if job.publish_fingerprint != inspection.fingerprint:
+            raise ValueError("import publish fingerprint changed before READY commit")
         dataset = Dataset(
             name=target_name,
             path=str(result.dataset_path),
@@ -167,7 +187,6 @@ def _record_import_success(
         )
         session.add(dataset)
         session.flush()
-        job = session.get_one(ImportJob, import_id)
         job.dataset_id = dataset.id
         job.state = "READY"
         job.progress = 100.0
@@ -204,6 +223,81 @@ def _record_import_cancelled(runtime: TaskRuntime, import_id: str) -> None:
         job.error_message = "Dataset import was cancelled."
 
 
+def _inspect_trusted_published_target(target: Path, inbox_root: Path) -> DatasetInspection:
+    lexical_root = Path(os.path.abspath(inbox_root))
+    lexical_target = Path(os.path.abspath(target))
+    if lexical_target == lexical_root or lexical_root not in lexical_target.parents:
+        raise ValueError("published import target is outside the trusted inbox")
+    if lexical_target.is_symlink():
+        raise ValueError("published import target must not be a symbolic link")
+    if not lexical_target.is_dir():
+        raise ValueError("published import target must be an existing directory")
+    try:
+        lexical_target.resolve(strict=True).relative_to(lexical_root.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ValueError("published import target escaped the trusted inbox") from error
+    return inspect_dataset(lexical_target, allowed_root=lexical_target)
+
+
+def _load_completed_import(
+    runtime: TaskRuntime,
+    import_id: str,
+    dataset_id: str | None,
+    publish_fingerprint: str | None,
+    target: Path,
+) -> ImportResult:
+    if dataset_id is None or publish_fingerprint is None:
+        raise ValueError("completed import is missing its dataset identity")
+    inspection = _inspect_trusted_published_target(
+        target,
+        runtime.config.data_root / "inbox",
+    )
+    with session_scope(runtime.engine) as session:
+        dataset = session.get_one(Dataset, dataset_id)
+        job = session.get_one(ImportJob, import_id)
+        if dataset.status != "READY" or dataset.path != str(target):
+            raise ValueError("completed import dataset record is inconsistent")
+        if not inspection.ready or inspection.fingerprint != publish_fingerprint:
+            raise ValueError("completed import fingerprint no longer matches its target")
+        if dataset.fingerprint != publish_fingerprint:
+            raise ValueError("completed import dataset fingerprint is inconsistent")
+        if (
+            job.state != "READY"
+            or job.dataset_id != dataset_id
+            or job.publish_fingerprint != publish_fingerprint
+        ):
+            raise ValueError("completed import state changed during validation")
+    return ImportResult(target, inspection)
+
+
+def _reconcile_interrupted_import(
+    runtime: TaskRuntime,
+    import_id: str,
+    dataset_id: str | None,
+    publish_fingerprint: str | None,
+    staging: Path,
+    target: Path,
+    target_name: str,
+) -> ImportResult:
+    if dataset_id is not None:
+        raise ValueError("interrupted import already has a dataset record")
+    if publish_fingerprint is None:
+        raise ValueError("interrupted import has no durable publish fingerprint")
+    if os.path.lexists(staging):
+        raise ValueError("interrupted import still has a staging path")
+    inspection = _inspect_trusted_published_target(
+        target,
+        runtime.config.data_root / "inbox",
+    )
+    if not inspection.ready:
+        raise ValueError("interrupted published target did not pass preflight")
+    if inspection.fingerprint != publish_fingerprint:
+        raise ValueError("interrupted published target fingerprint does not match")
+    result = ImportResult(target, inspection)
+    _record_import_success(runtime, import_id, target_name, result)
+    return result
+
+
 def run_import_task(import_id: str, *, runtime: TaskRuntime | None = None) -> ImportResult:
     resolved = _require_runtime(runtime)
     with session_scope(resolved.engine) as session:
@@ -212,13 +306,31 @@ def run_import_task(import_id: str, *, runtime: TaskRuntime | None = None) -> Im
         remote_root = job.remote_root
         remote_path = job.remote_path
         target_name = job.target_name
+        state = job.state
+        dataset_id = job.dataset_id
+        publish_fingerprint = job.publish_fingerprint
 
     target_path = resolved.config.data_root / "inbox" / target_name
+    staging_path = resolved.config.data_root / "staging" / import_id
+    if state == "READY":
+        return _load_completed_import(
+            resolved,
+            import_id,
+            dataset_id,
+            publish_fingerprint,
+            target_path,
+        )
     captured_inspection: DatasetInspection | None = None
 
     def inspect_and_capture(path: Path) -> DatasetInspection:
         nonlocal captured_inspection
         captured_inspection = inspect_dataset(path, allowed_root=path)
+        if captured_inspection.ready:
+            _record_publish_fingerprint(
+                resolved,
+                import_id,
+                captured_inspection.fingerprint,
+            )
         return captured_inspection
 
     def update_state(state: str) -> None:
@@ -242,6 +354,16 @@ def run_import_task(import_id: str, *, runtime: TaskRuntime | None = None) -> Im
     try:
         if callbacks.is_cancelled():
             raise TransferError("import cancelled before execution")
+        if state == "INTERRUPTED" and os.path.lexists(target_path):
+            return _reconcile_interrupted_import(
+                resolved,
+                import_id,
+                dataset_id,
+                publish_fingerprint,
+                staging_path,
+                target_path,
+                target_name,
+            )
         configured_source = resolved.config.remote_sources[source_name]
         if remote_root not in configured_source.roots:
             raise ValueError("persisted remote root is not registered for the selected source")
@@ -251,7 +373,7 @@ def run_import_task(import_id: str, *, runtime: TaskRuntime | None = None) -> Im
             source_name=source.name,
             remote_root=remote_root,
             remote_relative_path=remote_path,
-            staging_path=resolved.config.data_root / "staging" / import_id,
+            staging_path=staging_path,
             target_path=target_path,
             mode="production",
             source=source,

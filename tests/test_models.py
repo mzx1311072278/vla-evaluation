@@ -65,6 +65,7 @@ def test_model_defaults_use_uuid_utc_and_independent_json(tmp_path):
         assert dataset.episode_count == 0
         assert import_job.state == "QUEUED"
         assert import_job.progress == 0.0
+        assert import_job.publish_fingerprint is None
         assert jobs[0].profile_version == "unknown"
         assert jobs[0].vlm_enabled is False
         assert jobs[0].stage == "PENDING"

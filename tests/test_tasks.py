@@ -1,3 +1,4 @@
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -418,6 +419,7 @@ def test_import_task_uses_persisted_second_remote_root(db_engine, data_root, mon
 
     def execute(spec, *, inspector, callbacks):
         received["spec"] = spec
+        callbacks.on_state("PREFLIGHT")
         inspector(spec.staging_path)
         callbacks.on_state("READY")
         return ImportResult(spec.target_path, inspection)
@@ -435,6 +437,29 @@ def test_import_task_uses_persisted_second_remote_root(db_engine, data_root, mon
 
     assert received["spec"].remote_root == "/data/archive"
     assert received["spec"].source.roots == ("/data/archive",)
+
+
+def test_import_ready_inspection_persists_fingerprint_before_publish(
+    db_engine, data_root, monkeypatch
+):
+    import_job = _create_import_job(db_engine)
+    inspection = DatasetInspection(DatasetKind.LEROBOT, True, "1" * 64, 8, 1, ())
+    monkeypatch.setattr(
+        tasks_module,
+        "inspect_dataset",
+        lambda _path, *, allowed_root: inspection,
+    )
+
+    def execute(spec, *, inspector, callbacks):
+        callbacks.on_state("PREFLIGHT")
+        inspector(spec.staging_path)
+        with session_scope(db_engine) as session:
+            assert session.get_one(ImportJob, import_job.id).publish_fingerprint == "1" * 64
+        return ImportResult(spec.target_path, inspection)
+
+    monkeypatch.setattr("vla_eval.tasks.execute_import", execute)
+
+    run_import_task(import_job.id, runtime=_runtime(db_engine, data_root))
 
 
 def test_import_task_rejects_unregistered_persisted_remote_root(db_engine, data_root, monkeypatch):
@@ -565,6 +590,7 @@ def test_import_task_maps_final_persistence_failure_to_failed(db_engine, data_ro
     )
 
     def execute(spec, *, inspector, callbacks):
+        callbacks.on_state("PREFLIGHT")
         inspector(spec.staging_path)
         callbacks.on_state("READY")
         return ImportResult(spec.target_path, inspection)
@@ -653,6 +679,56 @@ def test_import_ready_persistence_failure_rolls_publication_back(db_engine, data
         assert (job.state, job.dataset_id) == ("FAILED", None)
 
 
+def test_publish_fingerprint_failure_stops_before_rename(db_engine, data_root, monkeypatch):
+    import_job = _create_import_job(db_engine)
+    inspection = DatasetInspection(DatasetKind.LEROBOT, True, "6" * 64, 10, 1, ())
+    staging = data_root / "staging" / import_job.id
+    target = data_root / "inbox" / import_job.target_name
+    monkeypatch.setattr(
+        tasks_module,
+        "inspect_dataset",
+        lambda _path, *, allowed_root: inspection,
+    )
+
+    def injected_execute(spec, **kwargs):
+        def transfer(_argv, _progress):
+            staging.mkdir(parents=True, exist_ok=True)
+            (staging / "partial.bin").write_bytes(b"partial")
+
+        return import_jobs_module.execute_import(
+            replace(
+                spec,
+                mode="injected",
+                source=None,
+                trusted_credentials_root=None,
+                trusted_staging_root=None,
+                trusted_inbox_root=None,
+            ),
+            transfer=transfer,
+            inspector=kwargs["inspector"],
+            callbacks=kwargs["callbacks"],
+        )
+
+    marker_error = OSError("marker database unavailable")
+
+    def fail_marker(*_args):
+        raise marker_error
+
+    monkeypatch.setattr("vla_eval.tasks.execute_import", injected_execute)
+    monkeypatch.setattr("vla_eval.tasks._record_publish_fingerprint", fail_marker)
+
+    with pytest.raises(OSError) as raised:
+        run_import_task(import_job.id, runtime=_runtime(db_engine, data_root))
+
+    assert raised.value is marker_error
+    assert staging.is_dir()
+    assert (staging / "partial.bin").is_file()
+    assert not target.exists()
+    with session_scope(db_engine) as session:
+        job = session.get_one(ImportJob, import_job.id)
+        assert (job.state, job.publish_fingerprint) == ("FAILED", None)
+
+
 def test_import_ready_commits_only_with_dataset_link_and_published_target(
     db_engine, data_root, monkeypatch
 ):
@@ -700,6 +776,179 @@ def test_import_ready_commits_only_with_dataset_link_and_published_target(
         assert (job.state, job.progress) == ("READY", 100.0)
         assert dataset.path == str(target)
         assert dataset.status == "READY"
+
+    monkeypatch.setattr(
+        "vla_eval.tasks.execute_import",
+        lambda *_args, **_kwargs: pytest.fail("completed import must not rerun Task 9"),
+    )
+
+    repeated = run_import_task(import_job.id, runtime=_runtime(db_engine, data_root))
+
+    assert repeated.dataset_path == target
+    assert repeated.inspection.fingerprint == inspection.fingerprint
+    with session_scope(db_engine) as session:
+        job = session.get_one(ImportJob, import_job.id)
+        assert (job.state, job.dataset_id) == ("READY", dataset.id)
+
+
+def test_interrupted_import_reconciles_published_target_by_fingerprint(
+    db_engine, data_root, monkeypatch
+):
+    import_job = _create_import_job(db_engine)
+    inspection = DatasetInspection(DatasetKind.LEROBOT, True, "2" * 64, 12, 3, ())
+    staging = data_root / "staging" / import_job.id
+    target = data_root / "inbox" / import_job.target_name
+    monkeypatch.setattr(
+        tasks_module,
+        "inspect_dataset",
+        lambda path, *, allowed_root: inspection,
+    )
+
+    def injected_execute(spec, **kwargs):
+        def transfer(_argv, _progress):
+            staging.mkdir(parents=True, exist_ok=True)
+            (staging / "received.marker").write_text("ok")
+
+        return import_jobs_module.execute_import(
+            replace(
+                spec,
+                mode="injected",
+                source=None,
+                trusted_credentials_root=None,
+                trusted_staging_root=None,
+                trusted_inbox_root=None,
+            ),
+            transfer=transfer,
+            inspector=kwargs["inspector"],
+            callbacks=kwargs["callbacks"],
+        )
+
+    monkeypatch.setattr("vla_eval.tasks.execute_import", injected_execute)
+    monkeypatch.setattr(
+        import_jobs_module,
+        "_publish_and_report_ready",
+        lambda _spec, source, destination, _production, _callbacks: (
+            import_jobs_module._rename_no_replace(source, destination)
+        ),
+    )
+
+    run_import_task(import_job.id, runtime=_runtime(db_engine, data_root))
+
+    with session_scope(db_engine) as session:
+        crashed = session.get_one(ImportJob, import_job.id)
+        assert (crashed.state, crashed.dataset_id, crashed.publish_fingerprint) == (
+            "PREFLIGHT",
+            None,
+            "2" * 64,
+        )
+    assert target.is_dir()
+    assert not staging.exists()
+    assert recover_interrupted_jobs(runtime=_runtime(db_engine, data_root)) == 1
+
+    monkeypatch.setattr(
+        "vla_eval.tasks.execute_import",
+        lambda *_args, **_kwargs: pytest.fail("reconcile must not rerun Task 9"),
+    )
+
+    result = run_import_task(import_job.id, runtime=_runtime(db_engine, data_root))
+
+    assert result.dataset_path == target
+    assert result.inspection.fingerprint == "2" * 64
+    with session_scope(db_engine) as session:
+        job = session.get_one(ImportJob, import_job.id)
+        dataset = session.get_one(Dataset, job.dataset_id)
+        assert (job.state, job.progress) == ("READY", 100.0)
+        assert dataset.fingerprint == "2" * 64
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("missing_marker", "no durable publish fingerprint"),
+        ("fingerprint_mismatch", "fingerprint does not match"),
+        ("target_not_ready", "did not pass preflight"),
+        ("target_symlink", "must not be a symbolic link"),
+        ("staging_exists", "still has a staging path"),
+    ],
+)
+def test_interrupted_import_never_adopts_unproven_target(
+    db_engine, data_root, monkeypatch, case, message
+):
+    import_job = _create_import_job(db_engine)
+    staging = data_root / "staging" / import_job.id
+    target = data_root / "inbox" / import_job.target_name
+    marker = None if case == "missing_marker" else "3" * 64
+    with session_scope(db_engine) as session:
+        job = session.get_one(ImportJob, import_job.id)
+        job.state = "INTERRUPTED"
+        job.publish_fingerprint = marker
+
+    if case == "target_symlink":
+        outside = data_root / "outside-target"
+        outside.mkdir()
+        target.symlink_to(outside, target_is_directory=True)
+    else:
+        target.mkdir()
+        (target / "evidence.bin").write_bytes(b"evidence")
+    if case == "staging_exists":
+        staging.mkdir()
+        (staging / "partial.bin").write_bytes(b"partial")
+
+    actual_fingerprint = "4" * 64 if case == "fingerprint_mismatch" else "3" * 64
+    monkeypatch.setattr(
+        tasks_module,
+        "inspect_dataset",
+        lambda _path, *, allowed_root: DatasetInspection(
+            DatasetKind.LEROBOT,
+            case != "target_not_ready",
+            actual_fingerprint,
+            8,
+            1,
+            (),
+        ),
+    )
+    monkeypatch.setattr(
+        "vla_eval.tasks.execute_import",
+        lambda *_args, **_kwargs: pytest.fail("unproven target must not enter Task 9"),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        run_import_task(import_job.id, runtime=_runtime(db_engine, data_root))
+
+    assert os.path.lexists(target)
+    with session_scope(db_engine) as session:
+        job = session.get_one(ImportJob, import_job.id)
+        assert (job.state, job.dataset_id) == ("FAILED", None)
+
+
+def test_interrupted_import_with_no_target_resumes_through_task9(db_engine, data_root, monkeypatch):
+    import_job = _create_import_job(db_engine)
+    staging = data_root / "staging" / import_job.id
+    staging.mkdir()
+    inspection = DatasetInspection(DatasetKind.LEROBOT, True, "5" * 64, 8, 1, ())
+    with session_scope(db_engine) as session:
+        job = session.get_one(ImportJob, import_job.id)
+        job.state = "INTERRUPTED"
+        job.publish_fingerprint = "old-marker"
+    called = []
+    monkeypatch.setattr(
+        tasks_module,
+        "inspect_dataset",
+        lambda _path, *, allowed_root: inspection,
+    )
+
+    def execute(spec, *, inspector, callbacks):
+        called.append(spec.job_id)
+        callbacks.on_state("PREFLIGHT")
+        inspector(spec.staging_path)
+        callbacks.on_state("READY")
+        return ImportResult(spec.target_path, inspection)
+
+    monkeypatch.setattr("vla_eval.tasks.execute_import", execute)
+
+    run_import_task(import_job.id, runtime=_runtime(db_engine, data_root))
+
+    assert called == [import_job.id]
 
 
 def test_recover_interrupted_jobs_is_selective_idempotent_and_keeps_staging(
