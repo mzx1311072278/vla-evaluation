@@ -20,6 +20,7 @@ from typing import Any, BinaryIO
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+from pyarrow import types as pa_types
 
 from Genie02_report.attempt_eval.dataset_reader import resolve_video_columns
 
@@ -78,6 +79,20 @@ class _FileSnapshot:
     inode: int
     size: int
     mtime_ns: int
+
+
+@dataclass(frozen=True)
+class _GenieEpisode:
+    index: int
+    episode_path: str
+    trajectory_path: str
+
+
+@dataclass(frozen=True)
+class _TrajectoryRequest:
+    path: Path
+    episode_index: int
+    label: str
 
 
 class _DatasetFileError(RuntimeError):
@@ -206,6 +221,14 @@ def _is_relative_to(path: Path, root: Path) -> bool:
     return True
 
 
+def _bounded_errors(errors: list[str], limit: int = 16) -> tuple[str, ...]:
+    unique = list(dict.fromkeys(errors))
+    if len(unique) <= limit:
+        return tuple(unique)
+    omitted = len(unique) - limit + 1
+    return (*unique[: limit - 1], f"{omitted} additional validation errors omitted")
+
+
 def _resolve_root(path: Path, label: str) -> tuple[Path | None, str | None]:
     try:
         resolved = path.expanduser().resolve(strict=True)
@@ -218,9 +241,11 @@ def _resolve_root(path: Path, label: str) -> tuple[Path | None, str | None]:
     return resolved, None
 
 
-def _resolve_dataset_root(path: Path, allowed_root: Path) -> tuple[Path | None, str | None]:
+def _resolve_dataset_root(
+    path: Path, allowed_logical: Path, resolved_allowed: Path
+) -> tuple[Path | None, str | None]:
     logical = Path(os.path.abspath(path.expanduser()))
-    if not _is_relative_to(logical, allowed_root):
+    if not _is_relative_to(logical, allowed_logical):
         return None, f"dataset root is outside allowed root: {logical}"
     try:
         resolved = logical.resolve(strict=True)
@@ -228,7 +253,7 @@ def _resolve_dataset_root(path: Path, allowed_root: Path) -> tuple[Path | None, 
         return None, f"dataset root does not exist: {logical}"
     except (OSError, RuntimeError) as exc:
         return None, f"cannot resolve dataset root {logical}: {exc}"
-    if not _is_relative_to(resolved, allowed_root):
+    if not _is_relative_to(resolved, resolved_allowed):
         return None, f"dataset root is outside allowed root: {logical} -> {resolved}"
     if not resolved.is_dir():
         return None, f"dataset root is not a directory: {resolved}"
@@ -392,6 +417,14 @@ def _validate_data_parquet(
 ) -> None:
     frame_counts = {index: 0 for index in references}
     action_shape: tuple[int, ...] | None = None
+    reported: set[tuple[int | None, str]] = set()
+
+    def report_once(episode_index: int | None, category: str, message: str) -> None:
+        key = (episode_index, category)
+        if key not in reported:
+            reported.add(key)
+            errors.append(message)
+
     try:
         with _stable_binary_file(path, manifest, "referenced data parquet") as handle:
             parquet_file = pq.ParquetFile(handle)
@@ -400,6 +433,12 @@ def _validate_data_parquet(
             if missing:
                 errors.append(
                     f"referenced data parquet {path} is missing columns: {', '.join(missing)}"
+                )
+                return
+            episode_type = parquet_file.schema_arrow.field("episode_index").type
+            if not pa_types.is_integer(episode_type) or pa_types.is_boolean(episode_type):
+                errors.append(
+                    f"referenced data parquet {path} episode_index must use an integer Arrow type"
                 )
                 return
             for batch in parquet_file.iter_batches(
@@ -412,36 +451,47 @@ def _validate_data_parquet(
                     values["action"],
                     strict=True,
                 ):
-                    try:
-                        episode_index = int(index)
-                    except (TypeError, ValueError):
+                    if index is None:
                         continue
+                    episode_index = index
                     if episode_index not in references:
                         continue
                     frame_counts[episode_index] += 1
                     if isinstance(timestamp, (bool, bytes, str)) or not isinstance(timestamp, Real):
-                        errors.append(
-                            f"episode {episode_index} must have a finite numeric timestamp in {path}"
+                        report_once(
+                            episode_index,
+                            "timestamp-type",
+                            f"episode {episode_index} must have a finite numeric timestamp in {path}",
                         )
                     elif not math.isfinite(float(timestamp)):
-                        errors.append(
-                            f"episode {episode_index} timestamp must be finite numeric timestamp in {path}"
+                        report_once(
+                            episode_index,
+                            "timestamp-finite",
+                            f"episode {episode_index} timestamp must be finite numeric timestamp in {path}",
                         )
                     raw_action = np.asarray(action)
                     if raw_action.dtype.kind not in "biufc":
-                        errors.append(
-                            f"episode {episode_index} action must be a numeric action vector in {path}"
+                        report_once(
+                            episode_index,
+                            "action-type",
+                            f"episode {episode_index} action must be a numeric action vector in {path}",
                         )
                         continue
                     if raw_action.ndim != 1 or raw_action.size == 0:
-                        errors.append(
-                            f"episode {episode_index} must have a nonempty action vector in {path}"
+                        report_once(
+                            episode_index,
+                            "action-shape",
+                            f"episode {episode_index} must have a nonempty action vector in {path}",
                         )
                         continue
                     if action_shape is None:
                         action_shape = raw_action.shape
                     elif raw_action.shape != action_shape:
-                        errors.append(f"inconsistent action vector shape in {path}")
+                        report_once(
+                            None,
+                            "action-shape-consistency",
+                            f"inconsistent action vector shape in {path}",
+                        )
     except Exception as exc:  # noqa: BLE001 - pyarrow exposes varied corrupt-file errors
         errors.append(f"cannot read referenced data parquet {path}: {exc}")
         return
@@ -598,7 +648,8 @@ def _numeric_matrix(value: Any, label: str) -> np.ndarray:
             array = np.stack([np.asarray(item, dtype=float) for item in value])
         except (TypeError, ValueError) as exc:
             raise _DatasetFileError(f"{label} is not a numeric matrix") from exc
-    array = np.squeeze(array)
+    if array.ndim > 2:
+        array = np.squeeze(array)
     if array.ndim == 1:
         array = array[:, None]
     if array.ndim != 2:
@@ -651,9 +702,9 @@ def _select_ee_columns(values: np.ndarray, action_names: list[str]) -> np.ndarra
 
 def _read_trajectory_arrays(
     logical_path: Path,
-    episode_index: int,
+    episode_indices: set[int],
     manifest: _Manifest,
-) -> dict[str, Any]:
+) -> dict[int, dict[str, Any]]:
     value_keys = ("smooth_send_y", "sent_y", "action")
     time_keys = ("smooth_send_t", "sent_t", "timestamp")
     suffix = logical_path.suffix.lower()
@@ -664,7 +715,8 @@ def _read_trajectory_arrays(
         ):
             keys = set(archive.files)
             selected = [key for key in (*value_keys, *time_keys, "is_intervention") if key in keys]
-            return {key: archive[key] for key in selected}
+            data = {key: archive[key] for key in selected}
+        return {episode_index: data for episode_index in episode_indices}
     if suffix in {".parquet", ".pq"}:
         with _stable_binary_file(logical_path, manifest, "trajectory") as handle:
             parquet_file = pq.ParquetFile(handle)
@@ -680,25 +732,43 @@ def _read_trajectory_arrays(
                 )
                 if key in columns
             ]
-            frame = parquet_file.read(columns=selected).to_pandas()
-        if "episode_index" in frame:
-            frame = frame[frame["episode_index"] == episode_index]
-        if frame.empty:
-            raise _DatasetFileError(
-                f"episode {episode_index} is absent from trajectory parquet {logical_path}"
-            )
-        return {key: frame[key].to_numpy() for key in selected if key != "episode_index"}
+            value_columns = [key for key in selected if key != "episode_index"]
+            collected = {
+                episode_index: {key: [] for key in value_columns}
+                for episode_index in episode_indices
+            }
+            frame_counts = {episode_index: 0 for episode_index in episode_indices}
+            for batch in parquet_file.iter_batches(columns=selected, batch_size=65_536):
+                values = batch.to_pydict()
+                if "episode_index" not in selected:
+                    for episode_index in episode_indices:
+                        frame_counts[episode_index] += batch.num_rows
+                        for key in value_columns:
+                            collected[episode_index][key].extend(values[key])
+                    continue
+                for row_number, episode_index in enumerate(values["episode_index"]):
+                    if episode_index not in episode_indices:
+                        continue
+                    frame_counts[episode_index] += 1
+                    for key in value_columns:
+                        collected[episode_index][key].append(values[key][row_number])
+        return {
+            episode_index: {
+                key: np.asarray(value) for key, value in collected[episode_index].items()
+            }
+            for episode_index in episode_indices
+            if frame_counts[episode_index] > 0
+        }
     raise _DatasetFileError(f"unsupported trajectory format: {logical_path}")
 
 
 def _validate_trajectory_structure(
     logical_path: Path,
-    episode_index: int,
+    data: dict[str, Any],
     session: dict[str, Any],
     manifest: _Manifest,
     errors: list[str],
 ) -> None:
-    data = _read_trajectory_arrays(logical_path, episode_index, manifest)
     value_time_pairs = (
         ("smooth_send_y", "smooth_send_t"),
         ("sent_y", "sent_t"),
@@ -734,57 +804,98 @@ def _validate_trajectory_structure(
         raise _DatasetFileError("trajectory intervention-mask length mismatch")
 
 
-def _validate_genie_trajectory(
-    raw_path: str,
+def _prepare_genie_trajectory(
+    path: Path,
     *,
-    session: dict[str, Any],
     root: Path,
-    allowed_root: Path,
     manifest: _Manifest,
-    episode_index: int,
     label: str,
     errors: list[str],
-) -> bool:
-    candidate = Path(raw_path).expanduser()
+) -> _FileEntry | None:
+    candidate = path.expanduser()
     logical = Path(os.path.abspath(candidate if candidate.is_absolute() else root / candidate))
     if not _is_relative_to(logical, manifest.dataset_root):
         errors.append(f"{label} is outside dataset root: {logical}")
-        return False
+        return None
     try:
         boundary_target = logical.resolve(strict=False)
         if not _is_relative_to(boundary_target, manifest.dataset_root):
             errors.append(f"{label} is outside dataset root: {logical} -> {boundary_target}")
-            return False
+            return None
         resolved_candidate = logical.resolve(strict=True)
     except FileNotFoundError:
         errors.append(f"{label} does not exist: {logical}")
-        return False
+        return None
     except (OSError, RuntimeError) as exc:
         errors.append(f"cannot resolve {label} {logical}: {exc}")
-        return False
+        return None
     if not _is_relative_to(resolved_candidate, manifest.dataset_root):
         errors.append(f"{label} is outside dataset root: {logical} -> {resolved_candidate}")
-        return False
+        return None
     entry, error = _safe_reference(
         logical, base=root, allowed_root=manifest.dataset_root, label=label
     )
     if error:
         errors.append(error)
-        return False
+        return None
     assert entry is not None
     if not _mark_trajectory_sidecar_metadata(entry, manifest.dataset_root, manifest, errors):
-        return False
-    try:
-        _validate_trajectory_structure(entry.logical_path, episode_index, session, manifest, errors)
-    except Exception as exc:  # noqa: BLE001 - numpy/pyarrow expose varied corrupt-file errors
-        errors.append(f"cannot read {label} {logical}: {exc}")
-        return False
-    try:
-        manifest.add_file(entry.logical_path, entry.resolved_path)
-    except (OSError, ValueError) as exc:
-        errors.append(f"cannot add {label} to manifest: {exc}")
-        return False
-    return True
+        return None
+    return entry
+
+
+def _validate_genie_trajectories(
+    requests: list[_TrajectoryRequest],
+    *,
+    session: dict[str, Any],
+    root: Path,
+    manifest: _Manifest,
+) -> dict[tuple[Path, int], tuple[str, ...]]:
+    grouped: dict[Path, list[_TrajectoryRequest]] = {}
+    for request in requests:
+        grouped.setdefault(request.path, []).append(request)
+
+    results: dict[tuple[Path, int], tuple[str, ...]] = {}
+    for path, path_requests in grouped.items():
+        unique_indices = {request.episode_index for request in path_requests}
+        label = path_requests[0].label
+        path_errors: list[str] = []
+        entry = _prepare_genie_trajectory(
+            path, root=root, manifest=manifest, label=label, errors=path_errors
+        )
+        if entry is None:
+            for episode_index in unique_indices:
+                results[(path, episode_index)] = tuple(path_errors)
+            continue
+        try:
+            data_by_episode = _read_trajectory_arrays(entry.logical_path, unique_indices, manifest)
+            manifest.add_file(entry.logical_path, entry.resolved_path)
+        except Exception as exc:  # noqa: BLE001 - numpy/pyarrow expose varied corrupt-file errors
+            message = f"cannot read {label} {entry.logical_path}: {exc}"
+            for episode_index in unique_indices:
+                results[(path, episode_index)] = (message,)
+            continue
+        for episode_index in unique_indices:
+            if episode_index not in data_by_episode:
+                message = (
+                    f"cannot read {label} {entry.logical_path}: episode {episode_index} "
+                    f"is absent from trajectory parquet {entry.logical_path}"
+                )
+                results[(path, episode_index)] = (message,)
+                continue
+            structure_errors: list[str] = []
+            try:
+                _validate_trajectory_structure(
+                    entry.logical_path,
+                    data_by_episode[episode_index],
+                    session,
+                    manifest,
+                    structure_errors,
+                )
+            except Exception as exc:  # noqa: BLE001 - numpy exposes varied corrupt-array errors
+                structure_errors.append(f"cannot read {label} {entry.logical_path}: {exc}")
+            results[(path, episode_index)] = tuple(structure_errors)
+    return results
 
 
 def _mark_trajectory_sidecar_metadata(
@@ -899,16 +1010,36 @@ def _load_genie_session(
     if session is None:
         return None
     missing = [field for field in _SESSION_FIELDS if field not in session]
-    if (
-        session.get("record_dataset", True) is not False
-        and not str(session.get("trajectory_log_dir", "")).strip()
-        and not str(session.get("dataset_root", "")).strip()
-    ):
-        missing.append("dataset_root")
     if missing:
         errors.append(f"session.json is missing fields: {', '.join(dict.fromkeys(missing))}")
         return None
     try:
+        string_fields = (
+            "schema_version",
+            "session_id",
+            "created_at",
+            "status",
+            "rollout_config_path",
+            "rollout_mode",
+            "policy_path",
+            "task",
+            "dataset_backend",
+        )
+        for field in string_fields:
+            if not isinstance(session[field], str):
+                raise _DatasetFileError(f"session.json {field} must be a string")
+        for field in ("trajectory_log_dir", "dataset_root"):
+            if field in session and not isinstance(session[field], str):
+                raise _DatasetFileError(f"session.json {field} must be a string")
+        if "record_dataset" in session and not isinstance(session["record_dataset"], bool):
+            raise _DatasetFileError("session.json record_dataset must be a boolean")
+        records_dataset = session.get("record_dataset", True) is not False
+        if (
+            records_dataset
+            and not session.get("trajectory_log_dir", "").strip()
+            and not session.get("dataset_root", "").strip()
+        ):
+            raise _DatasetFileError("session.json is missing fields: dataset_root")
         if session["schema_version"] != "1.0":
             raise _DatasetFileError("session.json schema_version must be '1.0'")
         if session["status"] not in {"recording", "completed", "aborted"}:
@@ -917,7 +1048,7 @@ def _load_genie_session(
             raise _DatasetFileError(f"invalid rollout_mode: {session['rollout_mode']!r}")
         if session["dataset_backend"] not in {"lerobot", "native"}:
             raise _DatasetFileError(f"invalid dataset_backend: {session['dataset_backend']!r}")
-        if _finite_float(session["fps"], "session.fps") <= 0:
+        if isinstance(session["fps"], bool) or _finite_float(session["fps"], "session.fps") <= 0:
             raise _DatasetFileError("session.fps must be greater than zero")
         target = session["num_episodes_target"]
         if not isinstance(target, int) or isinstance(target, bool) or target < 0:
@@ -933,7 +1064,7 @@ def _load_genie_episodes(
     session: dict[str, Any],
     manifest: _Manifest,
     errors: list[str],
-) -> list[dict[str, str]] | None:
+) -> list[_GenieEpisode] | None:
     path = root / "episodes.csv"
     try:
         with _stable_binary_file(path, manifest, "episodes.csv") as handle:
@@ -946,16 +1077,22 @@ def _load_genie_episodes(
     except (OSError, UnicodeError, csv.Error, _DatasetFileError) as exc:
         errors.append(f"cannot read episodes.csv: {exc}")
         return None
+    valid_rows: list[_GenieEpisode] = []
     seen: set[int] = set()
     for line, row in enumerate(rows, 2):
         prefix = f"episodes.csv row {line}"
         try:
-            index = int(row["episode_index"])
+            for field in _EPISODE_FIELDS:
+                if not isinstance(row.get(field), str):
+                    raise _DatasetFileError(f"{prefix}: {field} must be a string")
+            try:
+                index = int(row["episode_index"])
+            except ValueError as exc:
+                raise _DatasetFileError(f"{prefix}: invalid episode_index") from exc
             if row["session_id"] != session["session_id"] or index < 0 or index in seen:
                 raise _DatasetFileError(f"{prefix}: invalid session_id or episode_index")
-            seen.add(index)
             has_path = bool(row["episode_path"].strip() or row["trajectory_path"].strip())
-            has_session_path = bool(str(session.get("trajectory_log_dir", "")).strip())
+            has_session_path = bool(session.get("trajectory_log_dir", "").strip())
             if not (has_path or has_session_path):
                 raise _DatasetFileError(f"{prefix}: episode_path or trajectory_path is required")
             if row["outcome"].strip().lower() not in {"success", "failure"}:
@@ -967,9 +1104,18 @@ def _load_genie_episodes(
                 raise _DatasetFileError(f"{prefix}: invalid timestamps or duration_s")
             if row["operator_intervened"].strip().lower() not in {"true", "false"}:
                 raise _DatasetFileError(f"{prefix}: invalid operator_intervened")
+            seen.add(index)
+            valid_rows.append(
+                _GenieEpisode(
+                    index=index,
+                    episode_path=row["episode_path"].strip(),
+                    trajectory_path=row["trajectory_path"].strip(),
+                )
+            )
         except (TypeError, ValueError, _DatasetFileError) as exc:
-            errors.append(str(exc))
-    return rows
+            message = str(exc) or f"{prefix}: invalid episode_index"
+            errors.append(message)
+    return valid_rows
 
 
 def _inspect_genie02(
@@ -996,13 +1142,17 @@ def _inspect_genie02(
         return None, errors
 
     trajectory_directories: list[Path] = []
-    if str(session.get("trajectory_log_dir", "")).strip():
-        trajectory_directories.append(Path(str(session["trajectory_log_dir"])))
+    if session.get("trajectory_log_dir", "").strip():
+        trajectory_directories.append(Path(session["trajectory_log_dir"]))
     raw_refs_path = root / "raw_refs.json"
     if raw_refs_path in manifest.files:
         refs = _read_json(raw_refs_path, "raw_refs.json", errors, manifest)
-        if refs and str(refs.get("trajectory_log_dir", "")).strip():
-            trajectory_directories.append(Path(str(refs["trajectory_log_dir"])))
+        if refs:
+            raw_directory = refs.get("trajectory_log_dir", "")
+            if not isinstance(raw_directory, str):
+                errors.append("raw_refs.json trajectory_log_dir must be a string")
+            elif raw_directory.strip():
+                trajectory_directories.append(Path(raw_directory))
     trajectory_directories.append(Path("trajectories"))
 
     resolved_directories: list[Path] = []
@@ -1020,9 +1170,12 @@ def _inspect_genie02(
         if directory.is_dir() and directory not in resolved_directories:
             resolved_directories.append(directory)
 
+    direct_requests: list[_TrajectoryRequest] = []
+    alternatives: dict[int, list[_TrajectoryRequest]] = {}
+    scanned_episode_paths: set[Path] = set()
     for row in rows:
-        index = int(row["episode_index"])
-        trajectory_path = row["trajectory_path"].strip()
+        index = row.index
+        trajectory_path = row.trajectory_path
         if trajectory_path:
             direct_path, error = _safe_logical_path(
                 trajectory_path,
@@ -1049,15 +1202,12 @@ def _inspect_genie02(
                     None,
                 )
             if selected_path is not None:
-                _validate_genie_trajectory(
-                    str(selected_path),
-                    session=session,
-                    root=root,
-                    allowed_root=allowed_root,
-                    manifest=manifest,
-                    episode_index=index,
-                    label=f"episodes.csv trajectory_path for episode {index}",
-                    errors=errors,
+                direct_requests.append(
+                    _TrajectoryRequest(
+                        path=selected_path,
+                        episode_index=index,
+                        label=f"episodes.csv trajectory_path for episode {index}",
+                    )
                 )
                 continue
 
@@ -1070,19 +1220,16 @@ def _inspect_genie02(
             None,
         )
         if selected_path is not None:
-            _validate_genie_trajectory(
-                str(selected_path),
-                session=session,
-                root=root,
-                allowed_root=allowed_root,
-                manifest=manifest,
-                episode_index=index,
-                label=f"trajectory for episode {index}",
-                errors=errors,
+            direct_requests.append(
+                _TrajectoryRequest(
+                    path=selected_path,
+                    episode_index=index,
+                    label=f"trajectory for episode {index}",
+                )
             )
             continue
 
-        episode_path = row["episode_path"].strip()
+        episode_path = row.episode_path
         if not episode_path:
             errors.append(f"no trajectory found for episode {index}")
             continue
@@ -1101,46 +1248,48 @@ def _inspect_genie02(
             if native_path is None:
                 errors.append(f"no native frames.npz for episode {index}")
                 continue
-            _validate_genie_trajectory(
-                str(native_path),
-                session=session,
-                root=root,
-                allowed_root=allowed_root,
-                manifest=manifest,
-                episode_index=index,
-                label=f"episodes.csv episode_path for episode {index}",
-                errors=errors,
+            direct_requests.append(
+                _TrajectoryRequest(
+                    path=native_path,
+                    episode_index=index,
+                    label=f"episodes.csv episode_path for episode {index}",
+                )
             )
             continue
         if not logical_episode_path.exists():
             errors.append(f"episode_path does not exist: {logical_episode_path}")
             continue
-        scan_errors = _scan_dataset(logical_episode_path, allowed_root, manifest)
-        errors.extend(scan_errors)
+        if logical_episode_path not in scanned_episode_paths:
+            scanned_episode_paths.add(logical_episode_path)
+            errors.extend(_scan_dataset(logical_episode_path, allowed_root, manifest))
         parquet_paths = sorted(
             path
             for path in manifest.files
             if _is_relative_to(path, logical_episode_path / "data") and path.suffix == ".parquet"
         )
-        last_errors: list[str] = []
-        for parquet_path in parquet_paths:
-            candidate_errors: list[str] = []
-            if _validate_genie_trajectory(
-                str(parquet_path),
-                session=session,
-                root=root,
-                allowed_root=allowed_root,
-                manifest=manifest,
+        alternatives[index] = [
+            _TrajectoryRequest(
+                path=parquet_path,
                 episode_index=index,
                 label=f"episodes.csv episode_path for episode {index}",
-                errors=candidate_errors,
-            ):
-                last_errors = []
-                break
-            last_errors = candidate_errors
-        else:
-            suffix = f": {last_errors[-1]}" if last_errors else ""
-            errors.append(f"no LeRobot parquet for episode {index}{suffix}")
+            )
+            for parquet_path in parquet_paths
+        ]
+
+    all_requests = direct_requests + [
+        request for candidates in alternatives.values() for request in candidates
+    ]
+    validation_results = _validate_genie_trajectories(
+        all_requests, session=session, root=root, manifest=manifest
+    )
+    for request in direct_requests:
+        errors.extend(validation_results[(request.path, request.episode_index)])
+    for index, candidates in alternatives.items():
+        if any(not validation_results[(candidate.path, index)] for candidate in candidates):
+            continue
+        last_errors = validation_results[(candidates[-1].path, index)] if candidates else ()
+        suffix = f": {last_errors[-1]}" if last_errors else ""
+        errors.append(f"no LeRobot parquet for episode {index}{suffix}")
     return len(rows), errors
 
 
@@ -1170,6 +1319,7 @@ def _detect_kind(root: Path) -> tuple[DatasetKind | None, str | None]:
 
 def inspect_dataset(path: Path, allowed_root: Path) -> DatasetInspection:
     """Inspect a quiescent dataset; portable filesystems cannot snapshot a whole tree atomically."""
+    allowed_logical = Path(os.path.abspath(allowed_root.expanduser()))
     resolved_allowed, allowed_error = _resolve_root(allowed_root, "allowed root")
     if allowed_error:
         empty_manifest = _Manifest(Path.cwd())
@@ -1178,7 +1328,7 @@ def inspect_dataset(path: Path, allowed_root: Path) -> DatasetInspection:
         )
     assert resolved_allowed is not None
 
-    resolved_root, root_error = _resolve_dataset_root(path, resolved_allowed)
+    resolved_root, root_error = _resolve_dataset_root(path, allowed_logical, resolved_allowed)
     if root_error:
         empty_manifest = _Manifest(resolved_allowed)
         return DatasetInspection(None, False, empty_manifest.fingerprint(), 0, None, (root_error,))
@@ -1201,7 +1351,7 @@ def inspect_dataset(path: Path, allowed_root: Path) -> DatasetInspection:
 
     validation_errors.extend(manifest.verify_unchanged())
 
-    errors = tuple(scan_errors + validation_errors)
+    errors = _bounded_errors(scan_errors + validation_errors)
     return DatasetInspection(
         kind=kind,
         ready=kind is not None and not errors,

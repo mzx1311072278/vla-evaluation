@@ -2,10 +2,12 @@ import csv
 import json
 import os
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from vla_eval import datasets
 from vla_eval.datasets import DatasetKind, inspect_dataset
@@ -761,3 +763,149 @@ def test_symlink_swap_between_check_and_parse_is_rejected(tmp_path: Path, monkey
     assert any(
         "changed during inspection" in error or "symlink" in error for error in result.errors
     )
+
+
+def test_malformed_session_container_type_returns_not_ready(tmp_path: Path):
+    root = _write_native_session(tmp_path / "run")
+    session = json.loads((root / "session.json").read_text(encoding="utf-8"))
+    session["status"] = []
+    (root / "session.json").write_text(json.dumps(session), encoding="utf-8")
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is False
+    assert any("status" in error for error in result.errors)
+
+
+def test_invalid_episode_index_is_filtered_before_downstream_use(tmp_path: Path):
+    root = _write_native_session(tmp_path / "run")
+    text = (root / "episodes.csv").read_text(encoding="utf-8")
+    (root / "episodes.csv").write_text(
+        text.replace("native-fixture,0,", "native-fixture,not-an-index,"),
+        encoding="utf-8",
+    )
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is False
+    assert any("episode_index" in error for error in result.errors)
+
+
+def test_truncated_episode_row_returns_not_ready(tmp_path: Path):
+    root = _write_native_session(tmp_path / "run")
+    header = (root / "episodes.csv").read_text(encoding="utf-8").splitlines()[0]
+    (root / "episodes.csv").write_text(
+        f"{header}\nnative-fixture,0\n",
+        encoding="utf-8",
+    )
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is False
+    assert any("row 2" in error for error in result.errors)
+
+
+@pytest.mark.parametrize("episode_index", [0.5, "0"])
+def test_lerobot_data_requires_integer_arrow_episode_index(tmp_path: Path, episode_index):
+    root = _write_lerobot(tmp_path / "run")
+    pd.DataFrame(
+        {"episode_index": [episode_index], "timestamp": [0.0], "action": [[0.0, 0.0]]}
+    ).to_parquet(root / "data/chunk-000/file-000.parquet")
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is False
+    assert any("integer Arrow" in error for error in result.errors)
+
+
+@pytest.mark.parametrize("episode_count", [2, 100])
+def test_shared_genie_parquet_opens_once(tmp_path: Path, monkeypatch, episode_count: int):
+    root = _write_native_session(
+        tmp_path / "run",
+        trajectory_path="recording/data/chunk-000/shared.parquet",
+        create_trajectory=False,
+    )
+    session = json.loads((root / "session.json").read_text(encoding="utf-8"))
+    session["num_episodes_target"] = episode_count
+    (root / "session.json").write_text(json.dumps(session), encoding="utf-8")
+    with (root / "episodes.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=EPISODE_FIELDS)
+        writer.writeheader()
+        for index in range(episode_count):
+            writer.writerow(
+                {
+                    "session_id": "native-fixture",
+                    "episode_index": index,
+                    "episode_path": "",
+                    "trajectory_path": "recording/data/chunk-000/shared.parquet",
+                    "t_start": 0,
+                    "t_end": 1,
+                    "duration_s": 1,
+                    "outcome": "success",
+                    "operator_intervened": "false",
+                    "notes": "",
+                }
+            )
+    shared = root / "recording/data/chunk-000/shared.parquet"
+    shared.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "episode_index": list(range(episode_count)),
+            "timestamp": [0.0] * episode_count,
+            "action": [[0.0, 0.0]] * episode_count,
+        }
+    ).to_parquet(shared)
+    open_count = 0
+    original_open = datasets._stable_binary_file
+
+    @contextmanager
+    def count_open(path, *args, **kwargs):
+        nonlocal open_count
+        if Path(path) == shared:
+            open_count += 1
+        with original_open(path, *args, **kwargs) as handle:
+            yield handle
+
+    monkeypatch.setattr(datasets, "_stable_binary_file", count_open)
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is True
+    assert open_count == 1
+
+
+def test_allowed_root_symlink_spelling_is_supported(tmp_path: Path):
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    allowed_link = tmp_path / "allowed-link"
+    allowed_link.symlink_to(real_root, target_is_directory=True)
+    dataset = _write_lerobot(allowed_link / "run")
+
+    result = inspect_dataset(dataset, allowed_root=allowed_link)
+
+    assert result.ready is True
+
+
+def test_corrupt_frames_have_bounded_deduplicated_errors(tmp_path: Path):
+    root = _write_lerobot(tmp_path / "run")
+    pd.DataFrame(
+        {
+            "episode_index": [0],
+            "length": [1000],
+            "episode_success": ["success"],
+            "data/chunk_index": [0],
+            "data/file_index": [0],
+        }
+    ).to_parquet(root / "meta/episodes/chunk-000/file-000.parquet")
+    pd.DataFrame(
+        {
+            "episode_index": [0] * 1000,
+            "timestamp": [0.0] * 1000,
+            "action": [["bad"]] * 1000,
+        }
+    ).to_parquet(root / "data/chunk-000/file-000.parquet")
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is False
+    assert len(result.errors) <= 16
