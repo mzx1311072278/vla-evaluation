@@ -2,19 +2,20 @@
 
 from __future__ import annotations
 
+import codecs
 import math
 import os
 import re
+import selectors
 import shlex
 import stat
 import subprocess
 import unicodedata
 from collections import deque
 from collections.abc import Callable, Sequence
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Final
+from typing import Final, Literal
 
 from vla_eval.config import RemoteSource
 from vla_eval.datasets import DatasetInspection, inspect_dataset
@@ -43,6 +44,7 @@ _MAX_TAIL_LINE_LENGTH = 500
 _MAX_VALIDATION_ERRORS = 8
 _MAX_VALIDATION_ERROR_LENGTH = 240
 _PROCESS_WAIT_SECONDS = 2.0
+_PROCESS_POLL_SECONDS = 0.1
 
 StateCallback = Callable[[str], None]
 ProgressCallback = Callable[[float], None]
@@ -70,6 +72,27 @@ class ImportCallbacks:
     is_cancelled: CancellationCallback = _not_cancelled
 
 
+class _ProgressReporter:
+    def __init__(self, callbacks: ImportCallbacks) -> None:
+        self.callbacks = callbacks
+        self.last_progress = 0.0
+
+    def poll(self) -> None:
+        if self.callbacks.is_cancelled():
+            raise TransferError("import cancelled")
+
+    def __call__(self, value: float) -> None:
+        self.poll()
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            numeric = self.last_progress
+        self.last_progress = max(
+            self.last_progress,
+            min(100.0, max(0.0, numeric)),
+        )
+        self.callbacks.on_progress(self.last_progress)
+
+
 @dataclass(frozen=True)
 class ImportSpec:
     job_id: str
@@ -78,6 +101,7 @@ class ImportSpec:
     remote_relative_path: str
     staging_path: Path
     target_path: Path
+    mode: Literal["injected", "production"] = "injected"
     source: RemoteSource | None = None
     trusted_credentials_root: Path | None = None
     trusted_staging_root: Path | None = None
@@ -147,31 +171,103 @@ def _argv_secrets(argv: Sequence[str]) -> tuple[str, ...]:
     return tuple(secrets)
 
 
-def _terminate_process(process: subprocess.Popen[str]) -> None:
+def _terminate_process(process: subprocess.Popen[str]) -> list[Exception]:
+    errors: list[Exception] = []
     try:
         process.terminate()
-    except OSError:
-        pass
+    except Exception as error:  # noqa: BLE001 - aggregate arbitrary cleanup failures
+        errors.append(error)
     try:
         process.wait(timeout=_PROCESS_WAIT_SECONDS)
-        return
-    except (subprocess.TimeoutExpired, OSError):
+        return errors
+    except subprocess.TimeoutExpired:
         pass
+    except Exception as error:  # noqa: BLE001 - cleanup must continue through kill
+        errors.append(error)
     try:
         process.kill()
-    except OSError:
-        pass
+    except Exception as error:  # noqa: BLE001 - aggregate arbitrary cleanup failures
+        errors.append(error)
     try:
         process.wait(timeout=_PROCESS_WAIT_SECONDS)
-    except (subprocess.TimeoutExpired, OSError):
-        pass
+    except Exception as error:  # noqa: BLE001 - aggregate arbitrary cleanup failures
+        errors.append(error)
+    return errors
 
 
-def run_rsync(argv: Sequence[str], on_progress: ProgressCallback) -> None:
+def _normalize_argv(argv: Sequence[str]) -> list[str]:
+    if isinstance(argv, (str, bytes)):
+        raise TransferError("rsync argv must be a nonempty sequence of strings")
+    try:
+        normalized = list(argv)
+    except (TypeError, ValueError) as error:
+        raise TransferError("rsync argv must be a nonempty sequence of strings") from error
+    if not normalized:
+        raise TransferError("rsync argv must be a nonempty sequence of strings")
+    for argument in normalized:
+        if not isinstance(argument, str) or not argument:
+            raise TransferError("rsync argv entries must be nonempty strings")
+        if any(unicodedata.category(character) in {"Cc", "Cf", "Cs"} for character in argument):
+            raise TransferError("rsync argv entries must not contain control characters")
+    return normalized
+
+
+def _fallback_stream(output: object, feed_text: Callable[[str], None]) -> None:
+    read = output.read  # type: ignore[attr-defined]
+    while chunk := read(4096):
+        if isinstance(chunk, bytes):
+            chunk = chunk.decode("utf-8", errors="replace")
+        feed_text(chunk)
+
+
+def _selector_stream(
+    output: object,
+    descriptor: int,
+    feed_text: Callable[[str], None],
+    on_poll: Callable[[], None],
+) -> None:
+    selector = selectors.DefaultSelector()
+    selector.register(descriptor, selectors.EVENT_READ)
+    encoding = getattr(output, "encoding", None) or "utf-8"
+    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+    primary: BaseException | None = None
+    try:
+        while True:
+            events = selector.select(_PROCESS_POLL_SECONDS)
+            if not events:
+                on_poll()
+                continue
+            chunk = os.read(descriptor, 4096)
+            if not chunk:
+                break
+            feed_text(decoder.decode(chunk))
+        feed_text(decoder.decode(b"", final=True))
+    except BaseException as error:  # noqa: BLE001 - preserve interrupts during cleanup
+        primary = error
+    try:
+        selector.close()
+    except Exception as close_error:
+        if primary is not None:
+            raise BaseExceptionGroup(
+                "streaming and selector cleanup both failed",
+                [primary, close_error],
+            ) from primary
+        raise
+    if primary is not None:
+        raise primary
+
+
+def run_rsync(
+    argv: Sequence[str],
+    on_progress: ProgressCallback,
+    *,
+    on_poll: Callable[[], None] | None = None,
+) -> None:
     """Run one argv-only rsync process and stream progress2 updates."""
+    normalized_argv = _normalize_argv(argv)
     try:
         process = subprocess.Popen(
-            argv,
+            normalized_argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -181,18 +277,25 @@ def run_rsync(argv: Sequence[str], on_progress: ProgressCallback) -> None:
         raise TransferError("rsync executable was not found; install rsync and retry") from error
     except PermissionError as error:
         raise TransferError("rsync could not be started due to a permission error") from error
-    except OSError as error:
+    except (OSError, ValueError, TypeError, IndexError) as error:
         raise TransferError("rsync could not be started") from error
 
     output = process.stdout
     if output is None:
-        _terminate_process(process)
-        raise TransferError("rsync output pipe was unavailable")
+        cleanup_errors = _terminate_process(process)
+        failure = TransferError("rsync output pipe was unavailable")
+        if cleanup_errors:
+            raise ExceptionGroup(
+                "rsync output setup and process cleanup both failed",
+                [failure, *cleanup_errors],
+            ) from failure
+        raise failure
 
     tail: deque[str] = deque(maxlen=_MAX_TAIL_LINES)
-    secrets = _argv_secrets(argv)
+    secrets = _argv_secrets(normalized_argv)
     pending = ""
     last_progress = 0.0
+    poll_callback = on_poll or getattr(on_progress, "poll", _not_cancelled)
 
     def consume_record(record: str) -> None:
         nonlocal last_progress
@@ -208,21 +311,40 @@ def run_rsync(argv: Sequence[str], on_progress: ProgressCallback) -> None:
             on_progress(last_progress)
             return
 
+    def feed_text(chunk: str) -> None:
+        nonlocal pending
+        for character in chunk:
+            if character in "\r\n":
+                consume_record(pending)
+                pending = ""
+            else:
+                pending += character
+
     try:
-        while chunk := output.read(4096):
-            for character in chunk:
-                if character in "\r\n":
-                    consume_record(pending)
-                    pending = ""
-                else:
-                    pending += character
+        try:
+            descriptor = output.fileno()
+        except (AttributeError, OSError, TypeError, ValueError):
+            _fallback_stream(output, feed_text)
+        else:
+            _selector_stream(output, descriptor, feed_text, poll_callback)
         consume_record(pending)
         returncode = process.wait()
-    except BaseException:
-        _terminate_process(process)
+    except BaseException as primary:
+        cleanup_errors = _terminate_process(process)
+        try:
+            output.close()
+        except Exception as close_error:  # noqa: BLE001 - aggregate cleanup with primary
+            cleanup_errors.append(close_error)
+        if cleanup_errors:
+            raise BaseExceptionGroup(
+                "rsync execution and cleanup both failed",
+                [primary, *cleanup_errors],
+            ) from primary
         raise
-    finally:
+    try:
         output.close()
+    except Exception as close_error:
+        raise TransferError("rsync output cleanup failed") from close_error
 
     if returncode != 0:
         raise TransferError(f"rsync exited with status {returncode}", tuple(tail))
@@ -238,6 +360,8 @@ def _absolute_path(value: Path, field_name: str) -> Path:
         raise ValueError(f"{field_name} must be a filesystem path") from error
     if not path.is_absolute():
         raise ValueError(f"{field_name} must be absolute")
+    if ".." in path.parts:
+        raise ValueError(f"{field_name} must not contain '..' components")
     return Path(os.path.abspath(path))
 
 
@@ -298,6 +422,28 @@ def _create_under_root(destination: Path, root: Path, field_name: str) -> None:
     _validate_protected_directory(destination, field_name)
 
 
+def _ensure_safe_injected_directory(path: Path, field_name: str) -> None:
+    path = _absolute_path(path, field_name)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path.anchor, flags)
+    try:
+        for part in path.parts[1:]:
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+            try:
+                child_descriptor = os.open(part, flags, dir_fd=descriptor)
+            except OSError as error:
+                raise ValueError(
+                    f"{field_name} must not contain symlink or non-directory components"
+                ) from error
+            os.close(descriptor)
+            descriptor = child_descriptor
+    finally:
+        os.close(descriptor)
+
+
 def _validate_spec(spec: ImportSpec) -> tuple[Path, Path]:
     if not spec.job_id.strip() or not spec.source_name.strip():
         raise ValueError("job and source names must not be empty")
@@ -323,8 +469,8 @@ def _prepare_paths(spec: ImportSpec, staging: Path, target: Path, production: bo
         _create_under_root(staging, staging_root, "staging path")
         _create_under_root(target.parent, inbox_root, "inbox path")
     else:
-        staging.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _ensure_safe_injected_directory(staging.parent, "staging parent")
+        _ensure_safe_injected_directory(target.parent, "target parent")
         _validate_no_symlink_directory(staging.parent, "staging parent")
         _validate_no_symlink_directory(target.parent, "target parent")
 
@@ -341,6 +487,25 @@ def _require_production_context(spec: ImportSpec) -> None:
     assert spec.source is not None
     if spec.source.name != spec.source_name:
         raise ValueError("remote source does not match source name")
+
+
+def _is_production_mode(spec: ImportSpec, transfer: Transfer) -> bool:
+    context = (
+        spec.source,
+        spec.trusted_credentials_root,
+        spec.trusted_staging_root,
+        spec.trusted_inbox_root,
+    )
+    if spec.mode == "production":
+        _require_production_context(spec)
+        return True
+    if spec.mode != "injected":
+        raise ValueError("import mode must be 'injected' or 'production'")
+    if any(value is not None for value in context):
+        raise ValueError("injected mode must not include production context")
+    if transfer is _DEFAULT_RUN_RSYNC or transfer is run_rsync:
+        raise ValueError("injected mode requires an explicit custom transfer")
+    return False
 
 
 def _ensure_target_available(target: Path) -> None:
@@ -393,20 +558,20 @@ def execute_import(
     callbacks: ImportCallbacks = _DEFAULT_CALLBACKS,
 ) -> ImportResult:
     """Transfer, preflight, and atomically publish one remote dataset."""
-    production = transfer is _DEFAULT_RUN_RSYNC or transfer is run_rsync
-    actual_transfer = run_rsync if transfer is _DEFAULT_RUN_RSYNC else transfer
-    if not callable(actual_transfer):
+    if not callable(transfer):
         raise TypeError("transfer must be callable")
     if inspector is not _DEFAULT_INSPECTOR and not callable(inspector):
         raise TypeError("inspector must be callable")
 
+    production = False
     failure_callback_needed = False
+    injected_transfer_started = False
+    published = False
     try:
+        production = _is_production_mode(spec, transfer)
         staging, target = _validate_spec(spec)
         _emit_state(callbacks, CONNECTING)
         failure_callback_needed = True
-        if production:
-            _require_production_context(spec)
         _prepare_paths(spec, staging, target, production)
         _verify_target_parent(spec, target, production)
         filesystem_probe = staging if staging.exists() else staging.parent
@@ -432,19 +597,9 @@ def execute_import(
         else:
             argv = []
 
-        last_progress = 0.0
-
-        def report_progress(value: float) -> None:
-            nonlocal last_progress
-            if callbacks.is_cancelled():
-                raise TransferError("import cancelled")
-            numeric = float(value)
-            if not math.isfinite(numeric):
-                numeric = last_progress
-            last_progress = max(last_progress, min(100.0, max(0.0, numeric)))
-            callbacks.on_progress(last_progress)
-
-        actual_transfer(argv, report_progress)
+        report_progress = _ProgressReporter(callbacks)
+        injected_transfer_started = not production
+        transfer(argv, report_progress)
         _emit_state(callbacks, VERIFYING)
         _verify_staging(spec, staging, production)
         _verify_target_parent(spec, target, production)
@@ -460,7 +615,9 @@ def execute_import(
         _verify_staging(spec, staging, production)
         _verify_target_parent(spec, target, production)
         _ensure_same_filesystem(staging, target.parent)
+        report_progress.poll()
         staging.replace(target)
+        published = True
 
         if not target.exists():
             raise OSError("published dataset target is missing")
@@ -470,15 +627,34 @@ def execute_import(
             if not _is_contained(target.resolve(strict=True), resolved_root):
                 raise OSError("published dataset escaped trusted inbox root")
 
-        _emit_state(callbacks, READY)
+        try:
+            callbacks.on_state(READY)
+        except Exception as ready_error:
+            try:
+                target.replace(staging)
+            except Exception as rollback_error:  # noqa: BLE001 - report compound publish failure
+                raise ExceptionGroup(
+                    "READY callback failed and dataset rollback failed",
+                    [ready_error, rollback_error],
+                ) from ready_error
+            published = False
+            raise
         failure_callback_needed = False
         return ImportResult(dataset_path=target, inspection=inspection)
-    except BaseException:
-        if not production:
+    except BaseException as original:
+        if not production and injected_transfer_started and not published:
             staging_path = Path(spec.staging_path)
             if staging_path.is_absolute() and not os.path.lexists(staging_path):
-                staging_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+                try:
+                    _ensure_safe_injected_directory(staging_path, "staging path")
+                except (OSError, ValueError) as placeholder_error:
+                    original.add_note(f"staging placeholder was not created: {placeholder_error}")
         if failure_callback_needed:
-            with suppress(Exception):
+            try:
                 callbacks.on_state(FAILED)
+            except Exception as failed_callback_error:  # noqa: BLE001 - preserve both callbacks
+                raise BaseExceptionGroup(
+                    "import and FAILED callback both failed",
+                    [original, failed_callback_error],
+                ) from original
         raise

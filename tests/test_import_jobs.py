@@ -1,4 +1,7 @@
 import subprocess
+import sys
+import threading
+from dataclasses import replace
 from inspect import signature
 from pathlib import Path
 from types import SimpleNamespace
@@ -226,6 +229,28 @@ class FakeStream:
         self.closed = True
 
 
+class SelectableFakeStream(FakeStream):
+    def fileno(self):
+        return 42
+
+
+class FakeSelector:
+    def __init__(self):
+        self.calls = 0
+
+    def register(self, _file, _events):
+        return None
+
+    def select(self, _timeout):
+        self.calls += 1
+        if self.calls == 1:
+            return []
+        return [(object(), 1)]
+
+    def close(self):
+        return None
+
+
 def test_run_rsync_uses_exact_argv_without_shell(monkeypatch):
     process = FakeProcess("")
     captured = {}
@@ -299,8 +324,196 @@ def test_run_rsync_cleans_up_process_when_progress_callback_fails(monkeypatch):
     assert process.stdout.closed is True
 
 
-def test_default_transfer_refuses_missing_trust_context(tmp_path):
-    spec = import_spec(tmp_path / "staging/job-1", tmp_path / "inbox/alice/run-1")
+def test_run_rsync_selector_polls_while_quiet_and_streams_partial_cr(monkeypatch):
+    process = FakeProcess("")
+    process.stdout = SelectableFakeStream("")
+    chunks = iter([b"  1,000  10% 1MB/s\r", b""])
+    monkeypatch.setattr("vla_eval.import_jobs.subprocess.Popen", lambda *_a, **_kw: process)
+    monkeypatch.setattr("vla_eval.import_jobs.selectors.DefaultSelector", FakeSelector)
+    monkeypatch.setattr("vla_eval.import_jobs.os.read", lambda _fd, _size: next(chunks))
+    progress = []
+    polls = []
+
+    run_rsync(["rsync"], progress.append, on_poll=lambda: polls.append("poll"))
+
+    assert polls == ["poll"]
+    assert progress == [10.0]
+
+
+def test_run_rsync_quiet_poll_cancellation_terminates_without_fake_progress(monkeypatch):
+    process = FakeProcess("")
+    process.stdout = SelectableFakeStream("")
+    monkeypatch.setattr("vla_eval.import_jobs.subprocess.Popen", lambda *_a, **_kw: process)
+    monkeypatch.setattr("vla_eval.import_jobs.selectors.DefaultSelector", FakeSelector)
+    progress = []
+
+    with pytest.raises(TransferError, match="cancelled"):
+        run_rsync(
+            ["rsync"],
+            progress.append,
+            on_poll=lambda: (_ for _ in ()).throw(TransferError("cancelled")),
+        )
+
+    assert process.terminated is True
+    assert process.stdout.closed is True
+    assert progress == []
+
+
+def test_run_rsync_observes_flushed_cr_before_local_child_exits():
+    progress_seen = threading.Event()
+    finished = threading.Event()
+    errors = []
+    argv = [
+        sys.executable,
+        "-u",
+        "-c",
+        "import sys,time;sys.stdout.write('  1,000  10% 1MB/s\\r');sys.stdout.flush();time.sleep(0.4)",
+    ]
+
+    def worker():
+        try:
+            run_rsync(argv, lambda _progress: progress_seen.set())
+        except Exception as error:  # noqa: BLE001 - relay worker failures to the test thread
+            errors.append(error)
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    assert progress_seen.wait(timeout=0.3)
+    assert not finished.is_set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert errors == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [],
+        [""],
+        ["rsync", "bad\x00argument"],
+        ["rsync", "bad\nargument"],
+        ["rsync", 1],
+        "rsync",
+        None,
+    ],
+)
+def test_run_rsync_rejects_invalid_argv_without_launch(argv, monkeypatch):
+    monkeypatch.setattr(
+        "vla_eval.import_jobs.subprocess.Popen",
+        lambda *_a, **_kw: pytest.fail("invalid argv must not launch"),
+    )
+
+    with pytest.raises(TransferError):
+        run_rsync(argv, lambda _progress: None)
+
+
+@pytest.mark.parametrize("launch_error", [ValueError("nul"), TypeError("bad"), IndexError("bad")])
+def test_run_rsync_normalizes_launch_errors(launch_error, monkeypatch):
+    monkeypatch.setattr(
+        "vla_eval.import_jobs.subprocess.Popen",
+        lambda *_a, **_kw: (_ for _ in ()).throw(launch_error),
+    )
+
+    with pytest.raises(TransferError, match="could not be started"):
+        run_rsync(["rsync"], lambda _progress: None)
+
+
+def test_run_rsync_copies_argv_to_a_new_list(monkeypatch):
+    process = FakeProcess("")
+    original = ("rsync", "--version")
+    captured = []
+
+    def fake_popen(argv, **_kwargs):
+        captured.append(argv)
+        return process
+
+    monkeypatch.setattr("vla_eval.import_jobs.subprocess.Popen", fake_popen)
+
+    run_rsync(original, lambda _progress: None)
+
+    assert captured == [["rsync", "--version"]]
+    assert captured[0] is not original
+
+
+def test_callback_and_cleanup_failures_are_both_observable(monkeypatch):
+    process = FakeProcess("  1,000  20% 1MB/s\r")
+
+    def fail_close():
+        raise RuntimeError("close failed")
+
+    process.stdout.close = fail_close
+    monkeypatch.setattr("vla_eval.import_jobs.subprocess.Popen", lambda *_a, **_kw: process)
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        run_rsync(
+            ["rsync"],
+            lambda _progress: (_ for _ in ()).throw(ValueError("callback failed")),
+        )
+
+    messages = [str(error) for error in caught.value.exceptions]
+    assert any("callback failed" in message for message in messages)
+    assert any("close failed" in message for message in messages)
+
+
+def test_failed_state_callback_does_not_hide_original_failure(tmp_path):
+    spec = import_spec(tmp_path / "staging/job-1", tmp_path / "inbox/run-1")
+
+    def fake_transfer(_argv, _progress):
+        raise TransferError("network failed")
+
+    def on_state(state):
+        if state == FAILED:
+            raise RuntimeError("failed persistence failed")
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        execute_import(
+            spec,
+            transfer=fake_transfer,
+            callbacks=ImportCallbacks(on_state=on_state),
+        )
+
+    messages = [str(error) for error in caught.value.exceptions]
+    assert any("network failed" in message for message in messages)
+    assert any("failed persistence failed" in message for message in messages)
+
+
+def test_rejected_symlink_staging_parent_does_not_create_outside_placeholder(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(outside, target_is_directory=True)
+    spec = import_spec(linked / "job-1", tmp_path / "inbox/run-1")
+    transfer_called = False
+
+    def fake_transfer(_argv, _progress):
+        nonlocal transfer_called
+        transfer_called = True
+
+    with pytest.raises(ValueError, match="symlink"):
+        execute_import(spec, transfer=fake_transfer)
+
+    assert transfer_called is False
+    assert not (outside / "job-1").exists()
+
+
+def test_injected_staging_rejects_lexical_parent_traversal(tmp_path):
+    staging = tmp_path / "safe" / ".." / "outside" / "job-1"
+    spec = import_spec(staging, tmp_path / "inbox/run-1")
+
+    with pytest.raises(ValueError, match=r"\.\."):
+        execute_import(spec, transfer=lambda _argv, _progress: None)
+
+    assert not (tmp_path / "outside").exists()
+
+
+def test_production_transfer_refuses_missing_trust_context(tmp_path):
+    spec = replace(
+        import_spec(tmp_path / "staging/job-1", tmp_path / "inbox/alice/run-1"),
+        mode="production",
+    )
 
     with pytest.raises(ValueError, match="trust context"):
         execute_import(spec)
@@ -333,6 +546,7 @@ def production_spec(tmp_path: Path) -> ImportSpec:
         remote_relative_path="run-1",
         staging_path=staging_root / "job-prod",
         target_path=inbox_root / "alice" / "run-1",
+        mode="production",
         source=source,
         trusted_credentials_root=credentials,
         trusted_staging_root=staging_root,
@@ -340,7 +554,7 @@ def production_spec(tmp_path: Path) -> ImportSpec:
     )
 
 
-def test_default_execution_revalidates_task8_immediately_before_runner(tmp_path, monkeypatch):
+def test_production_mode_revalidates_task8_with_wrapped_runner(tmp_path, monkeypatch):
     spec = production_spec(tmp_path)
     calls = []
     inspection = DatasetInspection(DatasetKind.LEROBOT, True, "b" * 64, 4, 1, ())
@@ -366,9 +580,7 @@ def test_default_execution_revalidates_task8_immediately_before_runner(tmp_path,
         progress(100)
 
     monkeypatch.setattr("vla_eval.import_jobs.build_rsync_argv", fake_build)
-    monkeypatch.setattr("vla_eval.import_jobs.run_rsync", fake_run)
-
-    execute_import(spec, inspector=lambda _path: inspection)
+    execute_import(spec, transfer=fake_run, inspector=lambda _path: inspection)
 
     run_index = next(index for index, call in enumerate(calls) if call[0] == "run")
     assert [call[0] for call in calls[run_index - 3 : run_index + 1]] == [
@@ -378,6 +590,141 @@ def test_default_execution_revalidates_task8_immediately_before_runner(tmp_path,
         "run",
     ]
     assert calls[run_index][1] == ["rsync", "--safe-argv"]
+
+
+@pytest.mark.parametrize("context_field", ["source", "trusted_inbox_root"])
+def test_injected_mode_rejects_production_context(tmp_path, context_field):
+    production = production_spec(tmp_path)
+    spec = import_spec(tmp_path / "injected/job-1", tmp_path / "target/run-1")
+    spec = replace(spec, **{context_field: getattr(production, context_field)})
+
+    with pytest.raises(ValueError, match="production context"):
+        execute_import(spec, transfer=lambda _argv, _progress: None)
+
+
+def test_cancellation_immediately_before_replace_keeps_staging(tmp_path, monkeypatch):
+    spec = import_spec(tmp_path / "staging/job-1", tmp_path / "inbox/run-1")
+    inspection = DatasetInspection(DatasetKind.LEROBOT, True, "d" * 64, 4, 1, ())
+    cancellation_polls = 0
+    replace_called = False
+
+    def is_cancelled():
+        nonlocal cancellation_polls
+        cancellation_polls += 1
+        return cancellation_polls == 5
+
+    def fake_transfer(_argv, _progress):
+        spec.staging_path.mkdir(parents=True)
+        (spec.staging_path / "received").write_text("ok", encoding="utf-8")
+
+    def forbidden_replace(_path, _target):
+        nonlocal replace_called
+        replace_called = True
+
+    monkeypatch.setattr(Path, "replace", forbidden_replace)
+
+    with pytest.raises(TransferError, match="cancelled"):
+        execute_import(
+            spec,
+            transfer=fake_transfer,
+            inspector=lambda _path: inspection,
+            callbacks=ImportCallbacks(is_cancelled=is_cancelled),
+        )
+
+    assert cancellation_polls == 5
+    assert replace_called is False
+    assert spec.staging_path.exists()
+    assert not spec.target_path.exists()
+
+
+def test_success_does_not_poll_cancellation_after_replace(tmp_path):
+    spec = import_spec(tmp_path / "staging/job-1", tmp_path / "inbox/run-1")
+    inspection = DatasetInspection(DatasetKind.LEROBOT, True, "e" * 64, 4, 1, ())
+    cancellation_polls = 0
+
+    def is_cancelled():
+        nonlocal cancellation_polls
+        cancellation_polls += 1
+        return cancellation_polls > 5
+
+    def fake_transfer(_argv, _progress):
+        spec.staging_path.mkdir(parents=True)
+        (spec.staging_path / "received").write_text("ok", encoding="utf-8")
+
+    result = execute_import(
+        spec,
+        transfer=fake_transfer,
+        inspector=lambda _path: inspection,
+        callbacks=ImportCallbacks(is_cancelled=is_cancelled),
+    )
+
+    assert cancellation_polls == 5
+    assert result.dataset_path.exists()
+
+
+def test_ready_callback_failure_rolls_target_back_to_staging(tmp_path):
+    spec = import_spec(tmp_path / "staging/job-1", tmp_path / "inbox/run-1")
+    inspection = DatasetInspection(DatasetKind.LEROBOT, True, "f" * 64, 4, 1, ())
+    states = []
+
+    def fake_transfer(_argv, _progress):
+        spec.staging_path.mkdir(parents=True)
+        (spec.staging_path / "received").write_text("ok", encoding="utf-8")
+
+    def on_state(state):
+        states.append(state)
+        if state == READY:
+            raise RuntimeError("ready persistence failed")
+
+    with pytest.raises(RuntimeError, match="ready persistence failed"):
+        execute_import(
+            spec,
+            transfer=fake_transfer,
+            inspector=lambda _path: inspection,
+            callbacks=ImportCallbacks(on_state=on_state),
+        )
+
+    assert states[-2:] == [READY, FAILED]
+    assert spec.staging_path.exists()
+    assert not spec.target_path.exists()
+
+
+def test_ready_callback_and_rollback_failures_are_both_observable(tmp_path, monkeypatch):
+    spec = import_spec(tmp_path / "staging/job-1", tmp_path / "inbox/run-1")
+    inspection = DatasetInspection(DatasetKind.LEROBOT, True, "1" * 64, 4, 1, ())
+    real_replace = Path.replace
+    replace_calls = 0
+
+    def fake_transfer(_argv, _progress):
+        spec.staging_path.mkdir(parents=True)
+        (spec.staging_path / "received").write_text("ok", encoding="utf-8")
+
+    def fail_rollback(path, target):
+        nonlocal replace_calls
+        replace_calls += 1
+        if replace_calls == 2:
+            raise OSError("rollback failed")
+        return real_replace(path, target)
+
+    def on_state(state):
+        if state == READY:
+            raise RuntimeError("ready persistence failed")
+
+    monkeypatch.setattr(Path, "replace", fail_rollback)
+
+    with pytest.raises(ExceptionGroup) as caught:
+        execute_import(
+            spec,
+            transfer=fake_transfer,
+            inspector=lambda _path: inspection,
+            callbacks=ImportCallbacks(on_state=on_state),
+        )
+
+    messages = [str(error) for error in caught.value.exceptions]
+    assert any("ready persistence failed" in message for message in messages)
+    assert any("rollback failed" in message for message in messages)
+    assert spec.target_path.exists()
+    assert not spec.staging_path.exists()
 
 
 def test_default_inspector_is_bound_to_staging_root(tmp_path, monkeypatch):
