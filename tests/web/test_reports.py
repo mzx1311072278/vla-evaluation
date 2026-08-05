@@ -443,12 +443,15 @@ def test_report_episode_filters(auth_client, db_engine, ready_dataset, user, dat
     )
     attempt_dir = Path(job.output_dir) / "attempt_eval"
     attempt_dir.mkdir()
+    # Realistic per-mode values (review_policy.apply_review_policy):
+    #   auto_review   -> needs_manual_review is True (warnings) or False (clean)
+    #   manual_review -> needs_manual_review is None (always, human must decide)
     (attempt_dir / "attempt_summary.json").write_text(
         json.dumps(
             [
                 _attempt_row(0, needs_manual_review=False, review_mode="auto_review"),
-                _attempt_row(1, needs_manual_review=True, review_mode="manual_review"),
-                _attempt_row(2, needs_manual_review=True, review_mode="manual_review"),
+                _attempt_row(1, needs_manual_review=True, review_mode="auto_review"),
+                _attempt_row(2, needs_manual_review=None, review_mode="manual_review"),
             ]
         ),
         encoding="utf-8",
@@ -480,15 +483,23 @@ def test_report_episode_filters(auth_client, db_engine, ready_dataset, user, dat
     assert "2.200" in response.text
     assert "3.300" not in response.text
 
-    # Filter by review=needs_review -> the two flagged episodes (indices 1 and 2).
+    # review=needs_review (needs_manual_review is True) -> episode 1 only.
     response = auth_client.get(f"{base}?review=needs_review")
     assert response.status_code == 200
-    assert "显示 2 / 3 个 episode" in response.text
+    assert "显示 1 / 3 个 episode" in response.text
     assert "2.200" in response.text
+    assert "1.100" not in response.text
+    assert "3.300" not in response.text
+
+    # review=reviewed (needs_manual_review is None, manual_review mode) -> ep 2.
+    response = auth_client.get(f"{base}?review=reviewed")
+    assert response.status_code == 200
+    assert "显示 1 / 3 个 episode" in response.text
     assert "3.300" in response.text
     assert "1.100" not in response.text
+    assert "2.200" not in response.text
 
-    # Filter by review=ok -> the single clean-reviewed episode (index 0).
+    # review=ok (needs_manual_review is False, auto-clean) -> episode 0 only.
     response = auth_client.get(f"{base}?review=ok")
     assert response.status_code == 200
     assert "显示 1 / 3 个 episode" in response.text
@@ -526,3 +537,122 @@ def test_download_rejects_attempt_summary_outside_dir(auth_client, successful_jo
         f"/reports/{successful_job.id}/files/attempt_summary.json"
     )
     assert response.status_code == 404
+
+
+def test_report_review_filter_manual_review_mode(
+    auth_client, db_engine, ready_dataset, user, data_root
+):
+    """In manual_review mode needs_manual_review is always None, so the only
+    non-empty review bucket is ``reviewed``; ``needs_review``/``ok`` are empty.
+    """
+    metrics = {
+        "schema_version": "1.0",
+        "session_id": "ready-dataset",
+        "n_episodes": 2,
+        "n_success": 1,
+        "n_failure": 1,
+        "gsr": 0.5,
+        "mean_tts_success_s": 1.0,
+        "smoothness": {
+            "space": "joint",
+            "left": {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "n_episodes": 2},
+            "right": {
+                "mean": None,
+                "std": None,
+                "min": None,
+                "max": None,
+                "n_episodes": 0,
+            },
+            "n_episodes": 2,
+        },
+    }
+    episode_rows = [
+        {
+            "session_id": "ready-dataset",
+            "episode_index": 0,
+            "outcome": "success",
+            "duration_s": "1.100",
+            "smoothness": "0",
+            "left_smoothness": "0",
+            "right_smoothness": "",
+            "smoothness_space": "joint",
+            "smoothness_frames": 4,
+            "smoothness_skipped_reason": "",
+        },
+        {
+            "session_id": "ready-dataset",
+            "episode_index": 1,
+            "outcome": "failure",
+            "duration_s": "2.200",
+            "smoothness": "0",
+            "left_smoothness": "0",
+            "right_smoothness": "",
+            "smoothness_space": "joint",
+            "smoothness_frames": 4,
+            "smoothness_skipped_reason": "",
+        },
+    ]
+    job, _output_dir = _make_succeeded_job(
+        db_engine,
+        ready_dataset,
+        user,
+        data_root,
+        slug="manual-mode-job",
+        metrics=metrics,
+        episode_rows=episode_rows,
+    )
+    attempt_dir = Path(job.output_dir) / "attempt_eval"
+    attempt_dir.mkdir()
+    (attempt_dir / "attempt_summary.json").write_text(
+        json.dumps(
+            [
+                _attempt_row(0, needs_manual_review=None, review_mode="manual_review"),
+                _attempt_row(1, needs_manual_review=None, review_mode="manual_review"),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    base = f"/reports/{job.id}"
+
+    # review=reviewed captures every manual_review-mode episode.
+    response = auth_client.get(f"{base}?review=reviewed")
+    assert response.status_code == 200
+    assert "显示 2 / 2 个 episode" in response.text
+    assert "1.100" in response.text
+    assert "2.200" in response.text
+
+    # needs_review and ok are empty in manual_review mode (no True/False values).
+    response = auth_client.get(f"{base}?review=needs_review")
+    assert response.status_code == 200
+    assert "暂无 Episode 指标" in response.text
+
+    response = auth_client.get(f"{base}?review=ok")
+    assert response.status_code == 200
+    assert "暂无 Episode 指标" in response.text
+
+
+def test_report_page_tolerates_pathological_episode_csv(
+    auth_client, successful_job, monkeypatch
+):
+    """A pathological episode_metrics.csv that raises csv.Error must degrade
+    gracefully (200, empty episode table) rather than 500 — headline metrics
+    are still rendered from metrics_core.json.
+    """
+    import csv as _csv
+
+    from vla_eval.web import routes_reports
+
+    class _ExplodingDictReader:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __iter__(self):
+            raise _csv.Error("simulated pathological CSV")
+
+    monkeypatch.setattr(routes_reports.csv, "DictReader", _ExplodingDictReader)
+    response = auth_client.get(f"/reports/{successful_job.id}")
+    assert response.status_code == 200
+    # Headline metrics still rendered from metrics_core.json.
+    assert "100.0%" in response.text
+    # Episode table degrades to the empty state instead of a 500.
+    assert "暂无 Episode 指标" in response.text

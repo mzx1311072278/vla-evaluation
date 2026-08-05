@@ -111,7 +111,7 @@ def _load_episode_rows(output_dir: Path) -> list[dict[str, str]]:
     try:
         with path.open(encoding="utf-8", newline="") as handle:
             return list(csv.DictReader(handle))
-    except OSError:
+    except (OSError, csv.Error):
         return []
 
 
@@ -206,6 +206,15 @@ def _parse_report_filters(request: Request) -> tuple[str, str]:
 def _apply_review_filter(
     episodes: list[dict[str, Any]], review: str
 ) -> list[dict[str, Any]]:
+    """Filter by VLM review state. Buckets partition ``needs_manual_review``:
+
+    - ``needs_review``: ``True`` (auto mode, flagged with warnings)
+    - ``reviewed``: ``None`` (manual_review mode, awaiting human review)
+    - ``ok``: ``False`` (auto mode, clean)
+
+    True / None / False are mutually exclusive and exhaustive across both
+    review modes (see ``review_policy.apply_review_policy``).
+    """
     if review == "needs_review":
         return [
             episode
@@ -214,7 +223,12 @@ def _apply_review_filter(
             and episode["vlm"].get("needs_manual_review") is True
         ]
     if review == "reviewed":
-        return [episode for episode in episodes if episode["vlm"] is not None]
+        return [
+            episode
+            for episode in episodes
+            if episode["vlm"] is not None
+            and episode["vlm"].get("needs_manual_review") is None
+        ]
     if review == "ok":
         return [
             episode

@@ -45,8 +45,8 @@
             <select name="review">
               <option value="all" {{ 'selected' if filter_review == 'all' else '' }}>全部</option>
               <option value="needs_review" {{ 'selected' if filter_review == 'needs_review' else '' }}>待复核</option>
-              <option value="reviewed" {{ 'selected' if filter_review == 'reviewed' else '' }}>已复核</option>
-              <option value="ok" {{ 'selected' if filter_review == 'ok' else '' }}>复核通过</option>
+              <option value="reviewed" {{ 'selected' if filter_review == 'reviewed' else '' }}>人工复核</option>
+              <option value="ok" {{ 'selected' if filter_review == 'ok' else '' }}>自动通过</option>
             </select>
           </label>
           <button type="submit">筛选</button>
