@@ -27,6 +27,10 @@ def normalize_remote_relative_path(value: str) -> str:
         raise ValueError("remote path must use POSIX separators")
     if _contains_control_or_format_character(value):
         raise ValueError("remote path must not contain control or format characters")
+    if any(unicodedata.category(character) in {"Zl", "Zp"} for character in value):
+        raise ValueError("remote path must not contain line or paragraph separators")
+    if unicodedata.normalize("NFC", value) != value:
+        raise ValueError("remote path must be NFC-normalized before use")
 
     raw_segments = value.split("/")
     if any(not segment or not segment.strip() for segment in raw_segments):

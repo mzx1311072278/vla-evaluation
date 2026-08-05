@@ -64,6 +64,8 @@ def test_build_rsync_argv_never_uses_shell(tmp_path):
         "run/",
         "run\x7fbad",
         "run\x85bad",
+        "run\u2028bad",
+        "run\u2029bad",
         "run\u202ebad",
         "run\u2066bad",
     ],
@@ -77,6 +79,17 @@ def test_normalize_remote_path_rejects_ambiguous_or_dangerous_segments(value):
     "value", ["run 1/\u573a\u666f.01", ".hidden/frame.v2", "\u6570\u636e/\u56de\u653e 01"]
 )
 def test_normalize_remote_path_preserves_safe_names(value):
+    assert normalize_remote_relative_path(value) == value
+
+
+def test_normalize_remote_path_rejects_non_nfc_spelling():
+    with pytest.raises(ValueError, match="NFC-normalized"):
+        normalize_remote_relative_path("cafe\u0301/run")
+
+
+def test_normalize_remote_path_preserves_nfc_unicode_name():
+    value = "caf\u00e9/\u573a\u666f.01"
+
     assert normalize_remote_relative_path(value) == value
 
 
