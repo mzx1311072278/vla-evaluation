@@ -12,6 +12,8 @@ from typing import Any
 import yaml
 from yaml.constructor import ConstructorError
 
+from Genie02_report.attempt_eval.prompt_registry import SUPPORTED_PROMPT_VERSIONS
+
 _SEMVER = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
     r"(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
@@ -24,7 +26,7 @@ _REVIEW_MODES = frozenset({"manual_review", "auto_review"})
 _REPORT_PATTERN = "report_*.md"
 _ADAPTERS = frozenset({"genie02"})
 _PLUGINS = frozenset({"genie02-attempt-eval"})
-_PROMPT_VERSIONS = frozenset({"genie02-attempt-v1"})
+_PROMPT_VERSIONS = SUPPORTED_PROMPT_VERSIONS
 _REQUIRED_OUTPUTS = frozenset({"episode_metrics.csv", "metrics_core.json", _REPORT_PATTERN})
 
 

@@ -20,6 +20,7 @@ from Genie02_report.genie02_eval_common import (
 from Genie02_report.genie02_markdown_report import generate_markdown_report
 from Genie02_report.genie02_metrics_core import build_core_metrics, generate_metrics_core
 
+from .exceptions import EvaluationCancelled
 from .profiles import Profile
 
 _ATTEMPT_REQUIRED_FIELDS = frozenset(
@@ -42,10 +43,6 @@ _ATTEMPT_REQUIRED_FIELDS = frozenset(
         "reason",
     }
 )
-
-
-class EvaluationCancelled(RuntimeError):
-    pass
 
 
 @dataclass(frozen=True)

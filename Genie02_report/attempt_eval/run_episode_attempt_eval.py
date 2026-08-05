@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from vla_eval.exceptions import EvaluationCancelled
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     if __package__:
@@ -15,9 +20,10 @@ if TYPE_CHECKING:
         from dataset_reader import EpisodeMeta
         from vlm_client import LocalVLMClient
 
-
-PROMPT_VERSION = "genie02-attempt-v1"
-SUPPORTED_PROMPT_VERSIONS = frozenset({PROMPT_VERSION})
+if __package__:
+    from .prompt_registry import PROMPT_VERSION, SUPPORTED_PROMPT_VERSIONS
+else:
+    from prompt_registry import PROMPT_VERSION, SUPPORTED_PROMPT_VERSIONS
 
 
 @dataclass(frozen=True)
@@ -47,11 +53,17 @@ class AttemptEvalConfig:
                 raise TypeError(f"{name} must be a pathlib.Path")
         if not isinstance(self.image_key, str) or not self.image_key.strip():
             raise ValueError("image_key must be a non-empty string")
+        if not isinstance(self.prompt_version, str):
+            raise TypeError("prompt_version must be a string")
         if self.prompt_version not in SUPPORTED_PROMPT_VERSIONS:
             supported = ", ".join(sorted(SUPPORTED_PROMPT_VERSIONS))
             raise ValueError(f"prompt_version must be one of: {supported}")
+        if not isinstance(self.dense_region, str):
+            raise TypeError("dense_region must be a string")
         if self.dense_region not in {"full", "last_half", "last_third"}:
             raise ValueError("dense_region must be one of: full, last_half, last_third")
+        if not isinstance(self.review_mode, str):
+            raise TypeError("review_mode must be a string")
         if self.review_mode not in {"manual_review", "auto_review"}:
             raise ValueError("review_mode must be one of: manual_review, auto_review")
 
@@ -108,11 +120,13 @@ def run_attempt_evaluation(
     progress: Callable[[int, int, str], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> list[dict[str, Any]]:
-    if episodes is None:
-        episodes = _read_episode_metadata(config.dataset_root, config.image_key)
-    if config.limit is not None:
-        episodes = episodes[: config.limit]
+    """Evaluate episodes and atomically persist the current writer schema.
 
+    Progress stages are ``initial`` before work, ``episode_complete`` after each
+    episode result is persisted, and ``complete`` immediately before the final
+    summary commit. Callback failures propagate and therefore cannot publish a
+    new successful summary.
+    """
     if __package__:
         from .result_writer import (
             ensure_output_dirs,
@@ -126,6 +140,11 @@ def run_attempt_evaluation(
 
     output_dir = config.output_dir.expanduser()
     _, frame_root = ensure_output_dirs(output_dir)
+    if episodes is None:
+        episodes = _read_episode_metadata(config.dataset_root, config.image_key)
+    if config.limit is not None:
+        episodes = episodes[: config.limit]
+
     review_config = ReviewConfig(
         mode=config.review_mode,
         confidence_threshold=config.confidence_threshold,
@@ -136,92 +155,107 @@ def run_attempt_evaluation(
     if progress is not None:
         progress(0, total, "initial")
 
+    factory = client_factory or _create_local_vlm_client
     vlm = None
-    if episodes and not config.dry_run:
-        _raise_if_cancelled(should_cancel)
-        factory = client_factory or _create_local_vlm_client
-        vlm = factory(
-            config.model_path,
-            max_new_tokens=config.max_new_tokens,
-            prompt_version=config.prompt_version,
-        )
-
     results: list[dict[str, Any]] = []
-    for done, episode in enumerate(episodes, start=1):
-        _raise_if_cancelled(should_cancel)
-        duration = max(0.0, episode.to_timestamp - episode.from_timestamp)
-        sampled_frames: list[Path] = []
-        frame_timestamps: list[dict[str, Any]] = []
-        vlm_json_valid = True
-        try:
-            sampled_frames, frame_timestamps = _sample_episode_frames(
-                episode.video_file,
-                frame_root / f"episode_{episode.episode_index:03d}",
-                episode.from_timestamp,
-                episode.to_timestamp,
-                max_image_size=config.max_image_size,
-                max_global_frames=config.max_global_frames,
-                global_sample_interval=config.global_sample_interval,
-                max_dense_frames=config.max_dense_frames,
-                dense_sample_interval=config.dense_sample_interval,
-                dense_region=config.dense_region,
-            )
-            if not sampled_frames:
-                raise RuntimeError("No frames sampled from episode video segment")
-            if episode.episode_success is False:
-                vlm_result = {
-                    "episode_success": False,
-                    "pre_success_failed_attempt_count": None,
-                    "failed_attempts_before_success": [],
-                    "final_success_time": None,
-                    "attempt_count": None,
-                    "success_count": 0,
-                    "failed_count": None,
-                    "attempts": [],
-                    "confidence": None,
-                    "vlm_valid": True,
-                    "reason": "metadata marks episode as failure; skipped attempt counting",
-                    "parse_error": "",
-                    "raw_response": "",
-                    "auto_warning": ["skipped_failure_episode"],
-                }
-            elif config.dry_run:
-                vlm_result = _fallback_result("", "dry_run")
+    try:
+        for done, episode in enumerate(episodes, start=1):
+            _raise_if_cancelled(should_cancel)
+            duration = max(0.0, episode.to_timestamp - episode.from_timestamp)
+            sampled_frames: list[Path] = []
+            frame_timestamps: list[dict[str, Any]] = []
+            vlm_json_valid = True
+            try:
+                sampled_frames, frame_timestamps = _sample_episode_frames(
+                    episode.video_file,
+                    frame_root / f"episode_{episode.episode_index:03d}",
+                    episode.from_timestamp,
+                    episode.to_timestamp,
+                    max_image_size=config.max_image_size,
+                    max_global_frames=config.max_global_frames,
+                    global_sample_interval=config.global_sample_interval,
+                    max_dense_frames=config.max_dense_frames,
+                    dense_sample_interval=config.dense_sample_interval,
+                    dense_region=config.dense_region,
+                )
+                if not sampled_frames:
+                    raise RuntimeError("No frames sampled from episode video segment")
+            except Exception as exc:
+                if _is_evaluation_cancelled(exc):
+                    raise
+                if _is_sampling_dependency_error(exc):
+                    raise
+                result = merge_result(episode, _episode_error_result(episode, exc, "sampling"))
                 vlm_json_valid = False
             else:
-                assert vlm is not None
-                vlm_result, vlm_json_valid = vlm.analyze(sampled_frames, frame_timestamps, duration)
-            result = merge_result(episode, vlm_result)
-        except Exception as exc:
-            if _is_evaluation_cancelled(exc):
-                raise
-            result = merge_result(episode, _fallback_result(str(exc), "episode_error"))
-            vlm_json_valid = False
+                _raise_if_cancelled(should_cancel)
+                if episode.episode_success is False:
+                    vlm_result = {
+                        "episode_success": False,
+                        "pre_success_failed_attempt_count": None,
+                        "failed_attempts_before_success": [],
+                        "final_success_time": None,
+                        "attempt_count": None,
+                        "success_count": 0,
+                        "failed_count": None,
+                        "attempts": [],
+                        "confidence": None,
+                        "vlm_valid": True,
+                        "reason": "metadata marks episode as failure; skipped attempt counting",
+                        "parse_error": "",
+                        "raw_response": "",
+                        "auto_warning": ["skipped_failure_episode"],
+                    }
+                    result = merge_result(episode, vlm_result)
+                elif config.dry_run:
+                    result = merge_result(episode, _fallback_result("", "dry_run"))
+                    vlm_json_valid = False
+                else:
+                    if vlm is None:
+                        vlm = factory(
+                            config.model_path,
+                            max_new_tokens=config.max_new_tokens,
+                            prompt_version=config.prompt_version,
+                        )
+                    _raise_if_cancelled(should_cancel)
+                    try:
+                        vlm_result, vlm_json_valid = vlm.analyze(
+                            sampled_frames, frame_timestamps, duration
+                        )
+                    except Exception as exc:
+                        if _is_evaluation_cancelled(exc):
+                            raise
+                        vlm_result = _episode_error_result(episode, exc, "inference")
+                        vlm_json_valid = False
+                    result = merge_result(episode, vlm_result)
 
-        result["sampled_frame_count"] = len(sampled_frames)
-        result["frame_timestamps"] = frame_timestamps
-        result["global_frame_count"] = sum(
-            1 for item in frame_timestamps if item.get("frame_type") == "global"
-        )
-        result["dense_frame_count"] = sum(
-            1 for item in frame_timestamps if item.get("frame_type") == "dense"
-        )
-        result = apply_review_policy(
-            result,
-            review_config,
-            duration,
-            len(sampled_frames),
-            vlm_json_valid,
-        )
-        save_episode_result(output_dir, result)
-        results.append(result)
-        if progress is not None:
-            progress(done, total, "episode_complete")
+            result["sampled_frame_count"] = len(sampled_frames)
+            result["frame_timestamps"] = frame_timestamps
+            result["global_frame_count"] = sum(
+                1 for item in frame_timestamps if item.get("frame_type") == "global"
+            )
+            result["dense_frame_count"] = sum(
+                1 for item in frame_timestamps if item.get("frame_type") == "dense"
+            )
+            result = apply_review_policy(
+                result,
+                review_config,
+                duration,
+                len(sampled_frames),
+                vlm_json_valid,
+            )
+            save_episode_result(output_dir, result)
+            results.append(result)
+            if progress is not None:
+                progress(done, total, "episode_complete")
+    finally:
+        _close_vlm_client(vlm)
 
     _raise_if_cancelled(should_cancel)
-    write_summary(output_dir, results)
     if progress is not None:
         progress(total, total, "complete")
+    _raise_if_cancelled(should_cancel)
+    write_summary(output_dir, results)
     return results
 
 
@@ -261,16 +295,50 @@ def _fallback_result(*args: Any, **kwargs: Any) -> dict[str, Any]:
     return fallback_result(*args, **kwargs)
 
 
+def _close_vlm_client(client: LocalVLMClient | None) -> None:
+    if client is None:
+        return
+    close = getattr(client, "close", None)
+    if callable(close):
+        close()
+
+
+def _is_sampling_dependency_error(exc: Exception) -> bool:
+    if __package__:
+        from .frame_sampler import SamplingDependencyError
+    else:
+        from frame_sampler import SamplingDependencyError
+
+    return isinstance(exc, SamplingDependencyError)
+
+
+def _episode_error_result(episode: EpisodeMeta, exc: Exception, category: str) -> dict[str, Any]:
+    logger.exception("episode %s %s failed", episode.episode_index, category)
+    exception_name = "".join(
+        character
+        for character in type(exc).__name__
+        if character.isascii() and (character.isalnum() or character == "_")
+    )[:64]
+    exception_name = exception_name or "Exception"
+    reasons = {
+        "sampling": "Episode frame sampling failed",
+        "inference": "Episode VLM inference failed",
+    }
+    result = _fallback_result(
+        "",
+        "episode_error",
+        parse_error=f"{category}_error:{exception_name}",
+    )
+    result["reason"] = reasons[category]
+    return result
+
+
 def _raise_if_cancelled(should_cancel: Callable[[], bool] | None) -> None:
     if should_cancel is not None and should_cancel():
-        from vla_eval.evaluation import EvaluationCancelled
-
         raise EvaluationCancelled("evaluation was cancelled")
 
 
 def _is_evaluation_cancelled(exc: Exception) -> bool:
-    from vla_eval.evaluation import EvaluationCancelled
-
     return isinstance(exc, EvaluationCancelled)
 
 
