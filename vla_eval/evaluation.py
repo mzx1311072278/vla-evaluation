@@ -2,17 +2,45 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import json
+import math
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
 from Genie02_report.genie02_episode_metrics import generate_episode_metrics
-from Genie02_report.genie02_eval_common import load_metrics_core, load_session
+from Genie02_report.genie02_eval_common import (
+    load_episode_metrics,
+    load_metrics_core,
+    load_session,
+)
 from Genie02_report.genie02_markdown_report import generate_markdown_report
 from Genie02_report.genie02_metrics_core import generate_metrics_core
 
 from .profiles import Profile
+
+_ATTEMPT_REQUIRED_FIELDS = frozenset(
+    {
+        "episode_index",
+        "metadata_episode_success",
+        "episode_success",
+        "pre_success_failed_attempt_count",
+        "failed_attempts_before_success",
+        "attempt_count",
+        "success_count",
+        "failed_count",
+        "confidence",
+        "vlm_valid",
+        "parse_error",
+        "needs_manual_review",
+        "review_note",
+        "auto_warning",
+        "review_mode",
+        "reason",
+    }
+)
 
 
 class EvaluationCancelled(RuntimeError):
@@ -33,6 +61,25 @@ class EvaluationResult:
     vlm_summary_path: Path | None
 
 
+class _ProgressEmitter:
+    def __init__(self, callback: Callable[[float], None], initial_progress: float) -> None:
+        self._callback = callback
+        self._last = initial_progress
+
+    def emit(self, value: float) -> None:
+        self._last = max(self._last, value)
+        self._callback(self._last)
+
+
+def _validate_initial_progress(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("initial_progress must be a number from 0 to 100")
+    result = float(value)
+    if not math.isfinite(result) or not 0.0 <= result <= 100.0:
+        raise ValueError("initial_progress must be finite and between 0 and 100")
+    return result
+
+
 def _check_cancelled(callbacks: EvaluationCallbacks) -> None:
     if callbacks.should_cancel():
         raise EvaluationCancelled("evaluation was cancelled")
@@ -50,7 +97,77 @@ def _prepare_output_dir(output_dir: Path) -> Path:
     return output_dir
 
 
-def _load_existing_metrics(dataset_path: Path, output_dir: Path) -> dict[str, Any]:
+def _check_output_components(output_dir: Path, relative: str) -> Path:
+    current = output_dir
+    parts = Path(relative).parts
+    for index, part in enumerate(parts):
+        current /= part
+        if current.is_symlink():
+            raise ValueError(f"output artifact path must not contain a symbolic link: {current}")
+        if current.exists() and index < len(parts) - 1 and not current.is_dir():
+            raise ValueError(f"output artifact parent is not a directory: {current}")
+    return current
+
+
+def _preflight_output_contract(output_dir: Path, profile: Profile) -> None:
+    for pattern in (*profile.outputs.required, *profile.outputs.optional):
+        if "*" in pattern:
+            for path in output_dir.glob(pattern):
+                _check_output_components(output_dir, path.relative_to(output_dir).as_posix())
+        else:
+            _check_output_components(output_dir, pattern)
+
+
+def _validate_regular_artifact(output_dir: Path, path: Path, label: str) -> Path:
+    if path.is_symlink():
+        raise ValueError(f"{label} must not be a symbolic link: {path}")
+    if not path.is_file():
+        raise ValueError(f"{label} must be a regular file: {path}")
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(output_dir.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(
+            f"{label} must remain within output directory {output_dir}: {path}"
+        ) from exc
+    return resolved
+
+
+def _artifact_matches(output_dir: Path, pattern: str) -> list[Path]:
+    if "*" in pattern:
+        return list(output_dir.glob(pattern))
+    path = output_dir / pattern
+    return [path] if path.exists() or path.is_symlink() else []
+
+
+def _validate_output_contract(output_dir: Path, profile: Profile, report_path: Path) -> None:
+    for pattern in profile.outputs.required:
+        matches = _artifact_matches(output_dir, pattern)
+        if not matches:
+            raise ValueError(f"required output is missing: {pattern}")
+        for path in matches:
+            _validate_regular_artifact(output_dir, path, f"required output {pattern}")
+    for pattern in profile.outputs.optional:
+        for path in _artifact_matches(output_dir, pattern):
+            _validate_regular_artifact(output_dir, path, f"optional output {pattern}")
+
+    resolved_report = _validate_regular_artifact(output_dir, report_path, "returned report")
+    relative_report = resolved_report.relative_to(output_dir.resolve(strict=True)).as_posix()
+    allowlist = (*profile.outputs.required, *profile.outputs.optional)
+    if not any(fnmatchcase(relative_report, pattern) for pattern in allowlist):
+        raise ValueError(
+            f"returned report is not in the profile output allowlist: {relative_report}"
+        )
+
+
+def _nonnegative_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
+
+
+def load_persisted_metrics(dataset_path: Path, output_dir: Path) -> dict[str, Any]:
+    """Load and cross-check persisted METRICS artifacts before a resumed stage."""
     missing = [
         path.name
         for path in (output_dir / "episode_metrics.csv", output_dir / "metrics_core.json")
@@ -58,14 +175,115 @@ def _load_existing_metrics(dataset_path: Path, output_dir: Path) -> dict[str, An
     ]
     if missing:
         raise ValueError(
-            "cannot resume after METRICS; missing required artifacts in "
+            "cannot load persisted metrics; missing required artifacts in "
             f"{output_dir}: {', '.join(missing)}"
         )
     try:
         session = load_session(dataset_path)
-        return load_metrics_core(output_dir, session)
+        episode_rows = load_episode_metrics(output_dir, session)
+        metrics = load_metrics_core(output_dir, session)
+        if not episode_rows:
+            raise ValueError("episode_metrics.csv must contain at least one episode row")
+
+        n_episodes = _nonnegative_int(metrics["n_episodes"], "metrics_core.n_episodes")
+        n_success = _nonnegative_int(metrics["n_success"], "metrics_core.n_success")
+        n_failure = _nonnegative_int(metrics["n_failure"], "metrics_core.n_failure")
+        if n_episodes != len(episode_rows):
+            raise ValueError(
+                f"metrics_core.n_episodes={n_episodes} does not match "
+                f"episode_metrics.csv rows={len(episode_rows)}"
+            )
+        row_successes = sum(row["outcome"] == "success" for row in episode_rows)
+        if (n_success, n_failure) != (row_successes, len(episode_rows) - row_successes):
+            raise ValueError("metrics_core success/failure counts do not match episode_metrics.csv")
+
+        gsr = metrics["gsr"]
+        if isinstance(gsr, bool) or not isinstance(gsr, (int, float)) or not math.isfinite(gsr):
+            raise ValueError("metrics_core.gsr must be a finite number")
+        expected_gsr = n_success / n_episodes
+        if not 0.0 <= float(gsr) <= 1.0 or not math.isclose(
+            float(gsr), expected_gsr, rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise ValueError("metrics_core.gsr does not match episode success counts")
+        for row in episode_rows:
+            duration = row["duration_s"]
+            if duration is None or not math.isfinite(duration) or duration < 0:
+                raise ValueError("episode_metrics.csv duration_s must be finite and non-negative")
+        return metrics
     except Exception as exc:
-        raise ValueError(f"cannot resume from persisted metrics in {output_dir}: {exc}") from exc
+        raise ValueError(f"cannot load persisted metrics in {output_dir}: {exc}") from exc
+
+
+def _optional_bool(value: Any, field: str) -> None:
+    if value is not None and not isinstance(value, bool):
+        raise ValueError(f"{field} must be a boolean or null")
+
+
+def _optional_count(value: Any, field: str) -> None:
+    if value is not None:
+        _nonnegative_int(value, field)
+
+
+def load_attempt_summary(path: Path) -> list[dict[str, Any]]:
+    """Load the current attempt_eval writer's JSON list and validate core result fields."""
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid attempt_summary.json at {path}: {exc}") from exc
+    if not isinstance(loaded, list):
+        raise TypeError(f"attempt_summary.json at {path} must contain a list")
+
+    results: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for position, value in enumerate(loaded):
+        field = f"attempt_summary.json row {position}"
+        if not isinstance(value, Mapping):
+            raise TypeError(f"{field} must be an object")
+        missing = _ATTEMPT_REQUIRED_FIELDS - set(value)
+        if missing:
+            raise ValueError(f"{field} is missing fields: {', '.join(sorted(missing))}")
+        episode_index = _nonnegative_int(value["episode_index"], f"{field}.episode_index")
+        if episode_index in seen:
+            raise ValueError(f"{field}.episode_index is duplicated: {episode_index}")
+        seen.add(episode_index)
+
+        _optional_bool(value["metadata_episode_success"], f"{field}.metadata_episode_success")
+        _optional_bool(value["episode_success"], f"{field}.episode_success")
+        _optional_bool(value["needs_manual_review"], f"{field}.needs_manual_review")
+        if not isinstance(value["vlm_valid"], bool):
+            raise TypeError(f"{field}.vlm_valid must be a boolean")
+        for name in (
+            "pre_success_failed_attempt_count",
+            "attempt_count",
+            "success_count",
+            "failed_count",
+        ):
+            _optional_count(value[name], f"{field}.{name}")
+        attempts = value["failed_attempts_before_success"]
+        if not isinstance(attempts, list):
+            raise TypeError(f"{field}.failed_attempts_before_success must be a list")
+        failed_before_success = value["pre_success_failed_attempt_count"]
+        if failed_before_success is not None and failed_before_success != len(attempts):
+            raise ValueError(f"{field}.pre_success_failed_attempt_count does not match attempts")
+
+        confidence = value["confidence"]
+        if confidence is not None and (
+            isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not math.isfinite(confidence)
+            or not 0.0 <= confidence <= 1.0
+        ):
+            raise ValueError(f"{field}.confidence must be a finite number from 0 to 1 or null")
+        warnings = value["auto_warning"]
+        if not isinstance(warnings, list) or not all(isinstance(item, str) for item in warnings):
+            raise ValueError(f"{field}.auto_warning must be a list of strings")
+        if value["review_mode"] not in {"manual_review", "auto_review"}:
+            raise ValueError(f"{field}.review_mode is unsupported")
+        for name in ("parse_error", "review_note", "reason"):
+            if not isinstance(value[name], str):
+                raise TypeError(f"{field}.{name} must be a string")
+        results.append(dict(value))
+    return results
 
 
 def run_profile_vlm(
@@ -119,6 +337,7 @@ def run_profile_vlm(
     summary_path = output_dir / "attempt_summary.json"
     if not summary_path.is_file():
         raise ValueError(f"VLM evaluation did not create required artifact: {summary_path}")
+    load_attempt_summary(summary_path)
     return summary_path
 
 
@@ -129,45 +348,62 @@ def run_evaluation(
     vlm_enabled: bool,
     callbacks: EvaluationCallbacks,
     resume_from: str = "METRICS",
+    initial_progress: float = 0.0,
 ) -> EvaluationResult:
     """Run METRICS, optional VLM, then REPORT with resumable stage boundaries."""
     if resume_from not in {"METRICS", "VLM", "REPORT"}:
         raise ValueError("resume_from must be one of METRICS, VLM, or REPORT")
     if not isinstance(vlm_enabled, bool):
         raise TypeError("vlm_enabled must be a boolean")
+    if resume_from == "VLM" and not vlm_enabled:
+        raise ValueError("resume_from='VLM' requires vlm_enabled=True")
+    progress = _ProgressEmitter(callbacks.on_progress, _validate_initial_progress(initial_progress))
+    stage_callbacks = EvaluationCallbacks(
+        on_stage=callbacks.on_stage,
+        on_progress=progress.emit,
+        should_cancel=callbacks.should_cancel,
+    )
 
     dataset = Path(dataset_path)
     output = _prepare_output_dir(Path(output_dir))
-    _check_cancelled(callbacks)
+    _preflight_output_contract(output, profile)
+    _check_cancelled(stage_callbacks)
 
     metrics_end = 30.0 if vlm_enabled else 80.0
     if resume_from == "METRICS":
-        callbacks.on_stage("METRICS")
-        callbacks.on_progress(0.0)
+        stage_callbacks.on_stage("METRICS")
+        stage_callbacks.on_progress(0.0)
         generate_episode_metrics(dataset, output)
         metrics = generate_metrics_core(dataset, output)
-        callbacks.on_progress(metrics_end)
+        stage_callbacks.on_progress(metrics_end)
     else:
-        metrics = _load_existing_metrics(dataset, output)
-        callbacks.on_progress(metrics_end)
+        metrics = load_persisted_metrics(dataset, output)
+        stage_callbacks.on_progress(metrics_end)
 
-    _check_cancelled(callbacks)
+    _check_cancelled(stage_callbacks)
     vlm_path: Path | None = None
     if vlm_enabled and resume_from in {"METRICS", "VLM"}:
-        callbacks.on_stage("VLM")
-        callbacks.on_progress(30.0)
-        vlm_path = run_profile_vlm(dataset, output / "attempt_eval", profile, callbacks)
-        callbacks.on_progress(90.0)
+        stage_callbacks.on_stage("VLM")
+        stage_callbacks.on_progress(30.0)
+        vlm_path = run_profile_vlm(dataset, output / "attempt_eval", profile, stage_callbacks)
+        stage_callbacks.on_progress(90.0)
     elif vlm_enabled:
         vlm_path = output / "attempt_eval" / "attempt_summary.json"
         if not vlm_path.is_file():
             raise ValueError(
                 f"cannot resume REPORT with VLM enabled; missing required artifact: {vlm_path}"
             )
+        attempt_results = load_attempt_summary(vlm_path)
+        if len(attempt_results) != metrics["n_episodes"]:
+            raise ValueError(
+                "attempt_summary.json episode count does not match persisted metrics: "
+                f"{len(attempt_results)} != {metrics['n_episodes']}"
+            )
 
-    _check_cancelled(callbacks)
-    callbacks.on_stage("REPORT")
-    callbacks.on_progress(90.0 if vlm_enabled else 80.0)
+    _check_cancelled(stage_callbacks)
+    stage_callbacks.on_stage("REPORT")
+    stage_callbacks.on_progress(90.0 if vlm_enabled else 80.0)
     report_path = generate_markdown_report(dataset, output)
-    callbacks.on_progress(100.0)
+    _validate_output_contract(output, profile, report_path)
+    stage_callbacks.on_progress(100.0)
     return EvaluationResult(metrics, report_path, vlm_path)

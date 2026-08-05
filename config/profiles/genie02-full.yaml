@@ -23,8 +23,8 @@ outputs:
   required:
     - episode_metrics.csv
     - metrics_core.json
-    - smoothness_curve.svg
     - report_*.md
   optional:
+    - smoothness_curve.svg
     - attempt_eval/attempt_summary.json
     - attempt_eval/attempt_summary.csv

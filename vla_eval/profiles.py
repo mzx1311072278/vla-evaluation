@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
+from yaml.constructor import ConstructorError
 
 _SEMVER = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
@@ -24,8 +25,42 @@ _REPORT_PATTERN = "report_*.md"
 _ADAPTERS = frozenset({"genie02"})
 _PLUGINS = frozenset({"genie02-attempt-eval"})
 _PROMPT_VERSIONS = frozenset({"genie02-attempt-v1"})
-_REQUIRED_OUTPUTS = frozenset(
-    {"episode_metrics.csv", "metrics_core.json", "smoothness_curve.svg", _REPORT_PATTERN}
+_REQUIRED_OUTPUTS = frozenset({"episode_metrics.csv", "metrics_core.json", _REPORT_PATTERN})
+
+
+class _UniqueKeyLoader(yaml.SafeLoader):
+    pass
+
+
+def _construct_unique_mapping(
+    loader: _UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict[Any, Any]:
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError as exc:
+            raise ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "mapping keys must be hashable",
+                key_node.start_mark,
+            ) from exc
+        if duplicate:
+            raise ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"duplicate mapping key: {key}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
 )
 
 
@@ -151,7 +186,7 @@ def load_profile(path: str | Path) -> Profile:
     """Load one fully specified profile, rejecting ambiguous or unsafe input."""
     profile_path = Path(path)
     try:
-        loaded: Any = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+        loaded: Any = yaml.load(profile_path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)
     except (OSError, yaml.YAMLError) as exc:
         raise ValueError(f"cannot load evaluation profile {profile_path}: {exc}") from exc
 

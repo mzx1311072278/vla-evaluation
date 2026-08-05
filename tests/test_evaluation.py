@@ -1,4 +1,6 @@
 import builtins
+import csv
+import json
 import sys
 from dataclasses import FrozenInstanceError, dataclass
 from pathlib import Path
@@ -42,30 +44,89 @@ def _callbacks(
 
 
 def _mock_metrics_and_report(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("vla_eval.evaluation.generate_episode_metrics", lambda *_args: [])
-    monkeypatch.setattr("vla_eval.evaluation.generate_metrics_core", lambda *_args: {"gsr": 1.0})
-    monkeypatch.setattr(
-        "vla_eval.evaluation.generate_markdown_report",
-        lambda _dataset, output: output / "report.md",
-    )
+    def episode_metrics(_dataset, output):
+        (output / "episode_metrics.csv").write_text("generated\n", encoding="utf-8")
+        return []
+
+    def metrics_core(_dataset, output):
+        (output / "metrics_core.json").write_text("{}", encoding="utf-8")
+        return {"gsr": 1.0}
+
+    def report(_dataset, output):
+        path = output / "report_20260805.md"
+        path.write_text("# report\n", encoding="utf-8")
+        return path
+
+    monkeypatch.setattr("vla_eval.evaluation.generate_episode_metrics", episode_metrics)
+    monkeypatch.setattr("vla_eval.evaluation.generate_metrics_core", metrics_core)
+    monkeypatch.setattr("vla_eval.evaluation.generate_markdown_report", report)
 
 
 def _persist_resume_artifacts(output: Path) -> None:
     output.mkdir(parents=True)
-    (output / "episode_metrics.csv").write_text("header\n", encoding="utf-8")
+    with (output / "episode_metrics.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=(
+                "session_id",
+                "episode_index",
+                "outcome",
+                "duration_s",
+                "smoothness",
+                "left_smoothness",
+                "right_smoothness",
+                "smoothness_space",
+                "smoothness_frames",
+                "smoothness_skipped_reason",
+            ),
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "session_id": "test-session",
+                "episode_index": 0,
+                "outcome": "success",
+                "duration_s": "1.000",
+                "smoothness_skipped_reason": "trajectory unavailable",
+            }
+        )
     (output / "metrics_core.json").write_text("{}", encoding="utf-8")
+
+
+def _attempt_result() -> dict[str, Any]:
+    return {
+        "episode_index": 0,
+        "metadata_episode_success": True,
+        "episode_success": True,
+        "pre_success_failed_attempt_count": 0,
+        "failed_attempts_before_success": [],
+        "attempt_count": 1,
+        "success_count": 1,
+        "failed_count": 0,
+        "confidence": 0.9,
+        "vlm_valid": True,
+        "parse_error": "",
+        "needs_manual_review": None,
+        "review_note": "",
+        "auto_warning": [],
+        "review_mode": "manual_review",
+        "reason": "final grasp visible",
+    }
+
+
+def _mock_persisted_loaders(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "vla_eval.evaluation.load_session", lambda _dataset: {"session_id": "test-session"}
+    )
+    monkeypatch.setattr(
+        "vla_eval.evaluation.load_metrics_core",
+        lambda *_args: {"n_episodes": 1, "n_success": 1, "n_failure": 0, "gsr": 1.0},
+    )
 
 
 def test_run_evaluation_calls_metrics_then_report(tmp_path, monkeypatch):
     stages = []
-    monkeypatch.setattr("vla_eval.evaluation.generate_episode_metrics", lambda dataset, output: [])
-    monkeypatch.setattr(
-        "vla_eval.evaluation.generate_metrics_core", lambda dataset, output: {"gsr": 1.0}
-    )
-    monkeypatch.setattr(
-        "vla_eval.evaluation.generate_markdown_report",
-        lambda dataset, output: output / "report.md",
-    )
+    _mock_metrics_and_report(monkeypatch)
     profile = load_profile("config/profiles/genie02-full.yaml")
     result = run_evaluation(
         dataset_path=tmp_path,
@@ -105,10 +166,10 @@ def test_genie02_profile_matches_cli_contract_and_is_deeply_immutable():
     assert profile.outputs.required == (
         "episode_metrics.csv",
         "metrics_core.json",
-        "smoothness_curve.svg",
         "report_*.md",
     )
     assert profile.outputs.optional == (
+        "smoothness_curve.svg",
         "attempt_eval/attempt_summary.json",
         "attempt_eval/attempt_summary.csv",
     )
@@ -207,6 +268,17 @@ def test_load_profile_rejects_unsupported_prompt_version(tmp_path: Path):
 
     with pytest.raises(ValueError, match="prompt_version must be one of.*genie02-attempt-v1"):
         load_profile(_write_profile(tmp_path, raw))
+
+
+def test_load_profile_rejects_duplicate_yaml_mapping_keys(tmp_path: Path):
+    path = tmp_path / "duplicate.yaml"
+    path.write_text(
+        "name: first-name\n" + PROFILE_PATH.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate mapping key.*name"):
+        load_profile(path)
 
 
 @pytest.mark.parametrize(
@@ -430,23 +502,25 @@ def test_resume_vlm_loads_metrics_and_runs_vlm_then_report(
     output = tmp_path / "run"
     _persist_resume_artifacts(output)
     stages: list[str] = []
-    monkeypatch.setattr("vla_eval.evaluation.load_session", lambda dataset: {"path": dataset})
-    monkeypatch.setattr(
-        "vla_eval.evaluation.load_metrics_core",
-        lambda actual_output, session: {"gsr": 0.5, "output": actual_output, "session": session},
-    )
+    _mock_persisted_loaders(monkeypatch)
     monkeypatch.setattr(
         "vla_eval.evaluation.generate_episode_metrics",
         lambda *_args: pytest.fail("metrics regenerated"),
     )
-    monkeypatch.setattr(
-        "vla_eval.evaluation.run_profile_vlm",
-        lambda _dataset, vlm_output, _profile, _callbacks: vlm_output / "attempt_summary.json",
-    )
-    monkeypatch.setattr(
-        "vla_eval.evaluation.generate_markdown_report",
-        lambda _dataset, actual_output: actual_output / "report.md",
-    )
+
+    def fake_vlm(_dataset, vlm_output, _profile, _callbacks):
+        vlm_output.mkdir(parents=True)
+        path = vlm_output / "attempt_summary.json"
+        path.write_text(json.dumps([_attempt_result()]), encoding="utf-8")
+        return path
+
+    def fake_report(_dataset, actual_output):
+        path = actual_output / "report_20260805.md"
+        path.write_text("# report\n", encoding="utf-8")
+        return path
+
+    monkeypatch.setattr("vla_eval.evaluation.run_profile_vlm", fake_vlm)
+    monkeypatch.setattr("vla_eval.evaluation.generate_markdown_report", fake_report)
 
     result = run_evaluation(
         tmp_path,
@@ -457,7 +531,7 @@ def test_resume_vlm_loads_metrics_and_runs_vlm_then_report(
         resume_from="VLM",
     )
 
-    assert result.metrics["gsr"] == 0.5
+    assert result.metrics["gsr"] == 1.0
     assert stages == ["VLM", "REPORT"]
 
 
@@ -488,8 +562,7 @@ def test_resume_report_with_vlm_requires_existing_attempt_summary(
 ):
     output = tmp_path / "run"
     _persist_resume_artifacts(output)
-    monkeypatch.setattr("vla_eval.evaluation.load_session", lambda _dataset: {})
-    monkeypatch.setattr("vla_eval.evaluation.load_metrics_core", lambda *_args: {"gsr": 1.0})
+    _mock_persisted_loaders(monkeypatch)
 
     with pytest.raises(ValueError, match="cannot resume REPORT.*attempt_summary.json"):
         run_evaluation(
@@ -517,16 +590,17 @@ def test_progress_is_monotonic_and_bounded(
     _mock_metrics_and_report(monkeypatch)
     if resume_from != "METRICS":
         _persist_resume_artifacts(output)
-        monkeypatch.setattr("vla_eval.evaluation.load_session", lambda _dataset: {})
-        monkeypatch.setattr("vla_eval.evaluation.load_metrics_core", lambda *_args: {"gsr": 1.0})
-    monkeypatch.setattr(
-        "vla_eval.evaluation.run_profile_vlm",
-        lambda _dataset, vlm_output, _profile, callbacks: (
-            callbacks.on_progress(45.0),
-            callbacks.on_progress(75.0),
-            vlm_output / "attempt_summary.json",
-        )[-1],
-    )
+        _mock_persisted_loaders(monkeypatch)
+
+    def fake_vlm(_dataset, vlm_output, _profile, callbacks):
+        callbacks.on_progress(45.0)
+        callbacks.on_progress(75.0)
+        vlm_output.mkdir(parents=True)
+        path = vlm_output / "attempt_summary.json"
+        path.write_text(json.dumps([_attempt_result()]), encoding="utf-8")
+        return path
+
+    monkeypatch.setattr("vla_eval.evaluation.run_profile_vlm", fake_vlm)
 
     run_evaluation(
         tmp_path,
@@ -573,6 +647,347 @@ def test_run_evaluation_creates_output_dir_and_rejects_unsafe_existing_path(
         run_evaluation(
             tmp_path,
             symlink_path,
+            load_profile(PROFILE_PATH),
+            False,
+            _callbacks(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("initial_progress", "error"),
+    [
+        (True, TypeError),
+        ("50", TypeError),
+        (-0.1, ValueError),
+        (100.1, ValueError),
+        (float("nan"), ValueError),
+        (float("inf"), ValueError),
+    ],
+)
+def test_run_evaluation_rejects_invalid_initial_progress(
+    tmp_path: Path,
+    initial_progress: Any,
+    error: type[Exception],
+):
+    with pytest.raises(error, match="initial_progress"):
+        run_evaluation(
+            tmp_path,
+            tmp_path / "run",
+            load_profile(PROFILE_PATH),
+            False,
+            _callbacks(),
+            initial_progress=initial_progress,
+        )
+
+
+def test_vlm_then_report_retries_keep_persisted_progress_monotonic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    output = tmp_path / "run"
+    _persist_resume_artifacts(output)
+    progress: list[float] = []
+    _mock_persisted_loaders(monkeypatch)
+
+    def fake_vlm(_dataset, vlm_output, _profile, callbacks):
+        callbacks.on_progress(45.0)
+        vlm_output.mkdir(parents=True)
+        summary = vlm_output / "attempt_summary.json"
+        summary.write_text(json.dumps([_attempt_result()]), encoding="utf-8")
+        return summary
+
+    monkeypatch.setattr("vla_eval.evaluation.run_profile_vlm", fake_vlm)
+    monkeypatch.setattr(
+        "vla_eval.evaluation.generate_markdown_report",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("report failed")),
+    )
+    callbacks = _callbacks(progress=progress)
+
+    with pytest.raises(RuntimeError, match="report failed"):
+        run_evaluation(
+            tmp_path,
+            output,
+            load_profile(PROFILE_PATH),
+            True,
+            callbacks,
+            resume_from="VLM",
+            initial_progress=30.0,
+        )
+
+    persisted = progress[-1]
+    monkeypatch.setattr(
+        "vla_eval.evaluation.generate_markdown_report",
+        lambda _dataset, actual_output: actual_output / "report_20260805.md",
+    )
+    (output / "report_20260805.md").write_text("# report\n", encoding="utf-8")
+    run_evaluation(
+        tmp_path,
+        output,
+        load_profile(PROFILE_PATH),
+        True,
+        callbacks,
+        resume_from="REPORT",
+        initial_progress=persisted,
+    )
+
+    assert progress == sorted(progress)
+    assert progress[-1] == 100.0
+
+
+def test_run_evaluation_rejects_vlm_resume_when_vlm_is_disabled(tmp_path: Path):
+    with pytest.raises(ValueError, match="resume_from.*VLM.*vlm_enabled"):
+        run_evaluation(
+            tmp_path,
+            tmp_path / "run",
+            load_profile(PROFILE_PATH),
+            False,
+            _callbacks(),
+            resume_from="VLM",
+        )
+
+
+@pytest.mark.parametrize("callback_name", ["on_stage", "on_progress", "should_cancel"])
+def test_callback_exceptions_propagate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    callback_name: str,
+):
+    _mock_metrics_and_report(monkeypatch)
+
+    def fail(*_args):
+        raise RuntimeError(f"{callback_name} failed")
+
+    callbacks = EvaluationCallbacks(
+        on_stage=fail if callback_name == "on_stage" else lambda _stage: None,
+        on_progress=fail if callback_name == "on_progress" else lambda _value: None,
+        should_cancel=fail if callback_name == "should_cancel" else lambda: False,
+    )
+
+    with pytest.raises(RuntimeError, match=f"{callback_name} failed"):
+        run_evaluation(
+            tmp_path,
+            tmp_path / f"run-{callback_name}",
+            load_profile(PROFILE_PATH),
+            False,
+            callbacks,
+        )
+
+
+def test_load_persisted_metrics_parses_episode_csv_and_checks_core_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from vla_eval import evaluation
+
+    output = tmp_path / "run"
+    _persist_resume_artifacts(output)
+    monkeypatch.setattr(
+        "vla_eval.evaluation.load_session", lambda _dataset: {"session_id": "test-session"}
+    )
+    monkeypatch.setattr(
+        "vla_eval.evaluation.load_metrics_core",
+        lambda *_args: {
+            "n_episodes": 1,
+            "n_success": 1,
+            "n_failure": 0,
+            "gsr": 1.0,
+        },
+    )
+
+    metrics = evaluation.load_persisted_metrics(tmp_path, output)
+
+    assert metrics["n_episodes"] == 1
+
+
+@pytest.mark.parametrize(
+    "metrics",
+    [
+        {"n_episodes": 2, "n_success": 1, "n_failure": 1, "gsr": 0.5},
+        {"n_episodes": 1, "n_success": 0, "n_failure": 1, "gsr": 0.0},
+        {"n_episodes": 1, "n_success": 1, "n_failure": 0, "gsr": float("nan")},
+        {"n_episodes": True, "n_success": 1, "n_failure": 0, "gsr": 1.0},
+    ],
+)
+def test_load_persisted_metrics_rejects_inconsistent_numeric_essentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metrics: dict[str, Any],
+):
+    from vla_eval import evaluation
+
+    output = tmp_path / "run"
+    _persist_resume_artifacts(output)
+    monkeypatch.setattr(
+        "vla_eval.evaluation.load_session", lambda _dataset: {"session_id": "test-session"}
+    )
+    monkeypatch.setattr("vla_eval.evaluation.load_metrics_core", lambda *_args: metrics)
+
+    with pytest.raises(ValueError, match="persisted metrics"):
+        evaluation.load_persisted_metrics(tmp_path, output)
+
+
+def test_resume_validates_episode_metrics_before_starting_vlm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    output = tmp_path / "run"
+    _persist_resume_artifacts(output)
+    (output / "episode_metrics.csv").write_text("wrong,columns\n1,2\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "vla_eval.evaluation.load_session", lambda _dataset: {"session_id": "test-session"}
+    )
+    monkeypatch.setattr(
+        "vla_eval.evaluation.run_profile_vlm", lambda *_args: pytest.fail("VLM started")
+    )
+
+    with pytest.raises(ValueError, match="persisted metrics.*episode_metrics.csv"):
+        run_evaluation(
+            tmp_path,
+            output,
+            load_profile(PROFILE_PATH),
+            True,
+            _callbacks(),
+            resume_from="VLM",
+        )
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        {"episode_index": 0},
+        [{}],
+        [{**_attempt_result(), "episode_index": True}],
+        [{**_attempt_result(), "confidence": float("nan")}],
+        [{**_attempt_result(), "auto_warning": "low_confidence"}],
+        [_attempt_result(), _attempt_result()],
+    ],
+)
+def test_load_attempt_summary_rejects_malformed_writer_schema(tmp_path: Path, summary: Any):
+    from vla_eval import evaluation
+
+    path = tmp_path / "attempt_summary.json"
+    path.write_text(json.dumps(summary), encoding="utf-8")
+
+    with pytest.raises((TypeError, ValueError), match="attempt_summary.json"):
+        evaluation.load_attempt_summary(path)
+
+
+def test_resume_report_validates_attempt_summary_before_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    output = tmp_path / "run"
+    _persist_resume_artifacts(output)
+    summary = output / "attempt_eval/attempt_summary.json"
+    summary.parent.mkdir()
+    summary.write_text("{not-json", encoding="utf-8")
+    monkeypatch.setattr(
+        "vla_eval.evaluation.load_session", lambda _dataset: {"session_id": "test-session"}
+    )
+    monkeypatch.setattr(
+        "vla_eval.evaluation.load_metrics_core",
+        lambda *_args: {"n_episodes": 1, "n_success": 1, "n_failure": 0, "gsr": 1.0},
+    )
+    monkeypatch.setattr(
+        "vla_eval.evaluation.generate_markdown_report",
+        lambda *_args: pytest.fail("report started"),
+    )
+
+    with pytest.raises(ValueError, match="attempt_summary.json"):
+        run_evaluation(
+            tmp_path,
+            output,
+            load_profile(PROFILE_PATH),
+            True,
+            _callbacks(),
+            resume_from="REPORT",
+        )
+
+
+def test_required_outputs_and_report_path_are_validated_before_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    output = tmp_path / "run"
+    progress: list[float] = []
+
+    def episode_metrics(_dataset, actual_output):
+        (actual_output / "episode_metrics.csv").write_text("generated\n", encoding="utf-8")
+        return []
+
+    def report(_dataset, actual_output):
+        path = actual_output / "report_20260805.md"
+        path.write_text("# report\n", encoding="utf-8")
+        return path
+
+    monkeypatch.setattr("vla_eval.evaluation.generate_episode_metrics", episode_metrics)
+    monkeypatch.setattr("vla_eval.evaluation.generate_metrics_core", lambda *_args: {"gsr": 1.0})
+    monkeypatch.setattr("vla_eval.evaluation.generate_markdown_report", report)
+
+    with pytest.raises(ValueError, match="required output.*metrics_core.json"):
+        run_evaluation(
+            tmp_path,
+            output,
+            load_profile(PROFILE_PATH),
+            False,
+            _callbacks(progress=progress),
+        )
+
+    assert 100.0 not in progress
+
+
+@pytest.mark.parametrize("case", ["outside", "symlink", "not-allowed"])
+def test_returned_report_must_be_safe_and_allowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+):
+    output = tmp_path / "run"
+    _mock_metrics_and_report(monkeypatch)
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside\n", encoding="utf-8")
+
+    def unsafe_report(_dataset, actual_output):
+        if case == "outside":
+            return outside
+        if case == "symlink":
+            path = actual_output / "report_20260805.md"
+            path.symlink_to(outside)
+            return path
+        path = actual_output / "unexpected.md"
+        path.write_text("unexpected\n", encoding="utf-8")
+        return path
+
+    monkeypatch.setattr("vla_eval.evaluation.generate_markdown_report", unsafe_report)
+
+    with pytest.raises(ValueError, match="report|symbolic link|allowlist"):
+        run_evaluation(
+            tmp_path,
+            output,
+            load_profile(PROFILE_PATH),
+            False,
+            _callbacks(),
+        )
+
+
+@pytest.mark.parametrize(
+    "relative",
+    ["metrics_core.json", "attempt_eval", "smoothness_curve.svg"],
+)
+def test_output_preflight_rejects_child_symlinks_before_writers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+):
+    output = tmp_path / "run"
+    output.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = output / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.symlink_to(outside, target_is_directory=relative == "attempt_eval")
+    monkeypatch.setattr(
+        "vla_eval.evaluation.generate_episode_metrics",
+        lambda *_args: pytest.fail("writer started"),
+    )
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        run_evaluation(
+            tmp_path,
+            output,
             load_profile(PROFILE_PATH),
             False,
             _callbacks(),
