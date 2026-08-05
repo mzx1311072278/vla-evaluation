@@ -1,6 +1,7 @@
 import csv
 import json
 import os
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -72,18 +73,20 @@ def _write_native_session(
 
 
 def test_inspect_genie02_accepts_direct_parquet_trajectory(tmp_path: Path):
+    trajectory_path = "recording/data/chunk-000/episode_000.parquet"
     root = _write_native_session(
         tmp_path / "run",
-        trajectory_path="trajectories/episode_000.parquet",
+        trajectory_path=trajectory_path,
         create_trajectory=False,
     )
+    (root / trajectory_path).parent.mkdir(parents=True)
     pd.DataFrame(
         {
             "episode_index": [0, 0, 0, 0],
             "timestamp": [0.0, 0.1, 0.2, 0.3],
             "action": [[0.0, 0.0, 0.0]] * 4,
         }
-    ).to_parquet(root / "trajectories/episode_000.parquet")
+    ).to_parquet(root / trajectory_path)
 
     result = inspect_dataset(root, allowed_root=tmp_path)
 
@@ -143,7 +146,7 @@ def test_inspect_genie02_rejects_csv_named_symlink_to_npz(tmp_path: Path):
     assert any("unsupported trajectory format" in error for error in result.errors)
 
 
-def test_inspect_genie02_parquet_uses_logical_sidecar_location(tmp_path: Path):
+def test_inspect_genie02_rejects_parquet_symlink_before_target_sidecar_read(tmp_path: Path):
     logical_path = "alias/data/chunk-000/file-000.parquet"
     root = _write_native_session(
         tmp_path / "run", trajectory_path=logical_path, create_trajectory=False
@@ -169,7 +172,8 @@ def test_inspect_genie02_parquet_uses_logical_sidecar_location(tmp_path: Path):
 
     result = inspect_dataset(root, allowed_root=tmp_path)
 
-    assert result.ready is True
+    assert result.ready is False
+    assert any("parsed symlink files are not supported" in error for error in result.errors)
 
 
 def test_inspect_rejects_shallow_parquet_symlink_with_reader_sidecar_escape(tmp_path: Path):
@@ -391,7 +395,7 @@ def test_inspect_reports_invalid_json_and_parquet_metadata(tmp_path: Path):
     assert any("cannot read" in error and "parquet" in error for error in result.errors)
 
 
-def test_inspect_accepts_internal_file_symlink_without_double_counting(tmp_path: Path):
+def test_inspect_rejects_internal_symlink_for_parsed_trajectory(tmp_path: Path):
     root = _write_native_session(tmp_path / "run")
     target = root / "trajectories/episode_000.npz"
     alias = root / "trajectory-link.npz"
@@ -407,7 +411,8 @@ def test_inspect_accepts_internal_file_symlink_without_double_counting(tmp_path:
         path.stat().st_size for path in (root / "session.json", root / "episodes.csv", target)
     )
 
-    assert result.ready is True
+    assert result.ready is False
+    assert any("symlink" in error for error in result.errors)
     assert result.size_bytes == expected_size
 
 
@@ -468,9 +473,9 @@ def test_manifest_hashes_only_adapter_metadata_independent_of_ancestors(
     hashed: list[Path] = []
     original_hash_file = datasets._hash_file
 
-    def record_hash(path: Path) -> str:
+    def record_hash(path: Path, *args) -> str:
         hashed.append(path.resolve())
-        return original_hash_file(path)
+        return original_hash_file(path, *args)
 
     monkeypatch.setattr(datasets, "_hash_file", record_hash)
 
@@ -548,3 +553,211 @@ def test_inspect_reports_missing_outside_reference_as_outside_allowed_root(tmp_p
 
     assert result.ready is False
     assert any("outside allowed root" in error for error in result.errors)
+
+
+def test_fingerprint_is_stable_when_dataset_is_relocated(tmp_path: Path):
+    source = _write_lerobot(tmp_path / "staging/run")
+    destination = tmp_path / "inbox/run"
+    shutil.copytree(source, destination, copy_function=shutil.copy2)
+
+    source_result = inspect_dataset(source, allowed_root=tmp_path)
+    destination_result = inspect_dataset(destination, allowed_root=tmp_path)
+
+    assert source_result.ready is True
+    assert destination_result.ready is True
+    assert source_result.fingerprint == destination_result.fingerprint
+
+
+def test_complete_genie_signature_wins_over_ordinary_data_directory(tmp_path: Path):
+    root = _write_native_session(tmp_path / "run")
+    (root / "data").mkdir()
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.kind is DatasetKind.GENIE02_SESSION
+    assert result.ready is True
+
+
+def test_dataset_with_both_complete_signatures_is_ambiguous(tmp_path: Path):
+    root = _write_lerobot(tmp_path / "run")
+    _write_native_session(root)
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.kind is None
+    assert result.ready is False
+    assert any("ambiguous" in error for error in result.errors)
+
+
+def test_dataset_root_outside_allowed_is_rejected_before_type_error(tmp_path: Path):
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    outside_file = tmp_path / "outside.txt"
+    outside_file.write_text("not a directory")
+
+    result = inspect_dataset(outside_file, allowed_root=allowed_root)
+
+    assert result.ready is False
+    assert "outside allowed root" in result.errors[0]
+
+
+def test_inspect_rejects_string_action_vectors(tmp_path: Path):
+    root = _write_lerobot(tmp_path / "run")
+    pd.DataFrame(
+        {"episode_index": [0], "timestamp": [0.0], "action": [["not-numeric"]]}
+    ).to_parquet(root / "data/chunk-000/file-000.parquet")
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is False
+    assert any("numeric action" in error for error in result.errors)
+
+
+def test_inspect_rejects_non_finite_lerobot_timestamps(tmp_path: Path):
+    root = _write_lerobot(tmp_path / "run")
+    pd.DataFrame(
+        {"episode_index": [0], "timestamp": [float("nan")], "action": [[0.0, 0.0]]}
+    ).to_parquet(root / "data/chunk-000/file-000.parquet")
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is False
+    assert any("finite numeric timestamp" in error for error in result.errors)
+
+
+def test_inspect_rejects_empty_lerobot_action_vectors(tmp_path: Path):
+    root = _write_lerobot(tmp_path / "run")
+    pd.DataFrame({"episode_index": [0], "timestamp": [0.0], "action": [[]]}).to_parquet(
+        root / "data/chunk-000/file-000.parquet"
+    )
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is False
+    assert any("nonempty action vector" in error for error in result.errors)
+
+
+def test_shared_lerobot_data_file_is_validated_once(tmp_path: Path, monkeypatch):
+    root = tmp_path / "run"
+    (root / "meta/episodes/chunk-000").mkdir(parents=True)
+    (root / "data/chunk-000").mkdir(parents=True)
+    (root / "meta/info.json").write_text('{"total_episodes": 100, "fps": 30}')
+    indices = list(range(100))
+    pd.DataFrame(
+        {
+            "episode_index": indices,
+            "length": [1] * 100,
+            "episode_success": ["success"] * 100,
+            "data/chunk_index": [0] * 100,
+            "data/file_index": [0] * 100,
+        }
+    ).to_parquet(root / "meta/episodes/chunk-000/file-000.parquet")
+    pd.DataFrame(
+        {
+            "episode_index": indices,
+            "timestamp": [float(index) for index in indices],
+            "action": [[0.0, 0.0, 0.0]] * 100,
+            "unrelated": ["do-not-read"] * 100,
+        }
+    ).to_parquet(root / "data/chunk-000/file-000.parquet")
+    calls = 0
+    original_validate = datasets._validate_data_parquet
+
+    def count_validation(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(datasets, "_validate_data_parquet", count_validation)
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is True
+    assert calls == 1
+
+
+def test_video_column_resolver_supports_all_reader_schemas():
+    from Genie02_report.attempt_eval.dataset_reader import resolve_video_columns
+
+    key = "observation.images.right_wrist"
+    schemas = (
+        {
+            "episode_index": "episode_index",
+            "length": "length",
+            "file_index": f"videos/{key}/file_index",
+            "from_timestamp": f"videos/{key}/from_timestamp",
+            "to_timestamp": f"videos/{key}/to_timestamp",
+        },
+        {
+            "episode_index": "episode_idx",
+            "length": "episode_length",
+            "file_index": f"{key}/file_index",
+            "from_timestamp": f"{key}/from_timestamp",
+            "to_timestamp": f"{key}/to_timestamp",
+        },
+        {
+            "episode_index": "my_episode_number",
+            "length": "recording_length",
+            "file_index": f"metadata/{key}/video_file_index",
+            "from_timestamp": f"metadata/{key}/video_from_timestamp",
+            "to_timestamp": f"metadata/{key}/video_to_timestamp",
+        },
+    )
+
+    for expected in schemas:
+        resolved = resolve_video_columns(list(expected.values()), key)
+        assert resolved.episode_index == expected["episode_index"]
+        assert resolved.length == expected["length"]
+        assert resolved.file_index == expected["file_index"]
+        assert resolved.from_timestamp == expected["from_timestamp"]
+        assert resolved.to_timestamp == expected["to_timestamp"]
+
+
+def test_inspect_lerobot_uses_shared_video_column_resolution(tmp_path: Path):
+    root = _write_lerobot(tmp_path / "run", with_video_metadata=True)
+    key = "observation.images.right_wrist"
+    metadata_path = root / "meta/episodes/chunk-000/file-000.parquet"
+    metadata = pd.read_parquet(metadata_path).rename(
+        columns={
+            f"videos/{key}/file_index": f"{key}/file_index",
+            f"videos/{key}/from_timestamp": f"{key}/from_timestamp",
+            f"videos/{key}/to_timestamp": f"{key}/to_timestamp",
+        }
+    )
+    metadata.to_parquet(metadata_path)
+    video = root / f"videos/{key}/chunk-000/file-000.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"video-placeholder")
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is True
+
+
+def test_symlink_swap_between_check_and_parse_is_rejected(tmp_path: Path, monkeypatch):
+    root = _write_native_session(tmp_path / "run")
+    trajectory = root / "trajectories/episode_000.npz"
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.npz"
+    np.savez(outside, action=np.ones((4, 3)))
+    original_mark = datasets._mark_trajectory_sidecar_metadata
+    swapped = False
+
+    def swap_after_check(*args, **kwargs):
+        nonlocal swapped
+        result = original_mark(*args, **kwargs)
+        if not swapped:
+            trajectory.unlink()
+            trajectory.symlink_to(outside)
+            swapped = True
+        return result
+
+    monkeypatch.setattr(datasets, "_mark_trajectory_sidecar_metadata", swap_after_check)
+    try:
+        result = inspect_dataset(root, allowed_root=tmp_path)
+    finally:
+        outside.unlink(missing_ok=True)
+
+    assert result.ready is False
+    assert any(
+        "changed during inspection" in error or "symlink" in error for error in result.errors
+    )
