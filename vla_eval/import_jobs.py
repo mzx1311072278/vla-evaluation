@@ -478,7 +478,9 @@ def _validate_no_symlink_directory(path: Path, field_name: str) -> None:
         raise ValueError(f"{field_name} must be an existing directory")
 
 
-def _validate_protected_directory(path: Path, field_name: str) -> None:
+def _validate_protected_directory(
+    path: Path, field_name: str, *, required_access: int = os.W_OK | os.X_OK
+) -> None:
     for component in _path_components(path):
         component_stat = os.lstat(component)
         if stat.S_ISLNK(component_stat.st_mode):
@@ -489,14 +491,21 @@ def _validate_protected_directory(path: Path, field_name: str) -> None:
             raise ValueError(f"{field_name} must be owned by root or the service user")
         if component_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             raise ValueError(f"{field_name} must not be group or other writable")
-    if not os.access(path, os.W_OK | os.X_OK):
-        raise ValueError(f"{field_name} must be writable and searchable")
+    if not os.access(path, required_access):
+        raise ValueError(f"{field_name} has insufficient service access")
 
 
 def validate_trusted_directory(path: Path, field_name: str) -> Path:
     """Validate an existing service-owned directory and all of its ancestors."""
     candidate = _absolute_path(path, field_name)
     _validate_protected_directory(candidate, field_name)
+    return candidate
+
+
+def validate_trusted_readable_directory(path: Path, field_name: str) -> Path:
+    """Validate a protected directory that only needs read/search access."""
+    candidate = _absolute_path(path, field_name)
+    _validate_protected_directory(candidate, field_name, required_access=os.R_OK | os.X_OK)
     return candidate
 
 

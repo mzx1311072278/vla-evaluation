@@ -3,3 +3,7 @@
 
 class EvaluationCancelled(RuntimeError):
     pass
+
+
+class ModelLoadError(RuntimeError):
+    """A model failed to initialize; the message is safe for persistence."""

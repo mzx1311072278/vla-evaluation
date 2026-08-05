@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from vla_eval.exceptions import ModelLoadError
+
 if __package__:
     from .prompt_registry import PROMPT, PROMPT_VERSION, prompt_for_version
     from .prompt_registry import PROMPTS as PROMPTS  # noqa: PLC0414 - compatibility re-export
@@ -59,7 +61,9 @@ def extract_json(text: str) -> tuple[dict[str, Any] | None, bool, str]:
     return None, False, parse_error
 
 
-def fallback_result(raw_response: str = "", warning: str = "invalid_vlm_json", parse_error: str = "") -> dict[str, Any]:
+def fallback_result(
+    raw_response: str = "", warning: str = "invalid_vlm_json", parse_error: str = ""
+) -> dict[str, Any]:
     warnings = ["vlm_invalid_response", warning]
     if not raw_response:
         warnings.append("empty_vlm_response")
@@ -86,7 +90,9 @@ def _is_non_grasp_attempt(attempt: dict[str, Any]) -> bool:
     evidence = str(attempt.get("evidence", ""))
     if "简短证据" in evidence or not evidence.strip():
         return True
-    return ("未闭合" in evidence or "没有明确闭合" in evidence) and ("接近" in evidence or "靠近" in evidence)
+    return ("未闭合" in evidence or "没有明确闭合" in evidence) and (
+        "接近" in evidence or "靠近" in evidence
+    )
 
 
 def validate_vlm_result(
@@ -103,20 +109,38 @@ def validate_vlm_result(
     ]
     missing = [key for key in required if key not in parsed]
     if missing:
-        return fallback_result(raw_response, "missing_required_fields", f"Missing required fields: {missing}")
+        return fallback_result(
+            raw_response, "missing_required_fields", f"Missing required fields: {missing}"
+        )
     if parsed["episode_success"] is not True:
-        return fallback_result(raw_response, "missing_required_fields", "episode_success must be true")
+        return fallback_result(
+            raw_response, "missing_required_fields", "episode_success must be true"
+        )
     attempts = parsed["failed_attempts_before_success"]
     if not isinstance(attempts, list):
-        return fallback_result(raw_response, "missing_required_fields", "failed_attempts_before_success must be a list")
+        return fallback_result(
+            raw_response, "missing_required_fields", "failed_attempts_before_success must be a list"
+        )
     count = parsed["pre_success_failed_attempt_count"]
     if count is not None and (not isinstance(count, int) or count != len(attempts)):
-        return fallback_result(raw_response, "missing_required_fields", "pre_success_failed_attempt_count must match failed_attempts_before_success length")
+        return fallback_result(
+            raw_response,
+            "missing_required_fields",
+            "pre_success_failed_attempt_count must match failed_attempts_before_success length",
+        )
     if count is None and attempts:
-        return fallback_result(raw_response, "missing_required_fields", "failed_attempts_before_success must be empty when count is null")
+        return fallback_result(
+            raw_response,
+            "missing_required_fields",
+            "failed_attempts_before_success must be empty when count is null",
+        )
     for i, attempt in enumerate(attempts):
         if not isinstance(attempt, dict):
-            return fallback_result(raw_response, "missing_required_fields", f"failed_attempts_before_success[{i}] must be an object")
+            return fallback_result(
+                raw_response,
+                "missing_required_fields",
+                f"failed_attempts_before_success[{i}] must be an object",
+            )
     filtered_non_grasp_attempt = False
     filtered_attempts = [attempt for attempt in attempts if not _is_non_grasp_attempt(attempt)]
     if len(filtered_attempts) != len(attempts):
@@ -126,14 +150,20 @@ def validate_vlm_result(
         parsed["failed_attempts_before_success"] = attempts
         parsed["pre_success_failed_attempt_count"] = count
     if not isinstance(parsed["confidence"], (int, float)):
-        return fallback_result(raw_response, "missing_required_fields", "confidence must be a number")
+        return fallback_result(
+            raw_response, "missing_required_fields", "confidence must be a number"
+        )
     if not isinstance(parsed["reason"], str):
         return fallback_result(raw_response, "missing_required_fields", "reason must be a string")
     if "简短原因" in parsed["reason"]:
-        return fallback_result(raw_response, "placeholder_reason", "reason must describe observed frames")
+        return fallback_result(
+            raw_response, "placeholder_reason", "reason must describe observed frames"
+        )
     final_success_time = parsed.get("final_success_time")
     if final_success_time is not None and not isinstance(final_success_time, (int, float)):
-        return fallback_result(raw_response, "missing_required_fields", "final_success_time must be a number or null")
+        return fallback_result(
+            raw_response, "missing_required_fields", "final_success_time must be a number or null"
+        )
     result = dict(parsed)
     out_of_range_final_success_time = False
     if (
@@ -168,7 +198,9 @@ class LocalVLMClient:
     ):
         self.model_path = model_path.expanduser()
         if not self.model_path.exists():
-            raise FileNotFoundError(f"Local VLM model path does not exist: {self.model_path}")
+            error = FileNotFoundError("local VLM model path does not exist")
+            error.add_note(str(self.model_path))
+            raise ModelLoadError("The configured model could not be loaded.") from error
         self.max_new_tokens = max_new_tokens
         self.prompt = prompt_for_version(prompt_version)
 
@@ -176,28 +208,31 @@ class LocalVLMClient:
 
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-        import torch
-        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+        try:
+            import torch
+            from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
-        self.torch = torch
-        if torch.cuda.is_available():
-            print("CUDA available: using GPU for VLM inference.")
-            device_map = "auto"
-            torch_dtype = "auto"
-        else:
-            print("CUDA not available: using CPU. VLM inference will be very slow.")
-            device_map = None
-            torch_dtype = torch.float32
+            self.torch = torch
+            if torch.cuda.is_available():
+                print("CUDA available: using GPU for VLM inference.")
+                device_map = "auto"
+                torch_dtype = "auto"
+            else:
+                print("CUDA not available: using CPU. VLM inference will be very slow.")
+                device_map = None
+                torch_dtype = torch.float32
 
-        self.processor = AutoProcessor.from_pretrained(self.model_path, local_files_only=True)
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            self.model_path,
-            torch_dtype=torch_dtype,
-            device_map=device_map,
-            local_files_only=True,
-        )
-        if device_map is None:
-            self.model.to("cpu")
+            self.processor = AutoProcessor.from_pretrained(self.model_path, local_files_only=True)
+            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                self.model_path,
+                torch_dtype=torch_dtype,
+                device_map=device_map,
+                local_files_only=True,
+            )
+            if device_map is None:
+                self.model.to("cpu")
+        except Exception as error:
+            raise ModelLoadError("The configured model could not be loaded.") from error
 
     def close(self) -> None:
         self.model = None
@@ -224,7 +259,9 @@ class LocalVLMClient:
         )
         messages = [{"role": "user", "content": content}]
 
-        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
         image_inputs = video_inputs = inputs = generated = None
         image_inputs, video_inputs = process_vision_info(messages)
         inputs = self.processor(

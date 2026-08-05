@@ -15,7 +15,7 @@ from tests.conftest import reload_job
 from vla_eval.config import AppConfig, RemoteSource
 from vla_eval.datasets import DatasetInspection, DatasetKind
 from vla_eval.db import create_engine_for_url, init_db, session_scope
-from vla_eval.exceptions import EvaluationCancelled
+from vla_eval.exceptions import EvaluationCancelled, ModelLoadError
 from vla_eval.import_jobs import ImportResult, TransferError
 from vla_eval.models import Dataset, EvaluationJob, ImportJob
 from vla_eval.queueing import create_queues
@@ -193,6 +193,19 @@ def test_stale_import_callbacks_cannot_overwrite_ready_job(db_engine, data_root)
         assert (job.state, job.progress, job.execution_token) == ("READY", 100.0, None)
 
 
+def test_import_claim_crash_is_recoverable(db_engine, data_root):
+    job = _create_import_job(db_engine)
+    runtime = _runtime(db_engine, data_root)
+    tasks_module._claim_import_execution(runtime, job.id, str(uuid4()))
+
+    assert recover_interrupted_jobs(runtime=runtime) == 1
+    with session_scope(db_engine) as session:
+        recovered = session.get_one(ImportJob, job.id)
+        assert (recovered.state, recovered.execution_token) == ("INTERRUPTED", None)
+
+    tasks_module._claim_import_execution(runtime, job.id, str(uuid4()))
+
+
 @pytest.mark.parametrize("task_kind", ["evaluation", "import"])
 def test_running_job_cannot_start_duplicate_core(
     db_engine, data_root, evaluation_job, monkeypatch, task_kind
@@ -268,7 +281,7 @@ def test_evaluation_task_records_sanitized_failure_and_reraises(
             "GPU memory was exhausted. Reduce workload or retry.",
         ),
         (
-            type("ModelLoadError", (RuntimeError,), {})("secret model path"),
+            ModelLoadError("secret model path"),
             "MODEL_LOAD_FAILED",
             "The configured model could not be loaded. Review worker logs.",
         ),
@@ -303,6 +316,12 @@ def test_evaluation_failure_classification_is_safe_and_actionable(
     assert "secret" not in job.error_message
 
 
+def test_model_words_do_not_trigger_model_load_classification():
+    error = RuntimeError("dataset model metadata failed to load")
+
+    assert tasks_module._classify_evaluation_failure(error)[0] == "EVALUATION_FAILED"
+
+
 def test_evaluation_rejects_dataset_outside_trusted_path(
     db_engine, data_root, evaluation_job, monkeypatch
 ):
@@ -317,10 +336,15 @@ def test_evaluation_rejects_dataset_outside_trusted_path(
         lambda **_kwargs: pytest.fail("untrusted dataset must not reach evaluation core"),
     )
 
-    with pytest.raises(ValueError, match="trusted inbox"):
+    with pytest.raises(ValueError, match="dataset identity changed"):
         run_evaluation_task(evaluation_job.id, runtime=_runtime(db_engine, data_root))
 
     assert list(outside.iterdir()) == []
+    with session_scope(db_engine) as session:
+        job = session.get_one(EvaluationJob, evaluation_job.id)
+        dataset = session.get_one(Dataset, evaluation_job.dataset_id)
+        assert (job.state, job.error_code) == ("FAILED", "DATASET_CHANGED")
+        assert dataset.status == "PREFLIGHT_FAILED"
 
 
 @pytest.mark.parametrize("case", ["persisted_outside", "canonical_symlink"])
@@ -375,6 +399,30 @@ def test_evaluation_rejects_unsafe_profile_selector(
         run_evaluation_task(evaluation_job.id, runtime=runtime)
 
 
+def test_evaluation_accepts_read_only_trusted_profile_root(
+    db_engine, data_root, evaluation_job, monkeypatch
+):
+    profiles_root = data_root / "read-only-profiles"
+    profiles_root.mkdir(mode=0o700)
+    profile_path = profiles_root / "genie02-full.yaml"
+    profile_path.write_text(
+        Path("config/profiles/genie02-full.yaml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    profile_path.chmod(0o444)
+    profiles_root.chmod(0o555)
+    runtime = replace(_runtime(db_engine, data_root), profiles_root=profiles_root)
+    monkeypatch.setattr(
+        tasks_module,
+        "run_evaluation",
+        lambda **kwargs: kwargs["callbacks"].on_stage("REPORT"),
+    )
+
+    run_evaluation_task(evaluation_job.id, runtime=runtime)
+
+    assert reload_job(db_engine, evaluation_job.id).state == "SUCCEEDED"
+
+
 @pytest.mark.parametrize("resume_stage", ["METRICS", "VLM", "REPORT"])
 def test_evaluation_dataset_changed_fails_before_any_resume_stage(
     db_engine, data_root, evaluation_job, monkeypatch, resume_stage
@@ -407,6 +455,35 @@ def test_evaluation_dataset_changed_fails_before_any_resume_stage(
             "DATASET_CHANGED",
             None,
         )
+        assert dataset.status == "PREFLIGHT_FAILED"
+
+
+def test_evaluation_dataset_trust_failure_is_dataset_changed(
+    db_engine, data_root, evaluation_job, monkeypatch
+):
+    with session_scope(db_engine) as session:
+        dataset = session.get_one(Dataset, evaluation_job.dataset_id)
+        dataset_id = dataset.id
+        dataset_path = Path(dataset.path)
+    for path in sorted(dataset_path.rglob("*"), reverse=True):
+        if path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            path.rmdir()
+    dataset_path.rmdir()
+    monkeypatch.setattr(
+        tasks_module,
+        "run_evaluation",
+        lambda **_kwargs: pytest.fail("missing dataset must not enter core"),
+    )
+
+    with pytest.raises(ValueError):
+        run_evaluation_task(evaluation_job.id, runtime=_runtime(db_engine, data_root))
+
+    with session_scope(db_engine) as session:
+        job = session.get_one(EvaluationJob, evaluation_job.id)
+        dataset = session.get_one(Dataset, dataset_id)
+        assert (job.state, job.error_code) == ("FAILED", "DATASET_CHANGED")
         assert dataset.status == "PREFLIGHT_FAILED"
 
 
@@ -1682,3 +1759,43 @@ def test_recovery_does_not_overwrite_success_committed_after_selection(
 
     job = reload_job(db_engine, evaluation_job.id)
     assert (job.state, job.execution_token) == ("SUCCEEDED", None)
+
+
+def test_recovery_does_not_clear_new_execution_token_after_selection(
+    db_engine, data_root, evaluation_job, monkeypatch
+):
+    runtime = _runtime(db_engine, data_root)
+    token_a = str(uuid4())
+    token_b = str(uuid4())
+    with session_scope(db_engine) as session:
+        job = session.get_one(EvaluationJob, evaluation_job.id)
+        job.state = "RUNNING"
+        job.execution_token = token_a
+    selected = Barrier(2)
+    resume = Barrier(2)
+    real_update = tasks_module.update
+    blocked = False
+
+    def pause_update(model):
+        nonlocal blocked
+        statement = real_update(model)
+        if model is EvaluationJob and not blocked:
+            blocked = True
+            selected.wait(timeout=5)
+            resume.wait(timeout=5)
+        return statement
+
+    monkeypatch.setattr(tasks_module, "update", pause_update)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(recover_interrupted_jobs, runtime=runtime)
+        selected.wait(timeout=5)
+        with session_scope(db_engine) as session:
+            job = session.get_one(EvaluationJob, evaluation_job.id)
+            job.state = "INTERRUPTED"
+            job.execution_token = None
+        tasks_module._claim_evaluation_execution(runtime, evaluation_job.id, token_b)
+        resume.wait(timeout=5)
+        assert future.result(timeout=5) == 0
+
+    job = reload_job(db_engine, evaluation_job.id)
+    assert (job.state, job.execution_token) == ("RUNNING", token_b)

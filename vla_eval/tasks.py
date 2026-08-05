@@ -15,7 +15,7 @@ from vla_eval.config import AppConfig
 from vla_eval.datasets import DatasetInspection, inspect_dataset
 from vla_eval.db import session_scope
 from vla_eval.evaluation import EvaluationCallbacks, run_evaluation
-from vla_eval.exceptions import EvaluationCancelled
+from vla_eval.exceptions import EvaluationCancelled, ModelLoadError
 from vla_eval.import_jobs import (
     DatasetValidationError,
     ImportCallbacks,
@@ -25,6 +25,7 @@ from vla_eval.import_jobs import (
     execute_import,
     validate_published_target,
     validate_trusted_directory,
+    validate_trusted_readable_directory,
 )
 from vla_eval.models import Dataset, EvaluationJob, ImportJob
 from vla_eval.profiles import load_profile
@@ -135,11 +136,7 @@ def _classify_evaluation_failure(error: BaseException) -> tuple[str, str]:
             "CUDA_OUT_OF_MEMORY",
             "GPU memory was exhausted. Reduce workload or retry.",
         )
-    if any(
-        item.__class__.__name__ == "ModelLoadError"
-        or ("model" in str(item).lower() and "load" in str(item).lower())
-        for item in chain
-    ):
+    if any(isinstance(item, ModelLoadError) for item in chain):
         return (
             "MODEL_LOAD_FAILED",
             "The configured model could not be loaded. Review worker logs.",
@@ -334,7 +331,10 @@ def _verify_evaluation_dataset_identity(
     expected_fingerprint: str | None,
 ) -> DatasetInspection:
     try:
-        inspection = inspect_dataset(dataset_path, allowed_root=dataset_path)
+        trusted_dataset = validate_published_target(
+            dataset_path, runtime.config.data_root / "inbox"
+        )
+        inspection = inspect_dataset(trusted_dataset, allowed_root=trusted_dataset)
     except (OSError, RuntimeError, ValueError) as error:
         _record_dataset_changed(runtime, job_id, token, dataset_id)
         raise DatasetChangedError("evaluation dataset identity changed") from error
@@ -369,7 +369,7 @@ def _trusted_evaluation_output(
 def _trusted_profile_path(runtime: TaskRuntime, profile_name: str) -> Path:
     if not _PROFILE_NAME_PATTERN.fullmatch(profile_name):
         raise ValueError("evaluation profile selector must be a safe identifier")
-    root = validate_trusted_directory(
+    root = validate_trusted_readable_directory(
         Path(os.path.abspath(runtime.profiles_root)), "trusted profiles root"
     )
     candidate = root / f"{profile_name}.yaml"
@@ -383,6 +383,8 @@ def _trusted_profile_path(runtime: TaskRuntime, profile_name: str) -> Path:
         raise ValueError("evaluation profile file has an untrusted owner")
     if candidate_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise ValueError("evaluation profile file must not be group or other writable")
+    if not os.access(candidate, os.R_OK):
+        raise ValueError("evaluation profile file is not readable")
     try:
         candidate.resolve(strict=True).relative_to(root.resolve(strict=True))
     except (OSError, RuntimeError, ValueError) as error:
@@ -395,33 +397,51 @@ def recover_interrupted_jobs(*, runtime: TaskRuntime | None = None) -> int:
     evaluation_states = {"RUNNING", "METRICS", "VLM", "REPORT"}
     import_states = {"CONNECTING", "TRANSFERRING", "VERIFYING", "PREFLIGHT"}
     with session_scope(resolved.engine) as session:
-        evaluation_ids = tuple(
-            session.scalars(
-                select(EvaluationJob.id).where(EvaluationJob.state.in_(evaluation_states))
+        evaluation_snapshots = tuple(
+            session.execute(
+                select(EvaluationJob.id, EvaluationJob.execution_token).where(
+                    EvaluationJob.state.in_(evaluation_states)
+                )
             )
         )
-        import_ids = tuple(
-            session.scalars(select(ImportJob.id).where(ImportJob.state.in_(import_states)))
+        import_snapshots = tuple(
+            session.execute(
+                select(ImportJob.id, ImportJob.execution_token).where(
+                    ImportJob.state.in_(import_states)
+                )
+            )
         )
 
     recovered = 0
     with session_scope(resolved.engine) as session:
-        for job_id in evaluation_ids:
+        for job_id, snapshot_token in evaluation_snapshots:
+            token_condition = (
+                EvaluationJob.execution_token.is_(None)
+                if snapshot_token is None
+                else EvaluationJob.execution_token == snapshot_token
+            )
             changed = session.execute(
                 update(EvaluationJob)
                 .where(
                     EvaluationJob.id == job_id,
                     EvaluationJob.state.in_(evaluation_states),
+                    token_condition,
                 )
                 .values(state="INTERRUPTED", execution_token=None)
             )
             recovered += int(changed.rowcount == 1)
-        for import_id in import_ids:
+        for import_id, snapshot_token in import_snapshots:
+            token_condition = (
+                ImportJob.execution_token.is_(None)
+                if snapshot_token is None
+                else ImportJob.execution_token == snapshot_token
+            )
             changed = session.execute(
                 update(ImportJob)
                 .where(
                     ImportJob.id == import_id,
                     ImportJob.state.in_(import_states),
+                    token_condition,
                 )
                 .values(state="INTERRUPTED", execution_token=None)
             )
@@ -438,7 +458,12 @@ def _claim_import_execution(runtime: TaskRuntime, import_id: str, token: str) ->
                 ImportJob.state.in_(_IMPORT_CLAIM_STATES),
                 ImportJob.execution_token.is_(None),
             )
-            .values(execution_token=token, error_code=None, error_message=None)
+            .values(
+                state="CONNECTING",
+                execution_token=token,
+                error_code=None,
+                error_message=None,
+            )
         )
         if claimed.rowcount != 1:
             raise StaleTaskExecution("import execution could not claim the job")
@@ -517,6 +542,8 @@ def _record_import_success(
     token: str,
     target_name: str,
     result: ImportResult,
+    *,
+    reconciliation: bool = False,
 ) -> bool:
     inspection = result.inspection
     with session_scope(runtime.engine) as session:
@@ -527,7 +554,7 @@ def _record_import_success(
                 ImportJob.execution_token == token,
                 ImportJob.dataset_id.is_(None),
                 ImportJob.publish_fingerprint == inspection.fingerprint,
-                ImportJob.state.in_(("PREFLIGHT", "INTERRUPTED")),
+                ImportJob.state == ("CONNECTING" if reconciliation else "PREFLIGHT"),
                 ImportJob.cancel_requested.is_(False),
             )
             .values(state="FINALIZING")
@@ -711,7 +738,14 @@ def _reconcile_interrupted_import(
     if inspection.fingerprint != publish_fingerprint:
         raise ValueError("interrupted published target fingerprint does not match")
     result = ImportResult(target, inspection)
-    if _record_import_success(runtime, import_id, token, target_name, result):
+    if _record_import_success(
+        runtime,
+        import_id,
+        token,
+        target_name,
+        result,
+        reconciliation=True,
+    ):
         return result
     with session_scope(runtime.engine) as session:
         completed = session.get_one(ImportJob, import_id)
@@ -877,18 +911,16 @@ def run_evaluation_task(job_id: str, *, runtime: TaskRuntime | None = None):
             raise EvaluationCancelled("evaluation cancelled before execution")
         if dataset_status != "READY":
             raise ValueError("evaluation dataset is not READY")
-        trusted_dataset = validate_published_target(
-            Path(dataset_path), resolved.config.data_root / "inbox"
-        )
         _verify_evaluation_dataset_identity(
             resolved,
             job_id,
             token,
             dataset_id,
-            trusted_dataset,
+            Path(dataset_path),
             dataset_kind,
             dataset_fingerprint,
         )
+        trusted_dataset = Path(dataset_path)
         output_dir = _trusted_evaluation_output(resolved, job_id, persisted_output)
         _set_evaluation_output(resolved, job_id, token, output_dir)
         profile = load_profile(_trusted_profile_path(resolved, profile_name))

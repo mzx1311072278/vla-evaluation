@@ -22,6 +22,7 @@ from vla_eval.evaluation import (
     run_profile_vlm,
 )
 from vla_eval.exceptions import EvaluationCancelled as LightweightEvaluationCancelled
+from vla_eval.exceptions import ModelLoadError
 from vla_eval.profiles import load_profile
 
 
@@ -342,6 +343,17 @@ def test_local_vlm_client_close_releases_loaded_resources():
     assert client.model is None
     assert client.processor is None
     assert empty_cache_calls
+
+
+def test_local_vlm_client_missing_path_raises_safe_model_load_error(tmp_path):
+    from Genie02_report.attempt_eval.vlm_client import LocalVLMClient
+
+    missing = tmp_path / "private-model"
+    with pytest.raises(ModelLoadError, match="configured model could not be loaded") as raised:
+        LocalVLMClient(missing)
+
+    assert str(missing) not in str(raised.value)
+    assert isinstance(raised.value.__cause__, FileNotFoundError)
 
 
 def test_evaluation_cancelled_is_reexported_from_lightweight_module():
