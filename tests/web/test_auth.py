@@ -4,6 +4,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 import pytest
+from fastapi.testclient import TestClient
 from itsdangerous import TimestampSigner
 from sqlalchemy import update
 
@@ -178,6 +179,32 @@ def test_login_failure_is_generic_and_does_not_echo_credentials(client, user, us
     assert username not in response.text
     assert password not in response.text
     assert 'role="alert"' in response.text
+
+
+@pytest.mark.parametrize("stored_hash", ["", "not-a-password-hash"])
+def test_login_with_invalid_stored_hash_is_generic_failure(app, user, db_engine, stored_hash):
+    with session_scope(db_engine) as session:
+        session.execute(update(User).where(User.id == user.id).values(password_hash=stored_hash))
+
+    with TestClient(
+        app,
+        base_url="https://testserver",
+        raise_server_exceptions=False,
+    ) as safe_client:
+        page = safe_client.get("/login")
+        response = safe_client.post(
+            "/login",
+            data={
+                "username": "alice",
+                "password": "secret",
+                "csrf_token": extract_csrf(page.text),
+            },
+        )
+
+    assert response.status_code == 401
+    assert "用户名或密码无效" in response.text
+    assert "alice" not in response.text
+    assert "secret" not in response.text
 
 
 def test_unknown_user_still_runs_dummy_password_verification(db_engine, monkeypatch):

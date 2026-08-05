@@ -40,7 +40,10 @@ def authenticate_user(engine: Engine, username: str, password: str) -> User | No
     with session_scope(engine) as session:
         user = session.scalar(select(User).where(User.username == validated_username))
         password_hash = user.password_hash if user is not None else _DUMMY_PASSWORD_HASH
-        password_matches = verify_password(validated_password, password_hash)
+        try:
+            password_matches = verify_password(validated_password, password_hash)
+        except (TypeError, ValueError):
+            password_matches = False
         if user is None or not user.active or not password_matches:
             return None
         return user
