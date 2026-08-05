@@ -75,6 +75,7 @@ class ImportJob(PersistedModel, Base):
     __tablename__ = "import_jobs"
 
     source_name: Mapped[str] = mapped_column(String(255))
+    remote_root: Mapped[str] = mapped_column(Text)
     remote_path: Mapped[str] = mapped_column(Text)
     target_name: Mapped[str] = mapped_column(String(255))
     state: Mapped[str] = mapped_column(String(32), default="QUEUED")

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
 
 from vla_eval.config import AppConfig
+from vla_eval.datasets import DatasetInspection, inspect_dataset
 from vla_eval.db import session_scope
 from vla_eval.evaluation import EvaluationCallbacks, run_evaluation
 from vla_eval.exceptions import EvaluationCancelled
@@ -63,6 +64,8 @@ def _record_evaluation_failure(runtime: TaskRuntime, job_id: str) -> None:
 def _record_evaluation_success(runtime: TaskRuntime, job_id: str) -> None:
     with session_scope(runtime.engine) as session:
         job = session.get_one(EvaluationJob, job_id)
+        if job.cancel_requested:
+            raise EvaluationCancelled("evaluation cancelled before success commit")
         job.state = "SUCCEEDED"
         job.progress = 100.0
         job.error_code = None
@@ -98,7 +101,7 @@ def _evaluation_cancel_requested(runtime: TaskRuntime, job_id: str) -> bool:
 def recover_interrupted_jobs(*, runtime: TaskRuntime | None = None) -> int:
     resolved = _require_runtime(runtime)
     evaluation_states = {"RUNNING", "METRICS", "VLM", "REPORT"}
-    import_states = {"TRANSFERRING"}
+    import_states = {"CONNECTING", "TRANSFERRING", "VERIFYING", "PREFLIGHT"}
     with session_scope(resolved.engine) as session:
         evaluation_ids = tuple(
             session.scalars(
@@ -206,33 +209,57 @@ def run_import_task(import_id: str, *, runtime: TaskRuntime | None = None) -> Im
     with session_scope(resolved.engine) as session:
         job = session.get_one(ImportJob, import_id)
         source_name = job.source_name
+        remote_root = job.remote_root
         remote_path = job.remote_path
         target_name = job.target_name
 
+    target_path = resolved.config.data_root / "inbox" / target_name
+    captured_inspection: DatasetInspection | None = None
+
+    def inspect_and_capture(path: Path) -> DatasetInspection:
+        nonlocal captured_inspection
+        captured_inspection = inspect_dataset(path, allowed_root=path)
+        return captured_inspection
+
+    def update_state(state: str) -> None:
+        if state == "READY":
+            if captured_inspection is None:
+                raise RuntimeError("import reached READY before dataset inspection completed")
+            _record_import_success(
+                resolved,
+                import_id,
+                target_name,
+                ImportResult(target_path, captured_inspection),
+            )
+            return
+        _update_import_state(resolved, import_id, state)
+
     callbacks = ImportCallbacks(
-        on_state=lambda state: _update_import_state(resolved, import_id, state),
+        on_state=update_state,
         on_progress=lambda progress: _update_import_progress(resolved, import_id, progress),
         is_cancelled=lambda: _import_cancel_requested(resolved, import_id),
     )
     try:
         if callbacks.is_cancelled():
             raise TransferError("import cancelled before execution")
-        source = resolved.config.remote_sources[source_name]
+        configured_source = resolved.config.remote_sources[source_name]
+        if remote_root not in configured_source.roots:
+            raise ValueError("persisted remote root is not registered for the selected source")
+        source = replace(configured_source, roots=(remote_root,))
         spec = ImportSpec(
             job_id=import_id,
             source_name=source.name,
-            remote_root=source.roots[0],
+            remote_root=remote_root,
             remote_relative_path=remote_path,
             staging_path=resolved.config.data_root / "staging" / import_id,
-            target_path=resolved.config.data_root / "inbox" / target_name,
+            target_path=target_path,
             mode="production",
             source=source,
             trusted_credentials_root=resolved.credentials_root,
             trusted_staging_root=resolved.config.data_root / "staging",
             trusted_inbox_root=resolved.config.data_root / "inbox",
         )
-        result = execute_import(spec, callbacks=callbacks)
-        _record_import_success(resolved, import_id, target_name, result)
+        result = execute_import(spec, inspector=inspect_and_capture, callbacks=callbacks)
     except BaseException as original:
         try:
             if callbacks.is_cancelled():
@@ -254,6 +281,7 @@ def run_evaluation_task(job_id: str, *, runtime: TaskRuntime | None = None):
         job = session.get_one(EvaluationJob, job_id)
         dataset = session.get_one(Dataset, job.dataset_id)
         dataset_path = dataset.path
+        dataset_status = dataset.status
         profile_name = job.profile_name
         profile_version = job.profile_version
         vlm_enabled = job.vlm_enabled
@@ -261,6 +289,7 @@ def run_evaluation_task(job_id: str, *, runtime: TaskRuntime | None = None):
         resume_from = job.stage if job.stage in {"VLM", "REPORT"} else "METRICS"
         initial_progress = job.progress
         job.state = "RUNNING"
+        job.stage = "PREFLIGHT"
         job.output_dir = output_dir
         job.error_code = None
         job.error_message = None
@@ -273,6 +302,8 @@ def run_evaluation_task(job_id: str, *, runtime: TaskRuntime | None = None):
     try:
         if callbacks.should_cancel():
             raise EvaluationCancelled("evaluation cancelled before execution")
+        if dataset_status != "READY":
+            raise ValueError("evaluation dataset is not READY")
         profile = load_profile(resolved.profiles_root / f"{profile_name}.yaml")
         if profile.version != profile_version:
             raise ValueError("evaluation profile version changed after job submission")

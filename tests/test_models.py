@@ -41,6 +41,7 @@ def test_model_defaults_use_uuid_utc_and_independent_json(tmp_path):
         )
         import_job = ImportJob(
             source_name="lab-a",
+            remote_root="/data/rollouts",
             remote_path="/data/rollouts/run-1",
             target_name="run-1",
         )

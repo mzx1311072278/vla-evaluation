@@ -1,8 +1,11 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from sqlalchemy import select
 
+import vla_eval.import_jobs as import_jobs_module
+import vla_eval.tasks as tasks_module
 from tests.conftest import reload_job
 from vla_eval.config import AppConfig, RemoteSource
 from vla_eval.datasets import DatasetInspection, DatasetKind
@@ -51,7 +54,12 @@ def test_task_entry_uses_explicitly_configured_worker_runtime(
     assert reload_job(db_engine, evaluation_job.id).state == "SUCCEEDED"
 
 
-def _runtime(db_engine, data_root: Path) -> TaskRuntime:
+def _runtime(
+    db_engine,
+    data_root: Path,
+    *,
+    remote_roots: tuple[str, ...] = ("/data/rollouts",),
+) -> TaskRuntime:
     credentials_root = data_root / "credentials"
     source = RemoteSource(
         name="lab-a",
@@ -60,7 +68,7 @@ def _runtime(db_engine, data_root: Path) -> TaskRuntime:
         username="eval-read",
         key_path=credentials_root / "lab-a-key",
         known_hosts_path=credentials_root / "known_hosts",
-        roots=("/data/rollouts",),
+        roots=remote_roots,
     )
     return TaskRuntime(
         engine=db_engine,
@@ -113,6 +121,11 @@ def test_evaluation_task_commits_callbacks_and_records_success(
 
     def evaluate(**kwargs):
         received.update(kwargs)
+        with session_scope(db_engine) as session:
+            persisted = session.get_one(EvaluationJob, evaluation_job.id)
+            assert (persisted.state, persisted.stage) == ("RUNNING", "PREFLIGHT")
+            assert persisted.output_dir == str(data_root / "runs" / evaluation_job.id)
+            assert (persisted.error_code, persisted.error_message) == (None, None)
         callbacks = kwargs["callbacks"]
         callbacks.on_stage("METRICS")
         with session_scope(db_engine) as session:
@@ -200,6 +213,32 @@ def test_evaluation_task_rejects_changed_profile_version(
     assert reload_job(db_engine, evaluation_job.id).state == "FAILED"
 
 
+@pytest.mark.parametrize("dataset_status", ["PENDING", "FAILED"])
+def test_evaluation_task_rejects_dataset_that_is_not_ready(
+    db_engine, data_root, dataset, monkeypatch, dataset_status
+):
+    with session_scope(db_engine) as session:
+        persisted_dataset = session.get_one(Dataset, dataset.id)
+        persisted_dataset.status = dataset_status
+        job = EvaluationJob(
+            dataset_id=dataset.id,
+            profile_name="genie02-full",
+            profile_version="1.0.0",
+        )
+        session.add(job)
+        session.flush()
+        job_id = job.id
+    monkeypatch.setattr(
+        "vla_eval.tasks.run_evaluation",
+        lambda **_kwargs: pytest.fail("non-ready dataset must not enter evaluation core"),
+    )
+
+    with pytest.raises(ValueError, match="dataset is not READY"):
+        run_evaluation_task(job_id, runtime=_runtime(db_engine, data_root))
+
+    assert reload_job(db_engine, job_id).state == "FAILED"
+
+
 def test_evaluation_task_records_cancelled_and_reraises(
     db_engine, data_root, evaluation_job, monkeypatch
 ):
@@ -218,6 +257,24 @@ def test_evaluation_task_records_cancelled_and_reraises(
     assert job.state == "CANCELLED"
     assert job.error_code == "EVALUATION_CANCELLED"
     assert job.error_message == "Evaluation was cancelled."
+
+
+def test_evaluation_task_checks_cancellation_in_success_transaction(
+    db_engine, data_root, evaluation_job, monkeypatch
+):
+    def evaluate(**kwargs):
+        kwargs["callbacks"].on_stage("REPORT")
+        with session_scope(db_engine) as session:
+            session.get_one(EvaluationJob, evaluation_job.id).cancel_requested = True
+
+    monkeypatch.setattr("vla_eval.tasks.run_evaluation", evaluate)
+
+    with pytest.raises(EvaluationCancelled, match="before success commit"):
+        run_evaluation_task(evaluation_job.id, runtime=_runtime(db_engine, data_root))
+
+    job = reload_job(db_engine, evaluation_job.id)
+    assert (job.state, job.stage) == ("CANCELLED", "REPORT")
+    assert job.error_code == "EVALUATION_CANCELLED"
 
 
 def test_evaluation_task_preserves_core_and_failure_persistence_errors(
@@ -262,10 +319,16 @@ def test_evaluation_task_maps_final_persistence_failure_to_failed(
     assert reload_job(db_engine, evaluation_job.id).state == "FAILED"
 
 
-def _create_import_job(db_engine, *, cancel_requested: bool = False) -> ImportJob:
+def _create_import_job(
+    db_engine,
+    *,
+    cancel_requested: bool = False,
+    remote_root: str = "/data/rollouts",
+) -> ImportJob:
     with session_scope(db_engine) as session:
         job = ImportJob(
             source_name="lab-a",
+            remote_root=remote_root,
             remote_path="run-1",
             target_name="run-1",
             cancel_requested=cancel_requested,
@@ -292,8 +355,13 @@ def test_import_task_commits_callbacks_and_persists_ready_dataset(
         errors=(),
     )
     received = {}
+    monkeypatch.setattr(
+        tasks_module,
+        "inspect_dataset",
+        lambda _path, *, allowed_root: inspection,
+    )
 
-    def execute(spec, *, callbacks):
+    def execute(spec, *, inspector, callbacks):
         received["spec"] = spec
         callbacks.on_state("CONNECTING")
         with session_scope(db_engine) as session:
@@ -305,6 +373,7 @@ def test_import_task_commits_callbacks_and_persists_ready_dataset(
             persisted = session.get_one(ImportJob, import_job.id)
             assert (persisted.state, persisted.progress) == ("TRANSFERRING", 45.0)
         callbacks.on_state("PREFLIGHT")
+        inspector(spec.staging_path)
         callbacks.on_state("READY")
         return ImportResult(spec.target_path, inspection)
 
@@ -334,6 +403,61 @@ def test_import_task_commits_callbacks_and_persists_ready_dataset(
         assert persisted_dataset.fingerprint == "a" * 64
         assert persisted_dataset.size_bytes == 123
         assert persisted_dataset.episode_count == 4
+
+
+def test_import_task_uses_persisted_second_remote_root(db_engine, data_root, monkeypatch):
+    import_job = _create_import_job(db_engine, remote_root="/data/archive")
+    inspection = DatasetInspection(DatasetKind.LEROBOT, True, "d" * 64, 8, 1, ())
+    received = {}
+
+    monkeypatch.setattr(
+        tasks_module,
+        "inspect_dataset",
+        lambda _path, *, allowed_root: inspection,
+    )
+
+    def execute(spec, *, inspector, callbacks):
+        received["spec"] = spec
+        inspector(spec.staging_path)
+        callbacks.on_state("READY")
+        return ImportResult(spec.target_path, inspection)
+
+    monkeypatch.setattr("vla_eval.tasks.execute_import", execute)
+
+    run_import_task(
+        import_job.id,
+        runtime=_runtime(
+            db_engine,
+            data_root,
+            remote_roots=("/data/rollouts", "/data/archive"),
+        ),
+    )
+
+    assert received["spec"].remote_root == "/data/archive"
+    assert received["spec"].source.roots == ("/data/archive",)
+
+
+def test_import_task_rejects_unregistered_persisted_remote_root(db_engine, data_root, monkeypatch):
+    import_job = _create_import_job(db_engine, remote_root="/data/unregistered")
+    monkeypatch.setattr(
+        "vla_eval.tasks.execute_import",
+        lambda *_args, **_kwargs: pytest.fail("unregistered root must not reach import core"),
+    )
+
+    with pytest.raises(ValueError, match="remote root is not registered"):
+        run_import_task(
+            import_job.id,
+            runtime=_runtime(
+                db_engine,
+                data_root,
+                remote_roots=("/data/rollouts", "/data/archive"),
+            ),
+        )
+
+    with session_scope(db_engine) as session:
+        job = session.get_one(ImportJob, import_job.id)
+        assert job.state == "FAILED"
+        assert job.error_code == "IMPORT_FAILED"
 
 
 def test_import_task_records_sanitized_failure_and_reraises(db_engine, data_root, monkeypatch):
@@ -434,8 +558,14 @@ def test_import_task_maps_final_persistence_failure_to_failed(db_engine, data_ro
         (),
     )
     persistence_error = RuntimeError("final persistence failed")
+    monkeypatch.setattr(
+        tasks_module,
+        "inspect_dataset",
+        lambda _path, *, allowed_root: inspection,
+    )
 
-    def execute(spec, *, callbacks):
+    def execute(spec, *, inspector, callbacks):
+        inspector(spec.staging_path)
         callbacks.on_state("READY")
         return ImportResult(spec.target_path, inspection)
 
@@ -453,6 +583,125 @@ def test_import_task_maps_final_persistence_failure_to_failed(db_engine, data_ro
         assert session.get_one(ImportJob, import_job.id).state == "FAILED"
 
 
+def test_import_ready_persistence_failure_rolls_publication_back(db_engine, data_root, monkeypatch):
+    import_job = _create_import_job(db_engine)
+    inspection = DatasetInspection(DatasetKind.LEROBOT, True, "c" * 64, 10, 1, ())
+    staging = data_root / "staging" / import_job.id
+    target = data_root / "inbox" / import_job.target_name
+    observed_ready_without_dataset = []
+    inspect_calls = []
+
+    def inspect(path, *, allowed_root):
+        inspect_calls.append((path, allowed_root))
+        return inspection
+
+    def injected_execute(spec, **kwargs):
+        callbacks = kwargs["callbacks"]
+
+        def transfer(_argv, _progress):
+            staging.mkdir(parents=True, exist_ok=True)
+            (staging / "received.marker").write_text("ok")
+
+        def observe_state(state):
+            callbacks.on_state(state)
+            if state == "READY":
+                with session_scope(db_engine) as session:
+                    persisted = session.get_one(ImportJob, import_job.id)
+                    observed_ready_without_dataset.append(
+                        persisted.state == "READY" and persisted.dataset_id is None
+                    )
+
+        injected_spec = replace(
+            spec,
+            mode="injected",
+            source=None,
+            trusted_credentials_root=None,
+            trusted_staging_root=None,
+            trusted_inbox_root=None,
+        )
+        return import_jobs_module.execute_import(
+            injected_spec,
+            transfer=transfer,
+            inspector=kwargs.get("inspector", lambda _path: inspection),
+            callbacks=import_jobs_module.ImportCallbacks(
+                on_state=observe_state,
+                on_progress=callbacks.on_progress,
+                is_cancelled=callbacks.is_cancelled,
+            ),
+        )
+
+    persistence_error = OSError("database write failed")
+
+    def fail_ready(*_args):
+        raise persistence_error
+
+    monkeypatch.setattr(tasks_module, "inspect_dataset", inspect, raising=False)
+    monkeypatch.setattr("vla_eval.tasks.execute_import", injected_execute)
+    monkeypatch.setattr("vla_eval.tasks._record_import_success", fail_ready)
+
+    with pytest.raises(OSError) as raised:
+        run_import_task(import_job.id, runtime=_runtime(db_engine, data_root))
+
+    assert raised.value is persistence_error
+    assert inspect_calls == [(staging, staging)]
+    assert observed_ready_without_dataset == []
+    assert staging.is_dir()
+    assert (staging / "received.marker").is_file()
+    assert not target.exists()
+    with session_scope(db_engine) as session:
+        job = session.get_one(ImportJob, import_job.id)
+        assert (job.state, job.dataset_id) == ("FAILED", None)
+
+
+def test_import_ready_commits_only_with_dataset_link_and_published_target(
+    db_engine, data_root, monkeypatch
+):
+    import_job = _create_import_job(db_engine)
+    inspection = DatasetInspection(DatasetKind.LEROBOT, True, "e" * 64, 11, 2, ())
+    staging = data_root / "staging" / import_job.id
+    target = data_root / "inbox" / import_job.target_name
+
+    monkeypatch.setattr(
+        tasks_module,
+        "inspect_dataset",
+        lambda path, *, allowed_root: inspection,
+    )
+
+    def injected_execute(spec, **kwargs):
+        def transfer(_argv, _progress):
+            staging.mkdir(parents=True, exist_ok=True)
+            (staging / "received.marker").write_text("ok")
+
+        return import_jobs_module.execute_import(
+            replace(
+                spec,
+                mode="injected",
+                source=None,
+                trusted_credentials_root=None,
+                trusted_staging_root=None,
+                trusted_inbox_root=None,
+            ),
+            transfer=transfer,
+            inspector=kwargs["inspector"],
+            callbacks=kwargs["callbacks"],
+        )
+
+    monkeypatch.setattr("vla_eval.tasks.execute_import", injected_execute)
+
+    result = run_import_task(import_job.id, runtime=_runtime(db_engine, data_root))
+
+    assert result.dataset_path == target
+    assert target.is_dir()
+    assert (target / "received.marker").is_file()
+    assert not staging.exists()
+    with session_scope(db_engine) as session:
+        job = session.get_one(ImportJob, import_job.id)
+        dataset = session.get_one(Dataset, job.dataset_id)
+        assert (job.state, job.progress) == ("READY", 100.0)
+        assert dataset.path == str(target)
+        assert dataset.status == "READY"
+
+
 def test_recover_interrupted_jobs_is_selective_idempotent_and_keeps_staging(
     db_engine, data_root, ready_dataset
 ):
@@ -468,7 +717,10 @@ def test_recover_interrupted_jobs_is_selective_idempotent_and_keeps_staging(
         "INTERRUPTED",
     ]
     import_states = [
+        "CONNECTING",
         "TRANSFERRING",
+        "VERIFYING",
+        "PREFLIGHT",
         "QUEUED",
         "READY",
         "FAILED",
@@ -488,6 +740,7 @@ def test_recover_interrupted_jobs_is_selective_idempotent_and_keeps_staging(
         imports = [
             ImportJob(
                 source_name="lab-a",
+                remote_root="/data/rollouts",
                 remote_path=f"run-{index}",
                 target_name=f"run-{index}",
                 state=state,
@@ -504,7 +757,7 @@ def test_recover_interrupted_jobs_is_selective_idempotent_and_keeps_staging(
     staging_marker.write_bytes(b"partial")
     runtime = _runtime(db_engine, data_root)
 
-    assert recover_interrupted_jobs(runtime=runtime) == 5
+    assert recover_interrupted_jobs(runtime=runtime) == 8
     assert recover_interrupted_jobs(runtime=runtime) == 0
 
     with session_scope(db_engine) as session:
@@ -525,6 +778,9 @@ def test_recover_interrupted_jobs_is_selective_idempotent_and_keeps_staging(
         "INTERRUPTED",
     ]
     assert actual_imports == [
+        "INTERRUPTED",
+        "INTERRUPTED",
+        "INTERRUPTED",
         "INTERRUPTED",
         "QUEUED",
         "READY",
