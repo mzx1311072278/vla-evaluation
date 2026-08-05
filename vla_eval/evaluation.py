@@ -84,6 +84,7 @@ def run_profile_vlm(
     config = AttemptEvalConfig(
         dataset_root=dataset_path,
         model_path=Path(profile.vlm.model_path),
+        prompt_version=profile.vlm.prompt_version,
         image_key=profile.image_key,
         output_dir=output_dir,
         max_image_size=profile.vlm.max_image_size,

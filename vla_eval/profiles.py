@@ -23,6 +23,7 @@ _REVIEW_MODES = frozenset({"manual_review", "auto_review"})
 _REPORT_PATTERN = "report_*.md"
 _ADAPTERS = frozenset({"genie02"})
 _PLUGINS = frozenset({"genie02-attempt-eval"})
+_PROMPT_VERSIONS = frozenset({"genie02-attempt-v1"})
 _REQUIRED_OUTPUTS = frozenset(
     {"episode_metrics.csv", "metrics_core.json", "smoothness_curve.svg", _REPORT_PATTERN}
 )
@@ -217,7 +218,9 @@ def load_profile(path: str | Path) -> Profile:
         image_key=_string(raw["image_key"], "image_key"),
         vlm=VLMProfile(
             model_path=_string(vlm["model_path"], "vlm.model_path"),
-            prompt_version=_identifier(vlm["prompt_version"], "vlm.prompt_version"),
+            prompt_version=_enum_identifier(
+                vlm["prompt_version"], "vlm.prompt_version", _PROMPT_VERSIONS
+            ),
             sampling=SamplingProfile(
                 max_global_frames=_integer(
                     sampling["max_global_frames"], "vlm.sampling.max_global_frames", 1, 10_000

@@ -201,6 +201,14 @@ def test_load_profile_rejects_wrong_types_ranges_and_enums(
         load_profile(_write_profile(tmp_path, raw))
 
 
+def test_load_profile_rejects_unsupported_prompt_version(tmp_path: Path):
+    raw = _profile_data()
+    raw["vlm"]["prompt_version"] = "made-up-v99"
+
+    with pytest.raises(ValueError, match="prompt_version must be one of.*genie02-attempt-v1"):
+        load_profile(_write_profile(tmp_path, raw))
+
+
 @pytest.mark.parametrize(
     "unsafe",
     ["/tmp/metrics.json", "../metrics.json", "sub/../metrics.json", "sub\\metrics.json", "*.json"],
@@ -282,6 +290,7 @@ def test_run_profile_vlm_maps_profile_and_callbacks_to_task7_service(
     class FakeAttemptEvalConfig:
         dataset_root: Path
         model_path: Path
+        prompt_version: str
         image_key: str
         output_dir: Path
         max_image_size: int
@@ -321,6 +330,7 @@ def test_run_profile_vlm_maps_profile_and_callbacks_to_task7_service(
         FakeAttemptEvalConfig(
             dataset_root=tmp_path,
             model_path=Path(profile.vlm.model_path),
+            prompt_version="genie02-attempt-v1",
             image_key="observation.images.right_wrist",
             output_dir=output,
             max_image_size=336,
