@@ -493,6 +493,37 @@ def _validate_protected_directory(path: Path, field_name: str) -> None:
         raise ValueError(f"{field_name} must be writable and searchable")
 
 
+def validate_published_target(target: Path, trusted_inbox_root: Path) -> Path:
+    """Validate a published dataset path without following untrusted ancestors."""
+    root = _absolute_path(trusted_inbox_root, "trusted inbox root")
+    candidate = _absolute_path(target, "published dataset target")
+    if candidate == root or not _is_contained(candidate, root):
+        raise ValueError("published dataset target must be within the trusted inbox root")
+
+    _validate_protected_directory(root, "trusted inbox root")
+    for component in _path_components(candidate)[len(_path_components(root)) :]:
+        try:
+            component_stat = os.lstat(component)
+        except OSError as error:
+            raise ValueError("published dataset target must be an existing directory") from error
+        if stat.S_ISLNK(component_stat.st_mode):
+            if component == candidate:
+                raise ValueError("published dataset target must not be a symbolic link")
+            raise ValueError("published dataset target must not contain symlink components")
+        if not stat.S_ISDIR(component_stat.st_mode):
+            raise ValueError("published dataset target components must be directories")
+        if component_stat.st_uid not in {0, os.geteuid()}:
+            raise ValueError("published dataset target must be owned by root or the service user")
+        if component_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise ValueError("published dataset target must not be group or other writable")
+
+    resolved_root = root.resolve(strict=True)
+    resolved_candidate = candidate.resolve(strict=True)
+    if not _is_contained(resolved_candidate, resolved_root):
+        raise ValueError("published dataset target escaped the trusted inbox root")
+    return candidate
+
+
 def _create_under_root(destination: Path, root: Path, field_name: str) -> None:
     if not _is_contained(destination, root):
         raise ValueError(f"{field_name} must be within its trusted root")
@@ -711,9 +742,7 @@ def _verify_published_target(spec: ImportSpec, target: Path, production: bool) -
         raise OSError("published dataset target is missing")
     if production:
         assert spec.trusted_inbox_root is not None
-        resolved_root = spec.trusted_inbox_root.resolve(strict=True)
-        if not _is_contained(target.resolve(strict=True), resolved_root):
-            raise OSError("published dataset escaped trusted inbox root")
+        validate_published_target(target, spec.trusted_inbox_root)
 
 
 def _publish_and_report_ready(

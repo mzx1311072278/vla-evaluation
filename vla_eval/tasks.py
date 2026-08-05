@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.engine import Engine
 
 from vla_eval.config import AppConfig
@@ -19,6 +19,7 @@ from vla_eval.import_jobs import (
     ImportSpec,
     TransferError,
     execute_import,
+    validate_published_target,
 )
 from vla_eval.models import Dataset, EvaluationJob, ImportJob
 from vla_eval.profiles import load_profile
@@ -33,6 +34,10 @@ class TaskRuntime:
 
 
 _configured_runtime: TaskRuntime | None = None
+
+
+class ImportIntegrityError(ValueError):
+    """A READY import no longer matches its durable dataset identity."""
 
 
 def configure_runtime(runtime: TaskRuntime) -> None:
@@ -165,16 +170,22 @@ def _record_import_success(
     import_id: str,
     target_name: str,
     result: ImportResult,
-) -> None:
+) -> bool:
     inspection = result.inspection
     with session_scope(runtime.engine) as session:
-        job = session.get_one(ImportJob, import_id)
-        if job.dataset_id is not None:
-            raise RuntimeError("import already has a published dataset")
-        if job.state not in {"PREFLIGHT", "INTERRUPTED"}:
-            raise ValueError("import state changed before READY commit")
-        if job.publish_fingerprint != inspection.fingerprint:
-            raise ValueError("import publish fingerprint changed before READY commit")
+        claim = session.execute(
+            update(ImportJob)
+            .where(
+                ImportJob.id == import_id,
+                ImportJob.dataset_id.is_(None),
+                ImportJob.publish_fingerprint == inspection.fingerprint,
+                ImportJob.state.in_(("PREFLIGHT", "INTERRUPTED")),
+            )
+            .values(state="FINALIZING")
+            .execution_options(synchronize_session=False)
+        )
+        if claim.rowcount != 1:
+            return False
         dataset = Dataset(
             name=target_name,
             path=str(result.dataset_path),
@@ -187,11 +198,13 @@ def _record_import_success(
         )
         session.add(dataset)
         session.flush()
+        job = session.get_one(ImportJob, import_id)
         job.dataset_id = dataset.id
         job.state = "READY"
         job.progress = 100.0
         job.error_code = None
         job.error_message = None
+    return True
 
 
 def _record_import_failure(
@@ -210,6 +223,8 @@ def _record_import_failure(
         message = "Dataset import failed. Review worker logs for details."
     with session_scope(runtime.engine) as session:
         job = session.get_one(ImportJob, import_id)
+        if job.state == "READY" and job.dataset_id is not None:
+            return
         job.state = "FAILED"
         job.error_code = code
         job.error_message = message
@@ -218,25 +233,57 @@ def _record_import_failure(
 def _record_import_cancelled(runtime: TaskRuntime, import_id: str) -> None:
     with session_scope(runtime.engine) as session:
         job = session.get_one(ImportJob, import_id)
+        if job.state == "READY" and job.dataset_id is not None:
+            return
         job.state = "CANCELLED"
         job.error_code = "IMPORT_CANCELLED"
         job.error_message = "Dataset import was cancelled."
 
 
+def _record_import_integrity_failure(
+    runtime: TaskRuntime,
+    import_id: str,
+    dataset_id: str | None,
+    publish_fingerprint: str | None,
+) -> None:
+    if dataset_id is None or publish_fingerprint is None:
+        return
+    with session_scope(runtime.engine) as session:
+        degraded = session.execute(
+            update(ImportJob)
+            .where(
+                ImportJob.id == import_id,
+                ImportJob.state == "READY",
+                ImportJob.dataset_id == dataset_id,
+                ImportJob.publish_fingerprint == publish_fingerprint,
+            )
+            .values(
+                state="FAILED",
+                error_code="IMPORT_INTEGRITY_FAILED",
+                error_message=(
+                    "Published dataset integrity check failed. Review or re-import the dataset."
+                ),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if degraded.rowcount == 1:
+            session.execute(
+                update(Dataset)
+                .where(Dataset.id == dataset_id)
+                .values(status="PREFLIGHT_FAILED")
+                .execution_options(synchronize_session=False)
+            )
+
+
 def _inspect_trusted_published_target(target: Path, inbox_root: Path) -> DatasetInspection:
-    lexical_root = Path(os.path.abspath(inbox_root))
-    lexical_target = Path(os.path.abspath(target))
-    if lexical_target == lexical_root or lexical_root not in lexical_target.parents:
-        raise ValueError("published import target is outside the trusted inbox")
-    if lexical_target.is_symlink():
-        raise ValueError("published import target must not be a symbolic link")
-    if not lexical_target.is_dir():
-        raise ValueError("published import target must be an existing directory")
     try:
-        lexical_target.resolve(strict=True).relative_to(lexical_root.resolve(strict=True))
+        validated_target = validate_published_target(target, inbox_root)
     except (OSError, RuntimeError, ValueError) as error:
-        raise ValueError("published import target escaped the trusted inbox") from error
-    return inspect_dataset(lexical_target, allowed_root=lexical_target)
+        raise ImportIntegrityError(str(error)) from error
+    try:
+        return inspect_dataset(validated_target, allowed_root=validated_target)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ImportIntegrityError("published import target could not be inspected") from error
 
 
 def _load_completed_import(
@@ -247,26 +294,28 @@ def _load_completed_import(
     target: Path,
 ) -> ImportResult:
     if dataset_id is None or publish_fingerprint is None:
-        raise ValueError("completed import is missing its dataset identity")
+        raise ImportIntegrityError("completed import is missing its dataset identity")
     inspection = _inspect_trusted_published_target(
         target,
         runtime.config.data_root / "inbox",
     )
     with session_scope(runtime.engine) as session:
-        dataset = session.get_one(Dataset, dataset_id)
-        job = session.get_one(ImportJob, import_id)
+        dataset = session.get(Dataset, dataset_id)
+        job = session.get(ImportJob, import_id)
+        if dataset is None or job is None:
+            raise ImportIntegrityError("completed import is missing its persisted identity")
         if dataset.status != "READY" or dataset.path != str(target):
-            raise ValueError("completed import dataset record is inconsistent")
+            raise ImportIntegrityError("completed import dataset record is inconsistent")
         if not inspection.ready or inspection.fingerprint != publish_fingerprint:
-            raise ValueError("completed import fingerprint no longer matches its target")
+            raise ImportIntegrityError("completed import fingerprint no longer matches its target")
         if dataset.fingerprint != publish_fingerprint:
-            raise ValueError("completed import dataset fingerprint is inconsistent")
+            raise ImportIntegrityError("completed import dataset fingerprint is inconsistent")
         if (
             job.state != "READY"
             or job.dataset_id != dataset_id
             or job.publish_fingerprint != publish_fingerprint
         ):
-            raise ValueError("completed import state changed during validation")
+            raise ImportIntegrityError("completed import state changed during validation")
     return ImportResult(target, inspection)
 
 
@@ -294,8 +343,19 @@ def _reconcile_interrupted_import(
     if inspection.fingerprint != publish_fingerprint:
         raise ValueError("interrupted published target fingerprint does not match")
     result = ImportResult(target, inspection)
-    _record_import_success(runtime, import_id, target_name, result)
-    return result
+    if _record_import_success(runtime, import_id, target_name, result):
+        return result
+    with session_scope(runtime.engine) as session:
+        completed = session.get_one(ImportJob, import_id)
+        completed_dataset_id = completed.dataset_id
+        completed_fingerprint = completed.publish_fingerprint
+    return _load_completed_import(
+        runtime,
+        import_id,
+        completed_dataset_id,
+        completed_fingerprint,
+        target,
+    )
 
 
 def run_import_task(import_id: str, *, runtime: TaskRuntime | None = None) -> ImportResult:
@@ -312,14 +372,6 @@ def run_import_task(import_id: str, *, runtime: TaskRuntime | None = None) -> Im
 
     target_path = resolved.config.data_root / "inbox" / target_name
     staging_path = resolved.config.data_root / "staging" / import_id
-    if state == "READY":
-        return _load_completed_import(
-            resolved,
-            import_id,
-            dataset_id,
-            publish_fingerprint,
-            target_path,
-        )
     captured_inspection: DatasetInspection | None = None
 
     def inspect_and_capture(path: Path) -> DatasetInspection:
@@ -337,12 +389,14 @@ def run_import_task(import_id: str, *, runtime: TaskRuntime | None = None) -> Im
         if state == "READY":
             if captured_inspection is None:
                 raise RuntimeError("import reached READY before dataset inspection completed")
-            _record_import_success(
+            committed = _record_import_success(
                 resolved,
                 import_id,
                 target_name,
                 ImportResult(target_path, captured_inspection),
             )
+            if not committed:
+                raise ValueError("import state changed before READY commit")
             return
         _update_import_state(resolved, import_id, state)
 
@@ -352,6 +406,14 @@ def run_import_task(import_id: str, *, runtime: TaskRuntime | None = None) -> Im
         is_cancelled=lambda: _import_cancel_requested(resolved, import_id),
     )
     try:
+        if state == "READY":
+            return _load_completed_import(
+                resolved,
+                import_id,
+                dataset_id,
+                publish_fingerprint,
+                target_path,
+            )
         if callbacks.is_cancelled():
             raise TransferError("import cancelled before execution")
         if state == "INTERRUPTED" and os.path.lexists(target_path):
@@ -384,7 +446,14 @@ def run_import_task(import_id: str, *, runtime: TaskRuntime | None = None) -> Im
         result = execute_import(spec, inspector=inspect_and_capture, callbacks=callbacks)
     except BaseException as original:
         try:
-            if callbacks.is_cancelled():
+            if state == "READY" and isinstance(original, ImportIntegrityError):
+                _record_import_integrity_failure(
+                    resolved,
+                    import_id,
+                    dataset_id,
+                    publish_fingerprint,
+                )
+            elif callbacks.is_cancelled():
                 _record_import_cancelled(resolved, import_id)
             else:
                 _record_import_failure(resolved, import_id, original)

@@ -1,6 +1,8 @@
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 from sqlalchemy import select
@@ -10,12 +12,13 @@ import vla_eval.tasks as tasks_module
 from tests.conftest import reload_job
 from vla_eval.config import AppConfig, RemoteSource
 from vla_eval.datasets import DatasetInspection, DatasetKind
-from vla_eval.db import session_scope
+from vla_eval.db import create_engine_for_url, init_db, session_scope
 from vla_eval.exceptions import EvaluationCancelled
 from vla_eval.import_jobs import ImportResult, TransferError
 from vla_eval.models import Dataset, EvaluationJob, ImportJob
 from vla_eval.queueing import create_queues
 from vla_eval.tasks import (
+    ImportIntegrityError,
     TaskRuntime,
     clear_runtime,
     configure_runtime,
@@ -861,6 +864,57 @@ def test_interrupted_import_reconciles_published_target_by_fingerprint(
         assert dataset.fingerprint == "2" * 64
 
 
+def test_concurrent_interrupted_import_reconciliation_commits_one_dataset(data_root, monkeypatch):
+    engine = create_engine_for_url(f"sqlite:///{data_root / 'db/concurrent.sqlite3'}")
+    init_db(engine)
+    inspection = DatasetInspection(DatasetKind.LEROBOT, True, "7" * 64, 12, 3, ())
+    with session_scope(engine) as session:
+        import_job = ImportJob(
+            source_name="lab-a",
+            remote_root="/data/rollouts",
+            remote_path="run-1",
+            target_name="run-1",
+            state="INTERRUPTED",
+            publish_fingerprint=inspection.fingerprint,
+        )
+        session.add(import_job)
+        session.flush()
+        import_id = import_job.id
+
+    target = data_root / "inbox" / "run-1"
+    target.mkdir()
+    (target / "evidence.bin").write_bytes(b"evidence")
+    monkeypatch.setattr(
+        tasks_module,
+        "inspect_dataset",
+        lambda _path, *, allowed_root: inspection,
+    )
+    real_record_success = tasks_module._record_import_success
+    commit_barrier = Barrier(2)
+
+    def synchronized_record_success(*args):
+        commit_barrier.wait(timeout=5)
+        return real_record_success(*args)
+
+    monkeypatch.setattr(tasks_module, "_record_import_success", synchronized_record_success)
+    runtime = _runtime(engine, data_root)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(run_import_task, import_id, runtime=runtime) for _ in range(2)
+            ]
+            results = [future.result(timeout=10) for future in futures]
+
+        assert [result.dataset_path for result in results] == [target, target]
+        with session_scope(engine) as session:
+            job = session.get_one(ImportJob, import_id)
+            datasets = list(session.scalars(select(Dataset)))
+            assert (job.state, job.dataset_id) == ("READY", datasets[0].id)
+            assert len(datasets) == 1
+    finally:
+        engine.dispose()
+
+
 @pytest.mark.parametrize(
     ("case", "message"),
     [
@@ -868,6 +922,8 @@ def test_interrupted_import_reconciles_published_target_by_fingerprint(
         ("fingerprint_mismatch", "fingerprint does not match"),
         ("target_not_ready", "did not pass preflight"),
         ("target_symlink", "must not be a symbolic link"),
+        ("inbox_root_symlink", "symlink components"),
+        ("intermediate_symlink", "symlink components"),
         ("staging_exists", "still has a staging path"),
     ],
 )
@@ -882,14 +938,29 @@ def test_interrupted_import_never_adopts_unproven_target(
         job = session.get_one(ImportJob, import_job.id)
         job.state = "INTERRUPTED"
         job.publish_fingerprint = marker
+        if case == "intermediate_symlink":
+            job.target_name = "team/run-1"
+            target = data_root / "inbox" / job.target_name
 
     if case == "target_symlink":
         outside = data_root / "outside-target"
         outside.mkdir()
         target.symlink_to(outside, target_is_directory=True)
+    elif case == "inbox_root_symlink":
+        inbox = data_root / "inbox"
+        inbox.rmdir()
+        actual_inbox = data_root / "actual-inbox"
+        target = actual_inbox / import_job.target_name
+        target.mkdir(parents=True)
+        inbox.symlink_to(actual_inbox, target_is_directory=True)
+    elif case == "intermediate_symlink":
+        actual_team = data_root / "actual-team"
+        target = actual_team / "run-1"
+        target.mkdir(parents=True)
+        (data_root / "inbox" / "team").symlink_to(actual_team, target_is_directory=True)
     else:
         target.mkdir()
-        (target / "evidence.bin").write_bytes(b"evidence")
+    (target / "evidence.bin").write_bytes(b"evidence")
     if case == "staging_exists":
         staging.mkdir()
         (staging / "partial.bin").write_bytes(b"partial")
@@ -919,6 +990,159 @@ def test_interrupted_import_never_adopts_unproven_target(
     with session_scope(db_engine) as session:
         job = session.get_one(ImportJob, import_job.id)
         assert (job.state, job.dataset_id) == ("FAILED", None)
+
+
+def test_ready_import_integrity_drift_marks_job_and_dataset_failed(
+    db_engine, data_root, monkeypatch
+):
+    target = data_root / "inbox" / "run-1"
+    target.mkdir()
+    evidence = target / "evidence.bin"
+    evidence.write_bytes(b"changed")
+    expected_fingerprint = "8" * 64
+    with session_scope(db_engine) as session:
+        dataset = Dataset(
+            name="run-1",
+            path=str(target),
+            kind=DatasetKind.LEROBOT.value,
+            status="READY",
+            fingerprint=expected_fingerprint,
+            size_bytes=8,
+            episode_count=1,
+        )
+        session.add(dataset)
+        session.flush()
+        job = ImportJob(
+            source_name="lab-a",
+            remote_root="/data/rollouts",
+            remote_path="run-1",
+            target_name="run-1",
+            state="READY",
+            progress=100.0,
+            publish_fingerprint=expected_fingerprint,
+            dataset_id=dataset.id,
+        )
+        session.add(job)
+        session.flush()
+        import_id = job.id
+        dataset_id = dataset.id
+
+    monkeypatch.setattr(
+        tasks_module,
+        "inspect_dataset",
+        lambda _path, *, allowed_root: DatasetInspection(
+            DatasetKind.LEROBOT,
+            True,
+            "9" * 64,
+            8,
+            1,
+            (),
+        ),
+    )
+
+    with pytest.raises(ImportIntegrityError):
+        run_import_task(import_id, runtime=_runtime(db_engine, data_root))
+
+    assert evidence.read_bytes() == b"changed"
+    with session_scope(db_engine) as session:
+        persisted_job = session.get_one(ImportJob, import_id)
+        persisted_dataset = session.get_one(Dataset, dataset_id)
+        assert persisted_job.state == "FAILED"
+        assert persisted_job.error_code == "IMPORT_INTEGRITY_FAILED"
+        assert (
+            persisted_job.error_message
+            == "Published dataset integrity check failed. Review or re-import the dataset."
+        )
+        assert persisted_dataset.status == "PREFLIGHT_FAILED"
+
+
+@pytest.mark.parametrize("recorder_name", ["_record_import_failure", "_record_import_cancelled"])
+def test_import_terminal_recorders_do_not_overwrite_ready_dataset(
+    db_engine, data_root, recorder_name
+):
+    target = data_root / "inbox" / "run-1"
+    target.mkdir()
+    fingerprint = "a" * 64
+    with session_scope(db_engine) as session:
+        dataset = Dataset(
+            name="run-1",
+            path=str(target),
+            kind=DatasetKind.LEROBOT.value,
+            status="READY",
+            fingerprint=fingerprint,
+        )
+        session.add(dataset)
+        session.flush()
+        job = ImportJob(
+            source_name="lab-a",
+            remote_root="/data/rollouts",
+            remote_path="run-1",
+            target_name="run-1",
+            state="READY",
+            progress=100.0,
+            publish_fingerprint=fingerprint,
+            dataset_id=dataset.id,
+        )
+        session.add(job)
+        session.flush()
+        import_id = job.id
+
+    recorder = getattr(tasks_module, recorder_name)
+    if recorder_name == "_record_import_failure":
+        recorder(_runtime(db_engine, data_root), import_id, RuntimeError("stale failure"))
+    else:
+        recorder(_runtime(db_engine, data_root), import_id)
+
+    with session_scope(db_engine) as session:
+        persisted = session.get_one(ImportJob, import_id)
+        assert (persisted.state, persisted.error_code, persisted.error_message) == (
+            "READY",
+            None,
+            None,
+        )
+
+
+def test_stale_integrity_failure_does_not_downgrade_newer_ready_commit(db_engine, data_root):
+    target = data_root / "inbox" / "run-1"
+    target.mkdir()
+    current_fingerprint = "b" * 64
+    with session_scope(db_engine) as session:
+        dataset = Dataset(
+            name="run-1",
+            path=str(target),
+            kind=DatasetKind.LEROBOT.value,
+            status="READY",
+            fingerprint=current_fingerprint,
+        )
+        session.add(dataset)
+        session.flush()
+        job = ImportJob(
+            source_name="lab-a",
+            remote_root="/data/rollouts",
+            remote_path="run-1",
+            target_name="run-1",
+            state="READY",
+            progress=100.0,
+            publish_fingerprint=current_fingerprint,
+            dataset_id=dataset.id,
+        )
+        session.add(job)
+        session.flush()
+        import_id = job.id
+        dataset_id = dataset.id
+
+    tasks_module._record_import_integrity_failure(
+        _runtime(db_engine, data_root),
+        import_id,
+        dataset_id,
+        "older-fingerprint",
+    )
+
+    with session_scope(db_engine) as session:
+        persisted_job = session.get_one(ImportJob, import_id)
+        persisted_dataset = session.get_one(Dataset, dataset_id)
+        assert (persisted_job.state, persisted_job.error_code) == ("READY", None)
+        assert persisted_dataset.status == "READY"
 
 
 def test_interrupted_import_with_no_target_resumes_through_task9(db_engine, data_root, monkeypatch):
