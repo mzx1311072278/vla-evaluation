@@ -145,20 +145,39 @@ def test_login_rejects_missing_csrf(client, user):
 
 
 @pytest.mark.parametrize("csrf_values", [["wrong"], ["错误"], ["first", "second"]])
-def test_login_rejects_invalid_or_duplicate_csrf(client, user, csrf_values):
-    response = client.post(
-        "/login",
-        content=urlencode(
-            [
-                ("username", "alice"),
-                ("password", "secret"),
-                *(("csrf_token", value) for value in csrf_values),
-            ]
-        ),
-        headers={"content-type": "application/x-www-form-urlencoded"},
-    )
+def test_login_rejects_invalid_or_duplicate_csrf(app, user, csrf_values):
+    with TestClient(
+        app,
+        base_url="https://testserver",
+        raise_server_exceptions=False,
+    ) as safe_client:
+        safe_client.get("/login")
+        response = safe_client.post(
+            "/login",
+            content=urlencode(
+                [
+                    ("username", "alice"),
+                    ("password", "secret"),
+                    *(("csrf_token", value) for value in csrf_values),
+                ]
+            ),
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
 
     assert response.status_code == 403
+
+
+def test_require_csrf_rejects_non_ascii_token():
+    from fastapi import HTTPException, Request
+
+    from vla_eval.security import require_csrf
+
+    request = Request({"type": "http", "session": {"csrf_token": "valid-ascii-token"}})
+
+    with pytest.raises(HTTPException) as captured:
+        require_csrf(request, ["错误"])
+
+    assert captured.value.status_code == 403
 
 
 @pytest.mark.parametrize(
@@ -381,13 +400,38 @@ def test_login_rotates_csrf_and_old_token_cannot_log_out(client, user):
 
 
 def test_successful_job_fixture_has_deterministic_artifacts(successful_job):
+    from Genie02_report.genie02_eval_common import load_episode_metrics, load_metrics_core
+
     output_dir = successful_job.output_dir
     assert output_dir is not None
-    metrics_path = Path(output_dir) / "metrics_core.json"
-    csv_path = Path(output_dir) / "episode_metrics.csv"
+    session = {"session_id": "ready-dataset"}
 
-    assert json.loads(metrics_path.read_text(encoding="utf-8")) == {
-        "episode_count": 1,
-        "success_rate": 1.0,
+    assert load_episode_metrics(Path(output_dir), session) == [
+        {
+            "session_id": "ready-dataset",
+            "episode_index": 0,
+            "outcome": "success",
+            "duration_s": 1.0,
+            "smoothness": 0.0,
+            "left_smoothness": 0.0,
+            "right_smoothness": None,
+            "smoothness_space": "joint",
+            "smoothness_frames": 4,
+            "smoothness_skipped_reason": "",
+        }
+    ]
+    assert load_metrics_core(Path(output_dir), session) == {
+        "schema_version": "1.0",
+        "session_id": "ready-dataset",
+        "n_episodes": 1,
+        "n_success": 1,
+        "n_failure": 0,
+        "gsr": 1.0,
+        "mean_tts_success_s": 1.0,
+        "smoothness": {
+            "space": "joint",
+            "left": {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "n_episodes": 1},
+            "right": {"mean": None, "std": None, "min": None, "max": None, "n_episodes": 0},
+            "n_episodes": 1,
+        },
     }
-    assert csv_path.read_text(encoding="utf-8") == "episode_index,success\n0,True\n"

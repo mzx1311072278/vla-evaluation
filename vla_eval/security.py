@@ -58,9 +58,11 @@ def require_csrf(request: Request, submitted_tokens: Sequence[object]) -> None:
     if (
         not isinstance(stored_token, str)
         or not stored_token
+        or not stored_token.isascii()
         or len(submitted_tokens) != 1
         or not isinstance(submitted_tokens[0], str)
         or not submitted_tokens[0]
+        or not submitted_tokens[0].isascii()
         or not secrets.compare_digest(stored_token, submitted_tokens[0])
     ):
         raise HTTPException(status_code=403, detail="Invalid CSRF token")

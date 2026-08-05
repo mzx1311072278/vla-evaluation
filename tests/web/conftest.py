@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 
+from Genie02_report.genie02_eval_common import EPISODE_METRIC_FIELDS
 from tests.fakes import FakeQueueBundle
 from vla_eval.config import AppConfig
 from vla_eval.db import session_scope
@@ -90,18 +91,52 @@ def successful_job(
 ) -> EvaluationJob:
     output_dir = data_root / "runs" / "successful-job"
     output_dir.mkdir(parents=True)
+    metrics = {
+        "schema_version": "1.0",
+        "session_id": "ready-dataset",
+        "n_episodes": 1,
+        "n_success": 1,
+        "n_failure": 0,
+        "gsr": 1.0,
+        "mean_tts_success_s": 1.0,
+        "smoothness": {
+            "space": "joint",
+            "left": {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "n_episodes": 1},
+            "right": {
+                "mean": None,
+                "std": None,
+                "min": None,
+                "max": None,
+                "n_episodes": 0,
+            },
+            "n_episodes": 1,
+        },
+    }
     (output_dir / "metrics_core.json").write_text(
-        json.dumps({"episode_count": 1, "success_rate": 1.0}, sort_keys=True),
+        json.dumps(metrics, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
         encoding="utf-8",
     )
     with (output_dir / "episode_metrics.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=("episode_index", "success"),
+            fieldnames=EPISODE_METRIC_FIELDS,
             lineterminator="\n",
         )
         writer.writeheader()
-        writer.writerow({"episode_index": 0, "success": True})
+        writer.writerow(
+            {
+                "session_id": "ready-dataset",
+                "episode_index": 0,
+                "outcome": "success",
+                "duration_s": "1.000",
+                "smoothness": "0",
+                "left_smoothness": "0",
+                "right_smoothness": "",
+                "smoothness_space": "joint",
+                "smoothness_frames": 4,
+                "smoothness_skipped_reason": "",
+            }
+        )
 
     with session_scope(db_engine) as session:
         value = EvaluationJob(
