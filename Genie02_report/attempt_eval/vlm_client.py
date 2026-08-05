@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-
 PROMPT = """你正在分析机器人抓取任务的成功 episode 抽帧序列。
 
 该 episode 的元数据已经标注为 success。你的任务不是重新评估整条是否成功，而是统计“最终成功抓取之前，发生了几次失败抓取”。
@@ -64,8 +63,19 @@ JSON schema:
 7. 不要逐帧计数；时间相邻且动作连续的帧属于同一个抓取事件。
 """
 
+PROMPT_VERSION = "genie02-attempt-v1"
+PROMPTS = {PROMPT_VERSION: PROMPT}
 
-def _prompt_with_frame_times(frame_timestamps: list[dict[str, Any]]) -> str:
+
+def prompt_for_version(prompt_version: str) -> str:
+    try:
+        return PROMPTS[prompt_version]
+    except KeyError as exc:
+        supported = ", ".join(sorted(PROMPTS))
+        raise ValueError(f"prompt_version must be one of: {supported}") from exc
+
+
+def _prompt_with_frame_times(frame_timestamps: list[dict[str, Any]], prompt: str = PROMPT) -> str:
     lines = [
         "下面是该 episode 的抽帧序列：",
         "",
@@ -85,7 +95,7 @@ def _prompt_with_frame_times(frame_timestamps: list[dict[str, Any]]) -> str:
             f"{item['frame']}: episode_time={item['episode_time']}s, "
             f"video_time={item['video_time']}s"
         )
-    return PROMPT + "\n\n" + "\n".join(lines)
+    return prompt + "\n\n" + "\n".join(lines)
 
 
 def extract_json(text: str) -> tuple[dict[str, Any] | None, bool, str]:
@@ -95,7 +105,6 @@ def extract_json(text: str) -> tuple[dict[str, Any] | None, bool, str]:
         return json.loads(text), True, ""
     except json.JSONDecodeError as exc:
         parse_error = str(exc)
-        pass
     start = text.find("{")
     if start < 0:
         return None, False, parse_error
@@ -214,11 +223,17 @@ def validate_vlm_result(
 
 
 class LocalVLMClient:
-    def __init__(self, model_path: Path, max_new_tokens: int = 256):
+    def __init__(
+        self,
+        model_path: Path,
+        max_new_tokens: int = 256,
+        prompt_version: str = PROMPT_VERSION,
+    ):
         self.model_path = model_path.expanduser()
         if not self.model_path.exists():
             raise FileNotFoundError(f"Local VLM model path does not exist: {self.model_path}")
         self.max_new_tokens = max_new_tokens
+        self.prompt = prompt_for_version(prompt_version)
 
         import os
 
@@ -256,7 +271,9 @@ class LocalVLMClient:
         from qwen_vl_utils import process_vision_info
 
         content = [{"type": "image", "image": str(path.resolve())} for path in frame_paths]
-        content.append({"type": "text", "text": _prompt_with_frame_times(frame_timestamps)})
+        content.append(
+            {"type": "text", "text": _prompt_with_frame_times(frame_timestamps, self.prompt)}
+        )
         messages = [{"role": "user", "content": content}]
 
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
