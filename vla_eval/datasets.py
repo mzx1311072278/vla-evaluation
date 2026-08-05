@@ -460,7 +460,7 @@ def _validate_genie_trajectory(
     if not _mark_trajectory_sidecar_metadata(entry, allowed_root, manifest, errors):
         return False
     try:
-        trajectory = _load_file(entry.resolved_path, session, episode_index)
+        trajectory = _load_file(entry.logical_path, session, episode_index)
     except Exception as exc:  # noqa: BLE001 - the legacy reader wraps backend-specific errors
         errors.append(f"cannot read {label} {logical}: {exc}")
         return False
@@ -489,19 +489,29 @@ def _mark_trajectory_sidecar_metadata(
     manifest: _Manifest,
     errors: list[str],
 ) -> bool:
-    suffix = entry.resolved_path.suffix.lower()
+    suffix = entry.logical_path.suffix.lower()
     if suffix == ".npz":
-        candidates = (entry.resolved_path.parent / "meta.json",)
-    elif suffix in {".parquet", ".pq"} and len(entry.resolved_path.parents) >= 3:
-        candidates = (entry.resolved_path.parents[2] / "meta/info.json",)
+        candidates = (entry.logical_path.parent / "meta.json",)
+    elif suffix in {".parquet", ".pq"} and len(entry.logical_path.parents) >= 3:
+        candidates = (entry.logical_path.parents[2] / "meta/info.json",)
     else:
         candidates = ()
     for candidate in candidates:
-        if not os.path.lexists(candidate):
+        safe_candidate, error = _safe_logical_path(
+            candidate,
+            base=entry.logical_path.parent,
+            allowed_root=allowed_root,
+            label="trajectory metadata",
+        )
+        if error:
+            errors.append(error)
+            return False
+        assert safe_candidate is not None
+        if not os.path.lexists(safe_candidate):
             continue
         metadata_entry, error = _safe_reference(
-            candidate,
-            base=entry.resolved_path.parent,
+            safe_candidate,
+            base=entry.logical_path.parent,
             allowed_root=allowed_root,
             label="trajectory metadata",
         )
@@ -513,7 +523,7 @@ def _mark_trajectory_sidecar_metadata(
             manifest.add_file(metadata_entry.logical_path, metadata_entry.resolved_path)
             manifest.mark_metadata(metadata_entry.logical_path)
         except (OSError, ValueError) as exc:
-            errors.append(f"cannot read trajectory metadata {candidate}: {exc}")
+            errors.append(f"cannot read trajectory metadata {safe_candidate}: {exc}")
             return False
     return True
 

@@ -117,6 +117,85 @@ def test_inspect_genie02_rejects_object_npz_without_falling_back(tmp_path: Path)
     assert any("cannot read" in error for error in result.errors)
 
 
+def test_inspect_genie02_rejects_plain_csv_trajectory(tmp_path: Path):
+    root = _write_native_session(
+        tmp_path / "run", trajectory_path="trajectory.csv", create_trajectory=False
+    )
+    (root / "trajectory.csv").write_text("action\n0.0\n", encoding="utf-8")
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is False
+    assert any("unsupported trajectory format" in error for error in result.errors)
+
+
+def test_inspect_genie02_rejects_csv_named_symlink_to_npz(tmp_path: Path):
+    root = _write_native_session(
+        tmp_path / "run", trajectory_path="trajectory.csv", create_trajectory=False
+    )
+    target = root / "trajectories/source.npz"
+    np.savez(target, action=np.ones((4, 3)))
+    (root / "trajectory.csv").symlink_to(target)
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is False
+    assert any("unsupported trajectory format" in error for error in result.errors)
+
+
+def test_inspect_genie02_parquet_uses_logical_sidecar_location(tmp_path: Path):
+    logical_path = "alias/data/chunk-000/file-000.parquet"
+    root = _write_native_session(
+        tmp_path / "run", trajectory_path=logical_path, create_trajectory=False
+    )
+    target = root / "target/data/chunk-000/file-000.parquet"
+    target.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "episode_index": [0, 0, 0, 0],
+            "timestamp": [0.0, 0.1, 0.2, 0.3],
+            "action": [[0.0, 0.0, 0.0]] * 4,
+        }
+    ).to_parquet(target)
+    logical = root / logical_path
+    logical.parent.mkdir(parents=True)
+    logical.symlink_to(target)
+    logical_info = root / "alias/meta/info.json"
+    logical_info.parent.mkdir(parents=True)
+    logical_info.write_text('{"features": {"action": {"names": []}}}', encoding="utf-8")
+    target_info = root / "target/meta/info.json"
+    target_info.parent.mkdir(parents=True)
+    target_info.write_text("invalid-json", encoding="utf-8")
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is True
+
+
+def test_inspect_rejects_shallow_parquet_symlink_with_reader_sidecar_escape(tmp_path: Path):
+    root = _write_native_session(
+        tmp_path / "run", trajectory_path="shallow.parquet", create_trajectory=False
+    )
+    target = root / "target/data/chunk-000/file-000.parquet"
+    target.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "episode_index": [0, 0, 0, 0],
+            "timestamp": [0.0, 0.1, 0.2, 0.3],
+            "action": [[0.0, 0.0, 0.0]] * 4,
+        }
+    ).to_parquet(target)
+    target_info = root / "target/meta/info.json"
+    target_info.parent.mkdir(parents=True)
+    target_info.write_text('{"features": {}}', encoding="utf-8")
+    (root / "shallow.parquet").symlink_to(target)
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is False
+    assert any("trajectory metadata is outside allowed root" in error for error in result.errors)
+
+
 def test_inspect_genie02_rejects_corrupt_npz(tmp_path: Path):
     root = _write_native_session(
         tmp_path / "run", trajectory_path="corrupt.npz", create_trajectory=False
@@ -142,16 +221,18 @@ def test_inspect_genie02_rejects_mismatched_npz_timestamps(tmp_path: Path):
 
 
 def test_inspect_genie02_rejects_empty_parquet_trajectory(tmp_path: Path):
+    trajectory_path = "recording/data/chunk-000/empty.parquet"
     root = _write_native_session(
-        tmp_path / "run", trajectory_path="empty.parquet", create_trajectory=False
+        tmp_path / "run", trajectory_path=trajectory_path, create_trajectory=False
     )
+    (root / trajectory_path).parent.mkdir(parents=True)
     pd.DataFrame(
         {
             "episode_index": pd.Series(dtype="int64"),
             "timestamp": pd.Series(dtype="float64"),
             "action": pd.Series(dtype="object"),
         }
-    ).to_parquet(root / "empty.parquet")
+    ).to_parquet(root / trajectory_path)
 
     result = inspect_dataset(root, allowed_root=tmp_path)
 
@@ -160,16 +241,18 @@ def test_inspect_genie02_rejects_empty_parquet_trajectory(tmp_path: Path):
 
 
 def test_inspect_genie02_rejects_wrong_episode_parquet_trajectory(tmp_path: Path):
+    trajectory_path = "recording/data/chunk-000/wrong.parquet"
     root = _write_native_session(
-        tmp_path / "run", trajectory_path="wrong.parquet", create_trajectory=False
+        tmp_path / "run", trajectory_path=trajectory_path, create_trajectory=False
     )
+    (root / trajectory_path).parent.mkdir(parents=True)
     pd.DataFrame(
         {
             "episode_index": [1, 1, 1, 1],
             "timestamp": [0.0, 0.1, 0.2, 0.3],
             "action": [[0.0, 0.0, 0.0]] * 4,
         }
-    ).to_parquet(root / "wrong.parquet")
+    ).to_parquet(root / trajectory_path)
 
     result = inspect_dataset(root, allowed_root=tmp_path)
 
@@ -380,6 +463,8 @@ def test_manifest_hashes_only_adapter_metadata_independent_of_ancestors(
     unrelated.write_text('{"same_size": true}', encoding="utf-8")
     unrelated_meta = root / "meta/unrelated.json"
     unrelated_meta.write_text('{"not_adapter_metadata": true}', encoding="utf-8")
+    unrelated_csv = root / "unrelated.csv"
+    unrelated_csv.write_text("not,adapter,metadata\n", encoding="utf-8")
     hashed: list[Path] = []
     original_hash_file = datasets._hash_file
 
@@ -397,6 +482,7 @@ def test_manifest_hashes_only_adapter_metadata_independent_of_ancestors(
     assert (root / "data/chunk-000/file-000.parquet").resolve() not in hashed
     assert unrelated.resolve() not in hashed
     assert unrelated_meta.resolve() not in hashed
+    assert unrelated_csv.resolve() not in hashed
 
 
 def test_inspect_validates_referenced_lerobot_data_and_video(tmp_path: Path):
