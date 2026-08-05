@@ -79,8 +79,10 @@ class ImportJob(PersistedModel, Base):
     target_name: Mapped[str] = mapped_column(String(255))
     state: Mapped[str] = mapped_column(String(32), default="QUEUED")
     progress: Mapped[float] = mapped_column(Float, default=0.0)
+    error_code: Mapped[str | None] = mapped_column(String(64), default=None)
     error_message: Mapped[str | None] = mapped_column(Text, default=None)
     dataset_id: Mapped[str | None] = mapped_column(ForeignKey("datasets.id"), default=None)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class EvaluationJob(PersistedModel, Base):
