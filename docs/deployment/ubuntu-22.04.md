@@ -275,6 +275,75 @@ newest 30 archives and prunes older ones.
 - Re-verify the CUDA base image tag in `deploy/Dockerfile.evaluation` against the
   driver present after any OS upgrade.
 
+## 15. Restart and crash recovery
+
+The two workers recover from a restart differently because their workloads have
+different durability guarantees. The web process is stateless and can always be
+restarted without data loss.
+
+### Transfer worker (rsync) restart
+
+The transfer worker writes into a per-job **staging** directory under
+`data/staging/<import_id>` using rsync `--partial`/`--append-verify`, so an
+in-progress transfer leaves resumable partial bytes on disk. A restart of the
+transfer worker therefore **keeps the staging directory and resumes** the
+in-flight import where it stopped:
+
+```bash
+docker compose restart transfer-worker
+docker compose logs -f transfer-worker
+```
+
+If the worker was killed mid-transfer, the in-flight import job is marked
+`INTERRUPTED` on the next `recover-jobs` sweep; the staging bytes are preserved
+and a retry resumes rather than re-downloading from scratch.
+
+### Evaluation worker restart
+
+Evaluations are **not** auto-recomputed. If the evaluation worker crashes or is
+restarted while a job is in `METRICS`/`VLM`/`REPORT`, that job is recorded as
+`INTERRUPTED` (a terminal-but-retryable state) by `recover_interrupted_jobs` and
+must be **retried manually from the web UI** (the "重试" button on the job
+page) or the CLI. It is never silently recomputed, because the metrics/VLM
+artifacts may be half-written and the user must explicitly confirm a rerun:
+
+```bash
+# Mark in-flight evaluations as INTERRUPTED after a crash/reboot:
+docker compose run --rm web python -m vla_eval.cli recover-jobs
+```
+
+Then, in the web UI, open each `INTERRUPTED` evaluation and click **重试**. The
+rerun resumes from the last completed stage boundary (METRICS → optional VLM →
+REPORT) when resumable artifacts are present, otherwise it recomputes from
+METRICS.
+
+> Web app restart never loses state: job progress is persisted to SQLite on
+> every state/progress callback, so closing the browser or restarting the web
+> container does not interrupt or lose a running evaluation -- reopening the
+> job page shows the current persisted progress (the in-process e2e test
+> `tests/e2e/test_evaluation_workflow.py` asserts this acceptance criterion).
+
+## 16. Record measured host versions (fill in on the 4090)
+
+The GPU smoke (§9), restart-recovery (§15), and the version table below **cannot
+be validated on the development machine** (no NVIDIA GPU, no Docker, no 4090).
+Run them on the Ubuntu host on first install and record the measured values
+here so the next operator can detect drift on upgrade. Replace each `_TBD_`.
+
+| Component                 | Command to capture                                  | Measured |
+| ------------------------- | --------------------------------------------------- | -------- |
+| NVIDIA driver / 4090      | `nvidia-smi` (CUDA version line)                    | _TBD_    |
+| Docker Engine             | `docker --version`                                  | _TBD_    |
+| Compose plugin            | `docker compose version`                            | _TBD_    |
+| CUDA runtime (container)  | `docker compose run --rm evaluation-worker nvidia-smi` | _TBD_ |
+| PyTorch (container)       | `docker compose run --rm evaluation-worker python -c "import torch; print(torch.__version__, torch.version.cuda)"` | _TBD_ |
+| GPU visible to PyTorch    | `... python -c "import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"` | _TBD_ |
+| Eval model weight id      | directory hash / commit of `data/models/Qwen2.5-VL-7B-Instruct` | _TBD_ |
+| rsync (host)              | `rsync --version` (must be >= 3.2.7)                | _TBD_    |
+
+Re-run the §9 GPU smoke after any driver, Docker, CUDA, or PyTorch upgrade and
+update this table.
+
 ## Operational commands cheat sheet
 
 ```bash
