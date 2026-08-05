@@ -6,6 +6,7 @@ from pathlib import Path
 
 import fakeredis
 import pytest
+from rq import Worker
 from sqlalchemy import Engine, select
 from typer.testing import CliRunner
 
@@ -63,6 +64,22 @@ def db_engine(app_config, tmp_path: Path) -> Engine:
 def load_user(engine: Engine, username: str) -> User | None:
     with session_scope(engine) as session:
         return session.scalar(select(User).where(User.username == username))
+
+
+# Module-level so RQ can serialize it as ``tests.test_cli._rq_runtime_sentinel``
+# and re-import it in the forked work-horse. It resolves the task runtime via the
+# global configured by ``build_runtime`` (inherited across ``fork()``) and writes
+# a filesystem marker so the parent process can observe execution (fakeredis
+# state written by the child is invisible to the parent after fork).
+def _rq_runtime_sentinel() -> tuple[str, str]:
+    import os
+
+    from vla_eval.tasks import _require_runtime
+
+    runtime = _require_runtime(None)  # raises RuntimeError if not configured
+    marker_path = os.environ["VLA_EVAL_RQ_SENTINEL_PATH"]
+    Path(marker_path).write_text(runtime.config.data_root.name, encoding="utf-8")
+    return ("ran", runtime.config.data_root.name)
 
 
 def _write_ready_session_dataset(path: Path) -> None:
@@ -350,3 +367,48 @@ def test_worker_command_runs(cli_runner: CliRunner, app_config, monkeypatch):
     assert captured.get("worked") is True
     assert [queue.name for queue in captured["queues"]] == ["evaluations"]
     clear_runtime()
+
+
+def test_rq_worker_executes_enqueued_function_against_configured_runtime(
+    app_config, tmp_path, monkeypatch
+):
+    """End-to-end: an enqueued function is deserialized and run in the work-horse,
+    and the task runtime configured by ``build_runtime`` (inherited across RQ's
+    ``fork()``) resolves inside it. Observed via a filesystem marker because
+    fakeredis state written by the child is invisible to the parent after fork.
+    """
+    fake = fakeredis.FakeRedis()
+    monkeypatch.setattr(
+        cli_module,
+        "create_queues",
+        lambda _url, **_kw: create_queues("redis://unused", connection=fake),
+    )
+    marker = tmp_path / "sentinel.out"
+    monkeypatch.setenv("VLA_EVAL_RQ_SENTINEL_PATH", str(marker))
+
+    engine, queues, runtime = cli_module.build_runtime(app_config)
+    try:
+        queues.evaluation.enqueue(_rq_runtime_sentinel)
+        Worker([queues.evaluation], connection=queues.evaluation.connection).work(
+            burst=True, logging_level="WARNING"
+        )
+        assert marker.exists()
+        assert marker.read_text(encoding="utf-8") == runtime.config.data_root.name
+    finally:
+        clear_runtime()
+        engine.dispose()
+
+
+def test_rq_sentinel_fails_when_runtime_not_configured(tmp_path, monkeypatch):
+    """The round-trip test above is load-bearing: with no configured runtime the
+    sentinel raises before writing the marker, so the marker is absent."""
+    clear_runtime()
+    queues = create_queues("redis://unused", connection=fakeredis.FakeRedis())
+    marker = tmp_path / "sentinel-fail.out"
+    monkeypatch.setenv("VLA_EVAL_RQ_SENTINEL_PATH", str(marker))
+
+    queues.evaluation.enqueue(_rq_runtime_sentinel)
+    Worker([queues.evaluation], connection=queues.evaluation.connection).work(
+        burst=True, logging_level="WARNING"
+    )
+    assert not marker.exists()

@@ -1,6 +1,10 @@
 # VLA evaluation service stack. See docs/deployment/ubuntu-22.04.md for the
 # full runbook (NVIDIA driver, Container Toolkit, host directory setup, etc.).
 # Validate locally with:  docker compose config --quiet
+#
+# BUILD ORDER: transfer-worker's image (deploy/Dockerfile.transfer) is
+# FROM vla-eval-web:latest, so the web image must be built first:
+#   docker compose build web && docker compose build
 services:
   caddy:
     image: caddy:2-alpine
@@ -54,6 +58,8 @@ services:
       timeout: 3s
       retries: 5
 
+  # transfer-worker's image is FROM vla-eval-web:latest (see top-of-file note);
+  # build the web image before building this service.
   transfer-worker:
     build:
       context: .

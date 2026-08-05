@@ -19,8 +19,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && python3.11 -m ensurepip \
     && python3.11 -m pip install --upgrade pip \
-    && update-alternatives --install /usr/local/bin/python python /usr/bin/python3.11 1 \
-    && update-alternatives --install /usr/local/bin/pip pip /usr/bin/pip3 1
+    && update-alternatives --install /usr/local/bin/python python /usr/bin/python3.11 1
+
+# Note: bare `pip` is intentionally not aliased. /usr/bin/pip3 belongs to the
+# system Python 3.10, so use `python -m pip` (which targets 3.11) everywhere.
 
 WORKDIR /app
 COPY . /app

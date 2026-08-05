@@ -13,13 +13,14 @@ from typing import Annotated
 
 import typer
 from rq import Worker
-from sqlalchemy import Engine, select, text
+from sqlalchemy import Engine, select
 
 from vla_eval.config import AppConfig, load_config
 from vla_eval.datasets import DatasetInspection, inspect_dataset
 from vla_eval.db import create_engine_for_url, init_db, session_scope
 from vla_eval.models import Dataset, User
 from vla_eval.queueing import QueueBundle, create_queues
+from vla_eval.readiness import collect_readiness_failures
 from vla_eval.security import hash_password
 from vla_eval.tasks import (
     TaskRuntime,
@@ -202,31 +203,10 @@ def recover_jobs_cmd(config_path: ConfigOption = None) -> None:
 def smoke_cmd(config_path: ConfigOption = None) -> None:
     """Verify the database, Redis, and data root are reachable/writable."""
     config = _load_config(config_path)
-    failures: list[str] = []
-
-    try:
-        engine = create_engine_for_url(config.database_url)
-        try:
-            with engine.connect() as connection:
-                connection.execute(text("SELECT 1"))
-        finally:
-            engine.dispose()
-    except Exception:  # noqa: BLE001 - any failure marks the component
-        failures.append("sqlite")
-
-    try:
-        queues = create_queues(config.redis_url)
-        queues.evaluation.connection.ping()
-    except Exception:  # noqa: BLE001 - any failure marks the component
-        failures.append("redis")
-
-    try:
-        probe = config.data_root / f".smoke-{os.getpid()}"
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink()
-    except Exception:  # noqa: BLE001 - any failure marks the component
-        failures.append("data_root")
-
+    engine = create_engine_for_url(config.database_url)
+    queues = create_queues(config.redis_url)
+    failures = collect_readiness_failures(engine, queues, config.data_root)
+    engine.dispose()
     if failures:
         typer.echo(f"smoke failed: {', '.join(failures)}", err=True)
         raise typer.Exit(1)
