@@ -237,6 +237,22 @@ class SelectableFakeStream(FakeStream):
         return 42
 
 
+class BlockingSelectableFakeStream(SelectableFakeStream):
+    def __init__(self):
+        super().__init__("")
+        self.read_started = threading.Event()
+        self.release_read = threading.Event()
+
+    def read(self, _size=-1):
+        self.read_started.set()
+        self.release_read.wait(timeout=1)
+        return ""
+
+    def close(self):
+        super().close()
+        self.release_read.set()
+
+
 class FakeSelector:
     def __init__(self):
         self.calls = 0
@@ -306,6 +322,40 @@ def test_run_rsync_uses_exact_argv_without_shell(monkeypatch):
             "shell": False,
         },
     }
+
+
+def test_run_rsync_prepares_redaction_before_starting_process(monkeypatch):
+    launched = False
+
+    def fake_popen(*_args, **_kwargs):
+        nonlocal launched
+        launched = True
+        return FakeProcess("")
+
+    monkeypatch.setattr(import_jobs.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        import_jobs,
+        "_argv_secrets",
+        lambda _argv: (_ for _ in ()).throw(RuntimeError("redaction setup failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="redaction setup failed"):
+        run_rsync(["rsync"], lambda _progress: None)
+
+    assert launched is False
+
+
+def test_argv_secrets_normalizes_paths_without_touching_filesystem(monkeypatch):
+    monkeypatch.setattr(
+        Path,
+        "resolve",
+        lambda *_args, **_kwargs: pytest.fail("redaction must not resolve filesystem paths"),
+    )
+
+    secrets = import_jobs._argv_secrets(["rsync", "-e", "ssh -i /private/keys/../keys/id_ed25519/"])
+
+    assert "/private/keys/id_ed25519" in secrets
+    assert "/private/keys/id_ed25519/" in secrets
 
 
 def test_run_rsync_parses_cr_progress_monotonically_and_ignores_filenames(monkeypatch):
@@ -471,6 +521,30 @@ def test_selector_registration_failure_closes_and_uses_safe_fallback(monkeypatch
     run_rsync(["rsync"], progress.append)
 
     assert progress == [12.0]
+    assert RegisterFailingSelector.instances[0].closed is True
+
+
+def test_selector_registration_fallback_polls_cancellation(monkeypatch):
+    RegisterFailingSelector.instances.clear()
+    process = FakeProcess("")
+    process.stdout = BlockingSelectableFakeStream()
+    monkeypatch.setattr(import_jobs.subprocess, "Popen", lambda *_a, **_kw: process)
+    monkeypatch.setattr(
+        import_jobs.selectors,
+        "DefaultSelector",
+        RegisterFailingSelector,
+    )
+
+    with pytest.raises(TransferError, match="cancelled"):
+        run_rsync(
+            ["rsync"],
+            lambda _progress: None,
+            on_poll=lambda: (_ for _ in ()).throw(TransferError("cancelled")),
+        )
+
+    assert process.stdout.read_started.is_set()
+    assert process.terminated is True
+    assert process.stdout.closed is True
     assert RegisterFailingSelector.instances[0].closed is True
 
 

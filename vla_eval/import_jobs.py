@@ -7,12 +7,14 @@ import ctypes
 import errno
 import math
 import os
+import queue
 import re
 import selectors
 import shlex
 import stat
 import subprocess
 import sys
+import threading
 import unicodedata
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -173,8 +175,8 @@ def _secret_path_variants(value: str) -> set[str]:
     if without_separator:
         variants.update({without_separator, f"{without_separator}/"})
     if value.startswith("/"):
-        resolved = str(Path(without_separator or value).resolve(strict=False))
-        variants.update({resolved, f"{resolved}/"})
+        normalized = os.path.normpath(without_separator or value)
+        variants.update({normalized, f"{normalized}/"})
     return variants
 
 
@@ -238,11 +240,39 @@ def _normalize_argv(argv: Sequence[str]) -> list[str]:
     return normalized
 
 
-def _fallback_stream(output: object, feed_text: Callable[[str], None]) -> None:
+def _fallback_stream(
+    output: object,
+    feed_text: Callable[[str], None],
+    on_poll: Callable[[], None],
+) -> None:
     read = output.read  # type: ignore[attr-defined]
-    while chunk := read(4096):
+    messages: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
+
+    def read_output() -> None:
+        try:
+            while chunk := read(4096):
+                messages.put(("chunk", chunk))
+        except BaseException as error:  # noqa: BLE001 - relay reader failure to caller
+            messages.put(("error", error))
+        finally:
+            messages.put(("eof", None))
+
+    threading.Thread(target=read_output, daemon=True).start()
+    while True:
+        try:
+            kind, payload = messages.get(timeout=_PROCESS_POLL_SECONDS)
+        except queue.Empty:
+            on_poll()
+            continue
+        if kind == "eof":
+            return
+        if kind == "error":
+            assert isinstance(payload, BaseException)
+            raise payload
+        chunk = payload
         if isinstance(chunk, bytes):
             chunk = chunk.decode("utf-8", errors="replace")
+        assert isinstance(chunk, str)
         feed_text(chunk)
 
 
@@ -257,7 +287,7 @@ def _selector_stream(
         selector.register(descriptor, selectors.EVENT_READ)
     except (KeyError, OSError, ValueError):
         selector.close()
-        _fallback_stream(output, feed_text)
+        _fallback_stream(output, feed_text, on_poll)
         return
     encoding = getattr(output, "encoding", None) or "utf-8"
     decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
@@ -308,6 +338,7 @@ def run_rsync(
 ) -> None:
     """Run one argv-only rsync process and stream progress2 updates."""
     normalized_argv = _normalize_argv(argv)
+    secrets = _argv_secrets(normalized_argv)
     try:
         process = subprocess.Popen(
             normalized_argv,
@@ -335,7 +366,6 @@ def run_rsync(
         raise failure
 
     tail: deque[str] = deque(maxlen=_MAX_TAIL_LINES)
-    secrets = _argv_secrets(normalized_argv)
     pending = ""
     pending_was_truncated = False
     last_progress = 0.0
@@ -377,7 +407,7 @@ def run_rsync(
         try:
             descriptor = output.fileno()
         except (AttributeError, OSError, TypeError, ValueError):
-            _fallback_stream(output, feed_text)
+            _fallback_stream(output, feed_text, poll_callback)
         else:
             _selector_stream(output, descriptor, feed_text, poll_callback)
         if not pending_was_truncated:
