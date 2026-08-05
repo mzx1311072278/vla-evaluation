@@ -7,14 +7,13 @@ import ctypes
 import errno
 import math
 import os
-import queue
 import re
 import selectors
 import shlex
 import stat
 import subprocess
 import sys
-import threading
+import time
 import unicodedata
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -242,38 +241,35 @@ def _normalize_argv(argv: Sequence[str]) -> list[str]:
 
 def _fallback_stream(
     output: object,
+    descriptor: int,
     feed_text: Callable[[str], None],
     on_poll: Callable[[], None],
 ) -> None:
-    read = output.read  # type: ignore[attr-defined]
-    messages: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
-
-    def read_output() -> None:
-        try:
-            while chunk := read(4096):
-                messages.put(("chunk", chunk))
-        except BaseException as error:  # noqa: BLE001 - relay reader failure to caller
-            messages.put(("error", error))
-        finally:
-            messages.put(("eof", None))
-
-    threading.Thread(target=read_output, daemon=True).start()
+    try:
+        os.set_blocking(descriptor, False)
+    except (AttributeError, OSError, ValueError) as error:
+        raise TransferError("rsync output pipe does not support safe polling") from error
+    encoding = getattr(output, "encoding", None) or "utf-8"
+    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+    next_poll = time.monotonic() + _PROCESS_POLL_SECONDS
     while True:
-        try:
-            kind, payload = messages.get(timeout=_PROCESS_POLL_SECONDS)
-        except queue.Empty:
+        now = time.monotonic()
+        if now >= next_poll:
             on_poll()
+            next_poll = time.monotonic() + _PROCESS_POLL_SECONDS
+        try:
+            chunk = os.read(descriptor, 4096)
+        except BlockingIOError:
+            sleep_seconds = max(0.0, next_poll - time.monotonic())
+            if sleep_seconds:
+                time.sleep(sleep_seconds)
             continue
-        if kind == "eof":
+        except InterruptedError:
+            continue
+        if not chunk:
+            feed_text(decoder.decode(b"", final=True))
             return
-        if kind == "error":
-            assert isinstance(payload, BaseException)
-            raise payload
-        chunk = payload
-        if isinstance(chunk, bytes):
-            chunk = chunk.decode("utf-8", errors="replace")
-        assert isinstance(chunk, str)
-        feed_text(chunk)
+        feed_text(decoder.decode(chunk))
 
 
 def _selector_stream(
@@ -287,17 +283,23 @@ def _selector_stream(
         selector.register(descriptor, selectors.EVENT_READ)
     except (KeyError, OSError, ValueError):
         selector.close()
-        _fallback_stream(output, feed_text, on_poll)
+        _fallback_stream(output, descriptor, feed_text, on_poll)
         return
     encoding = getattr(output, "encoding", None) or "utf-8"
     decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
     primary: BaseException | None = None
+    next_poll = time.monotonic() + _PROCESS_POLL_SECONDS
     try:
         while True:
-            events = selector.select(_PROCESS_POLL_SECONDS)
+            timeout = max(0.0, next_poll - time.monotonic())
+            events = selector.select(timeout)
             if not events:
                 on_poll()
+                next_poll = time.monotonic() + _PROCESS_POLL_SECONDS
                 continue
+            if time.monotonic() >= next_poll:
+                on_poll()
+                next_poll = time.monotonic() + _PROCESS_POLL_SECONDS
             chunk = os.read(descriptor, 4096)
             if not chunk:
                 break
@@ -406,8 +408,10 @@ def run_rsync(
     try:
         try:
             descriptor = output.fileno()
-        except (AttributeError, OSError, TypeError, ValueError):
-            _fallback_stream(output, feed_text, poll_callback)
+        except (AttributeError, OSError, TypeError, ValueError) as error:
+            raise TransferError(
+                "rsync output pipe does not expose a pollable descriptor"
+            ) from error
         else:
             _selector_stream(output, descriptor, feed_text, poll_callback)
         if not pending_was_truncated:

@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import threading
@@ -212,45 +213,68 @@ class FakeProcess:
     def kill(self):
         self.killed = True
 
+    @property
+    def stdout(self):
+        return self._stdout
+
+    @stdout.setter
+    def stdout(self, stream):
+        previous = getattr(self, "_stdout", None)
+        if previous is not None:
+            previous.close()
+        self._stdout = stream
+
 
 class FakeStream:
     def __init__(self, output: str):
-        self.output = output
-        self.offset = 0
+        self.read_descriptor, write_descriptor = os.pipe()
         self.closed = False
+        self.encoding = "utf-8"
+        if output:
+            os.write(write_descriptor, output.encode())
+        os.close(write_descriptor)
 
     def read(self, size=-1):
-        if self.offset >= len(self.output):
-            return ""
         if size < 0:
-            size = len(self.output)
-        value = self.output[self.offset : self.offset + size]
-        self.offset += len(value)
-        return value
+            size = 4096
+        return os.read(self.read_descriptor, size).decode()
+
+    def fileno(self):
+        return self.read_descriptor
 
     def close(self):
-        self.closed = True
+        if not self.closed:
+            os.close(self.read_descriptor)
+            self.closed = True
 
 
 class SelectableFakeStream(FakeStream):
-    def fileno(self):
-        return 42
+    pass
 
 
-class BlockingSelectableFakeStream(SelectableFakeStream):
-    def __init__(self):
+class ChunkingSelectableFakeStream(SelectableFakeStream):
+    def __init__(self, chunks, *, delay=0.0):
         super().__init__("")
-        self.read_started = threading.Event()
-        self.release_read = threading.Event()
+        self.chunks = iter(chunks)
+        self.delay = delay
 
     def read(self, _size=-1):
-        self.read_started.set()
-        self.release_read.wait(timeout=1)
-        return ""
+        if self.delay:
+            time.sleep(self.delay)
+        return next(self.chunks, "")
+
+
+class ErrorSelectableFakeStream(SelectableFakeStream):
+    def read(self, _size=-1):
+        raise OSError("output read failed")
+
+
+class NoDescriptorStream:
+    def __init__(self):
+        self.closed = False
 
     def close(self):
-        super().close()
-        self.release_read.set()
+        self.closed = True
 
 
 class FakeSelector:
@@ -294,6 +318,23 @@ class RegisterFailingSelector:
 
     def register(self, _file, _events):
         raise OSError("selector does not support this pipe")
+
+    def close(self):
+        self.closed = True
+
+
+class AlwaysReadySelector:
+    instances: ClassVar[list] = []
+
+    def __init__(self):
+        self.closed = False
+        self.__class__.instances.append(self)
+
+    def register(self, _file, _events):
+        return None
+
+    def select(self, _timeout):
+        return [(object(), 1)]
 
     def close(self):
         self.closed = True
@@ -527,12 +568,18 @@ def test_selector_registration_failure_closes_and_uses_safe_fallback(monkeypatch
 def test_selector_registration_fallback_polls_cancellation(monkeypatch):
     RegisterFailingSelector.instances.clear()
     process = FakeProcess("")
-    process.stdout = BlockingSelectableFakeStream()
+    process.stdout = SelectableFakeStream("")
     monkeypatch.setattr(import_jobs.subprocess, "Popen", lambda *_a, **_kw: process)
     monkeypatch.setattr(
         import_jobs.selectors,
         "DefaultSelector",
         RegisterFailingSelector,
+    )
+    monkeypatch.setattr(import_jobs.os, "set_blocking", lambda _fd, _blocking: None)
+    monkeypatch.setattr(
+        import_jobs.os,
+        "read",
+        lambda _fd, _size: (_ for _ in ()).throw(BlockingIOError()),
     )
 
     with pytest.raises(TransferError, match="cancelled"):
@@ -542,10 +589,181 @@ def test_selector_registration_fallback_polls_cancellation(monkeypatch):
             on_poll=lambda: (_ for _ in ()).throw(TransferError("cancelled")),
         )
 
-    assert process.stdout.read_started.is_set()
     assert process.terminated is True
     assert process.stdout.closed is True
     assert RegisterFailingSelector.instances[0].closed is True
+
+
+def test_fallback_callback_failures_leave_no_reader_threads(monkeypatch):
+    active_process = None
+    fd_root = "/proc/self/fd" if Path("/proc/self/fd").exists() else "/dev/fd"
+    baseline_fd_count = len(os.listdir(fd_root))
+    baseline = {
+        thread.ident for thread in threading.enumerate() if thread.name.endswith("(read_output)")
+    }
+    monkeypatch.setattr(import_jobs.selectors, "DefaultSelector", RegisterFailingSelector)
+    monkeypatch.setattr(import_jobs.os, "set_blocking", lambda _fd, _blocking: None)
+
+    def fake_popen(*_args, **_kwargs):
+        assert active_process is not None
+        return active_process
+
+    def fake_read(_fd, size):
+        assert active_process is not None
+        return active_process.stdout.read(size).encode()
+
+    monkeypatch.setattr(import_jobs.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(import_jobs.os, "read", fake_read)
+
+    for _ in range(100):
+        active_process = FakeProcess("")
+        active_process.stdout = ChunkingSelectableFakeStream(["12%\r"] * 4)
+
+        with pytest.raises(RuntimeError, match="callback failed"):
+            run_rsync(
+                ["rsync"],
+                lambda _progress: (_ for _ in ()).throw(RuntimeError("callback failed")),
+            )
+
+        assert active_process.terminated is True
+        assert active_process.stdout.closed is True
+
+    deadline = time.monotonic() + 0.2
+    while time.monotonic() < deadline:
+        remaining = {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name.endswith("(read_output)")
+        }
+        if remaining == baseline:
+            break
+        time.sleep(0.01)
+
+    assert remaining == baseline
+    assert len(os.listdir(fd_root)) == baseline_fd_count
+
+
+def test_real_fallback_bursts_leave_threads_and_fds_stable(monkeypatch):
+    fd_root = "/proc/self/fd" if Path("/proc/self/fd").exists() else "/dev/fd"
+    baseline_fd_count = len(os.listdir(fd_root))
+    baseline_threads = {thread.ident for thread in threading.enumerate()}
+    monkeypatch.setattr(import_jobs.selectors, "DefaultSelector", RegisterFailingSelector)
+    argv = [
+        sys.executable,
+        "-c",
+        "import sys;sys.stdout.write('12%\\r'*5000);sys.stdout.flush()",
+    ]
+
+    for _ in range(100):
+        with pytest.raises(RuntimeError, match="callback failed"):
+            run_rsync(
+                argv,
+                lambda _progress: (_ for _ in ()).throw(RuntimeError("callback failed")),
+            )
+
+    assert {thread.ident for thread in threading.enumerate()} == baseline_threads
+    assert len(os.listdir(fd_root)) == baseline_fd_count
+
+
+def test_selector_polls_cancellation_during_continuous_output(monkeypatch):
+    AlwaysReadySelector.instances.clear()
+    process = FakeProcess("")
+    process.stdout = SelectableFakeStream("")
+    reads = 0
+    polls = []
+
+    def continuous_read(_fd, _size):
+        nonlocal reads
+        time.sleep(0.01)
+        reads += 1
+        return b"x" if reads <= 30 else b""
+
+    monkeypatch.setattr(import_jobs.subprocess, "Popen", lambda *_a, **_kw: process)
+    monkeypatch.setattr(import_jobs.selectors, "DefaultSelector", AlwaysReadySelector)
+    monkeypatch.setattr(import_jobs.os, "read", continuous_read)
+    started = time.monotonic()
+
+    with pytest.raises(TransferError, match="cancelled"):
+        run_rsync(
+            ["rsync"],
+            lambda _progress: None,
+            on_poll=lambda: (
+                polls.append(time.monotonic()),
+                (_ for _ in ()).throw(TransferError("cancelled")),
+            )[-1],
+        )
+
+    assert polls
+    assert polls[0] - started < 0.25
+    assert process.terminated is True
+    assert process.stdout.closed is True
+    assert AlwaysReadySelector.instances[0].closed is True
+
+
+def test_registration_fallback_polls_cancellation_during_continuous_output(monkeypatch):
+    RegisterFailingSelector.instances.clear()
+    process = FakeProcess("")
+    process.stdout = ChunkingSelectableFakeStream(["x"] * 30, delay=0.01)
+    polls = []
+    monkeypatch.setattr(import_jobs.subprocess, "Popen", lambda *_a, **_kw: process)
+    monkeypatch.setattr(import_jobs.selectors, "DefaultSelector", RegisterFailingSelector)
+    monkeypatch.setattr(import_jobs.os, "set_blocking", lambda _fd, _blocking: None)
+    monkeypatch.setattr(
+        import_jobs.os,
+        "read",
+        lambda _fd, size: process.stdout.read(size).encode(),
+    )
+    started = time.monotonic()
+
+    with pytest.raises(TransferError, match="cancelled"):
+        run_rsync(
+            ["rsync"],
+            lambda _progress: None,
+            on_poll=lambda: (
+                polls.append(time.monotonic()),
+                (_ for _ in ()).throw(TransferError("cancelled")),
+            )[-1],
+        )
+
+    assert polls
+    assert polls[0] - started < 0.25
+    assert process.terminated is True
+    assert process.stdout.closed is True
+    assert RegisterFailingSelector.instances[0].closed is True
+
+
+def test_registration_fallback_read_error_cleans_up(monkeypatch):
+    RegisterFailingSelector.instances.clear()
+    process = FakeProcess("")
+    process.stdout = ErrorSelectableFakeStream("")
+    monkeypatch.setattr(import_jobs.subprocess, "Popen", lambda *_a, **_kw: process)
+    monkeypatch.setattr(import_jobs.selectors, "DefaultSelector", RegisterFailingSelector)
+    monkeypatch.setattr(import_jobs.os, "set_blocking", lambda _fd, _blocking: None)
+    monkeypatch.setattr(
+        import_jobs.os,
+        "read",
+        lambda _fd, size: process.stdout.read(size).encode(),
+    )
+
+    with pytest.raises(OSError, match="output read failed"):
+        run_rsync(["rsync"], lambda _progress: None)
+
+    assert process.terminated is True
+    assert process.stdout.closed is True
+    assert RegisterFailingSelector.instances[0].closed is True
+
+
+def test_output_without_descriptor_fails_closed_and_cleans_up(monkeypatch):
+    process = FakeProcess("")
+    process.stdout.close()
+    process.stdout = NoDescriptorStream()
+    monkeypatch.setattr(import_jobs.subprocess, "Popen", lambda *_a, **_kw: process)
+
+    with pytest.raises(TransferError, match="pollable descriptor"):
+        run_rsync(["rsync"], lambda _progress: None)
+
+    assert process.terminated is True
+    assert process.stdout.closed is True
 
 
 def test_run_rsync_bounds_newline_free_pending_output():
@@ -660,8 +878,10 @@ def test_run_rsync_copies_argv_to_a_new_list(monkeypatch):
 
 def test_callback_and_cleanup_failures_are_both_observable(monkeypatch):
     process = FakeProcess("  1,000  20% 1MB/s\r")
+    real_close = process.stdout.close
 
     def fail_close():
+        real_close()
         raise RuntimeError("close failed")
 
     process.stdout.close = fail_close
