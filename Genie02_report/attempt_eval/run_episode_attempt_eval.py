@@ -218,6 +218,7 @@ def run_attempt_evaluation(
         if progress is not None:
             progress(done, total, "episode_complete")
 
+    _raise_if_cancelled(should_cancel)
     write_summary(output_dir, results)
     if progress is not None:
         progress(total, total, "complete")

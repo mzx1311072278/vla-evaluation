@@ -75,14 +75,17 @@ def test_empty_non_dry_run_writes_summary_without_constructing_client(tmp_path: 
         output_dir=tmp_path / "out",
     )
 
+    progress: list[tuple[int, int, str]] = []
     results = run_attempt_evaluation(
         config,
         episodes=[],
         client_factory=lambda *_args, **_kwargs: pytest.fail("VLM client constructed"),
+        progress=lambda done, total, stage: progress.append((done, total, stage)),
     )
 
     assert results == []
     assert load_attempt_summary(config.output_dir / "attempt_summary.json") == []
+    assert progress == [(0, 0, "initial"), (0, 0, "complete")]
 
 
 def test_attempt_eval_config_is_frozen(tmp_path: Path):
@@ -362,6 +365,76 @@ def test_cancellation_preserves_episode_files_without_overwriting_final_summary(
     assert (output_dir / "episode_results/episode_000.json").is_file()
     assert not (output_dir / "episode_results/episode_001.json").exists()
     assert summary_path.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_cancellation_after_final_episode_does_not_overwrite_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        service,
+        "_sample_episode_frames",
+        lambda *_args, **_kwargs: ([tmp_path / "frame.jpg"], []),
+    )
+
+    class FakeClient:
+        def analyze(self, *_args):
+            return _valid_vlm_result(), True
+
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    summary_path = output_dir / "attempt_summary.json"
+    summary_path.write_text("sentinel", encoding="utf-8")
+    cancellation_checks = iter([False, False, True])
+    progress: list[tuple[int, int, str]] = []
+    config = AttemptEvalConfig(
+        dataset_root=tmp_path,
+        model_path=tmp_path / "model",
+        output_dir=output_dir,
+    )
+
+    with pytest.raises(EvaluationCancelled, match="cancelled"):
+        run_attempt_evaluation(
+            config,
+            episodes=[_episode(tmp_path, 0)],
+            client_factory=lambda *_args, **_kwargs: FakeClient(),
+            progress=lambda done, total, stage: progress.append((done, total, stage)),
+            should_cancel=lambda: next(cancellation_checks),
+        )
+
+    assert (output_dir / "episode_results/episode_000.json").is_file()
+    assert summary_path.read_text(encoding="utf-8") == "sentinel"
+    assert progress == [(0, 1, "initial"), (1, 1, "episode_complete")]
+
+
+@pytest.mark.parametrize("existing_summary", [None, "sentinel"])
+def test_empty_cancelled_run_does_not_create_or_overwrite_summary(
+    tmp_path: Path, existing_summary: str | None
+):
+    output_dir = tmp_path / "out"
+    summary_path = output_dir / "attempt_summary.json"
+    if existing_summary is not None:
+        output_dir.mkdir()
+        summary_path.write_text(existing_summary, encoding="utf-8")
+    progress: list[tuple[int, int, str]] = []
+    config = AttemptEvalConfig(
+        dataset_root=tmp_path,
+        model_path=tmp_path / "model",
+        output_dir=output_dir,
+    )
+
+    with pytest.raises(EvaluationCancelled, match="cancelled"):
+        run_attempt_evaluation(
+            config,
+            episodes=[],
+            progress=lambda done, total, stage: progress.append((done, total, stage)),
+            should_cancel=lambda: True,
+        )
+
+    if existing_summary is None:
+        assert not summary_path.exists()
+    else:
+        assert summary_path.read_text(encoding="utf-8") == existing_summary
+    assert progress == [(0, 0, "initial")]
 
 
 def test_client_cancellation_is_not_converted_to_episode_fallback(
