@@ -1,0 +1,14 @@
+{
+	# Disable the admin API endpoint (not needed for a single reverse proxy).
+	admin off
+}
+
+# Replace vla-eval.local with this host's FQDN or IP address.
+# `tls internal` makes Caddy issue a certificate from its internal CA so the
+# site is HTTPS-only on :443 with no plaintext port. Install Caddy's root CA on
+# client machines (see docs/deployment/ubuntu-22.04.md) to avoid browser warnings.
+vla-eval.local {
+	tls internal
+
+	reverse_proxy web:8000
+}

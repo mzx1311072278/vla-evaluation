@@ -1,0 +1,108 @@
+# VLA evaluation service stack. See docs/deployment/ubuntu-22.04.md for the
+# full runbook (NVIDIA driver, Container Toolkit, host directory setup, etc.).
+# Validate locally with:  docker compose config --quiet
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - frontend
+    depends_on:
+      web:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.web
+    image: vla-eval-web:latest
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - /srv/vla-eval/data:/srv/vla-eval/data
+      - /srv/vla-eval/config:/srv/vla-eval/config:ro
+    networks:
+      - frontend
+      - backend
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  transfer-worker:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.transfer
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - /srv/vla-eval/data:/srv/vla-eval/data
+      - /srv/vla-eval/config:/srv/vla-eval/config:ro
+      - /srv/vla-eval/secrets:/run/secrets:ro
+    command: ["python", "-m", "vla_eval.cli", "worker", "--queue", "transfers"]
+    networks:
+      - frontend
+      - backend
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  evaluation-worker:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.evaluation
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - /srv/vla-eval/data:/srv/vla-eval/data
+      - /srv/vla-eval/config:/srv/vla-eval/config:ro
+      - /srv/vla-eval/models:/srv/vla-eval/data/models:ro
+      - /srv/vla-eval/secrets:/run/secrets:ro
+    command: ["python", "-m", "vla_eval.cli", "worker", "--queue", "evaluations"]
+    networks:
+      - backend
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    depends_on:
+      redis:
+        condition: service_healthy
+
+networks:
+  frontend:
+  backend:
+    internal: true
+
+volumes:
+  caddy_data:
+  caddy_config:
+  redis_data:
