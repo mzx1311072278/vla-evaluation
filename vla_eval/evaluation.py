@@ -13,11 +13,12 @@ from typing import Any
 from Genie02_report.genie02_episode_metrics import generate_episode_metrics
 from Genie02_report.genie02_eval_common import (
     load_episode_metrics,
+    load_episodes,
     load_metrics_core,
     load_session,
 )
 from Genie02_report.genie02_markdown_report import generate_markdown_report
-from Genie02_report.genie02_metrics_core import generate_metrics_core
+from Genie02_report.genie02_metrics_core import build_core_metrics, generate_metrics_core
 
 from .profiles import Profile
 
@@ -59,6 +60,12 @@ class EvaluationResult:
     metrics: dict[str, Any]
     report_path: Path
     vlm_summary_path: Path | None
+
+
+@dataclass(frozen=True)
+class _PersistedMetricsState:
+    metrics: dict[str, Any]
+    episode_indices: frozenset[int]
 
 
 class _ProgressEmitter:
@@ -141,6 +148,18 @@ def _artifact_matches(output_dir: Path, pattern: str) -> list[Path]:
 
 
 def _validate_output_contract(output_dir: Path, profile: Profile, report_path: Path) -> None:
+    resolved_report = _validate_regular_artifact(output_dir, report_path, "returned report")
+    relative_report = resolved_report.relative_to(output_dir.resolve(strict=True)).as_posix()
+    report_patterns = tuple(
+        pattern
+        for pattern in (*profile.outputs.required, *profile.outputs.optional)
+        if Path(pattern).name.startswith("report_") and pattern.endswith(".md")
+    )
+    if not any(fnmatchcase(relative_report, pattern) for pattern in report_patterns):
+        raise ValueError(
+            f"returned report does not match a profile report output pattern: {relative_report}"
+        )
+
     for pattern in profile.outputs.required:
         matches = _artifact_matches(output_dir, pattern)
         if not matches:
@@ -151,14 +170,6 @@ def _validate_output_contract(output_dir: Path, profile: Profile, report_path: P
         for path in _artifact_matches(output_dir, pattern):
             _validate_regular_artifact(output_dir, path, f"optional output {pattern}")
 
-    resolved_report = _validate_regular_artifact(output_dir, report_path, "returned report")
-    relative_report = resolved_report.relative_to(output_dir.resolve(strict=True)).as_posix()
-    allowlist = (*profile.outputs.required, *profile.outputs.optional)
-    if not any(fnmatchcase(relative_report, pattern) for pattern in allowlist):
-        raise ValueError(
-            f"returned report is not in the profile output allowlist: {relative_report}"
-        )
-
 
 def _nonnegative_int(value: Any, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -166,8 +177,40 @@ def _nonnegative_int(value: Any, field: str) -> int:
     return value
 
 
-def load_persisted_metrics(dataset_path: Path, output_dir: Path) -> dict[str, Any]:
-    """Load and cross-check persisted METRICS artifacts before a resumed stage."""
+def _compare_core_metrics(rebuilt: Any, persisted: Any, field: str = "metrics_core") -> None:
+    if isinstance(rebuilt, Mapping):
+        if not isinstance(persisted, Mapping):
+            raise TypeError(f"{field} must be an object")
+        if set(rebuilt) != set(persisted):
+            missing = sorted(set(rebuilt) - set(persisted))
+            unexpected = sorted(set(persisted) - set(rebuilt))
+            raise ValueError(f"{field} fields differ: missing={missing}, unexpected={unexpected}")
+        for key, value in rebuilt.items():
+            _compare_core_metrics(value, persisted[key], f"{field}.{key}")
+        return
+
+    if isinstance(rebuilt, bool) or isinstance(persisted, bool):
+        if type(rebuilt) is not type(persisted) or rebuilt != persisted:
+            raise ValueError(f"{field} does not match rebuilt metrics")
+        return
+    if isinstance(rebuilt, int):
+        if not isinstance(persisted, int) or persisted != rebuilt:
+            raise ValueError(f"{field} does not match rebuilt metrics")
+        return
+    if isinstance(rebuilt, float):
+        if (
+            not isinstance(persisted, (int, float))
+            or not math.isfinite(rebuilt)
+            or not math.isfinite(persisted)
+            or not math.isclose(rebuilt, persisted, rel_tol=1e-12, abs_tol=1e-12)
+        ):
+            raise ValueError(f"{field} does not match rebuilt metrics")
+        return
+    if type(rebuilt) is not type(persisted) or rebuilt != persisted:
+        raise ValueError(f"{field} does not match rebuilt metrics")
+
+
+def _load_persisted_metrics_state(dataset_path: Path, output_dir: Path) -> _PersistedMetricsState:
     missing = [
         path.name
         for path in (output_dir / "episode_metrics.csv", output_dir / "metrics_core.json")
@@ -180,38 +223,22 @@ def load_persisted_metrics(dataset_path: Path, output_dir: Path) -> dict[str, An
         )
     try:
         session = load_session(dataset_path)
+        episodes = load_episodes(dataset_path, session)
         episode_rows = load_episode_metrics(output_dir, session)
         metrics = load_metrics_core(output_dir, session)
-        if not episode_rows:
-            raise ValueError("episode_metrics.csv must contain at least one episode row")
-
-        n_episodes = _nonnegative_int(metrics["n_episodes"], "metrics_core.n_episodes")
-        n_success = _nonnegative_int(metrics["n_success"], "metrics_core.n_success")
-        n_failure = _nonnegative_int(metrics["n_failure"], "metrics_core.n_failure")
-        if n_episodes != len(episode_rows):
-            raise ValueError(
-                f"metrics_core.n_episodes={n_episodes} does not match "
-                f"episode_metrics.csv rows={len(episode_rows)}"
-            )
-        row_successes = sum(row["outcome"] == "success" for row in episode_rows)
-        if (n_success, n_failure) != (row_successes, len(episode_rows) - row_successes):
-            raise ValueError("metrics_core success/failure counts do not match episode_metrics.csv")
-
-        gsr = metrics["gsr"]
-        if isinstance(gsr, bool) or not isinstance(gsr, (int, float)) or not math.isfinite(gsr):
-            raise ValueError("metrics_core.gsr must be a finite number")
-        expected_gsr = n_success / n_episodes
-        if not 0.0 <= float(gsr) <= 1.0 or not math.isclose(
-            float(gsr), expected_gsr, rel_tol=0.0, abs_tol=1e-12
-        ):
-            raise ValueError("metrics_core.gsr does not match episode success counts")
-        for row in episode_rows:
-            duration = row["duration_s"]
-            if duration is None or not math.isfinite(duration) or duration < 0:
-                raise ValueError("episode_metrics.csv duration_s must be finite and non-negative")
-        return metrics
+        rebuilt = build_core_metrics(session, episodes, episode_rows)
+        _compare_core_metrics(rebuilt, metrics)
+        return _PersistedMetricsState(
+            metrics=metrics,
+            episode_indices=frozenset(int(row["episode_index"]) for row in episodes),
+        )
     except Exception as exc:
         raise ValueError(f"cannot load persisted metrics in {output_dir}: {exc}") from exc
+
+
+def load_persisted_metrics(dataset_path: Path, output_dir: Path) -> dict[str, Any]:
+    """Load and cross-check persisted METRICS artifacts before a resumed stage."""
+    return _load_persisted_metrics_state(dataset_path, output_dir).metrics
 
 
 def _optional_bool(value: Any, field: str) -> None:
@@ -284,6 +311,16 @@ def load_attempt_summary(path: Path) -> list[dict[str, Any]]:
                 raise TypeError(f"{field}.{name} must be a string")
         results.append(dict(value))
     return results
+
+
+def _validate_attempt_indices(results: list[dict[str, Any]], expected: frozenset[int]) -> None:
+    actual = frozenset(row["episode_index"] for row in results)
+    if actual != expected:
+        raise ValueError(
+            "attempt_summary.json episode indices do not match expected episodes: "
+            f"missing={sorted(expected - actual)}, "
+            f"unexpected={sorted(actual - expected)}"
+        )
 
 
 def run_profile_vlm(
@@ -373,11 +410,14 @@ def run_evaluation(
     if resume_from == "METRICS":
         stage_callbacks.on_stage("METRICS")
         stage_callbacks.on_progress(0.0)
-        generate_episode_metrics(dataset, output)
+        episode_rows = generate_episode_metrics(dataset, output)
+        expected_episode_indices = frozenset(row["episode_index"] for row in episode_rows)
         metrics = generate_metrics_core(dataset, output)
         stage_callbacks.on_progress(metrics_end)
     else:
-        metrics = load_persisted_metrics(dataset, output)
+        persisted = _load_persisted_metrics_state(dataset, output)
+        metrics = persisted.metrics
+        expected_episode_indices = persisted.episode_indices
         stage_callbacks.on_progress(metrics_end)
 
     _check_cancelled(stage_callbacks)
@@ -393,14 +433,11 @@ def run_evaluation(
             raise ValueError(
                 f"cannot resume REPORT with VLM enabled; missing required artifact: {vlm_path}"
             )
-        attempt_results = load_attempt_summary(vlm_path)
-        if len(attempt_results) != metrics["n_episodes"]:
-            raise ValueError(
-                "attempt_summary.json episode count does not match persisted metrics: "
-                f"{len(attempt_results)} != {metrics['n_episodes']}"
-            )
+        _validate_attempt_indices(load_attempt_summary(vlm_path), expected_episode_indices)
 
     _check_cancelled(stage_callbacks)
+    if vlm_path is not None and resume_from in {"METRICS", "VLM"}:
+        _validate_attempt_indices(load_attempt_summary(vlm_path), expected_episode_indices)
     stage_callbacks.on_stage("REPORT")
     stage_callbacks.on_progress(90.0 if vlm_enabled else 80.0)
     report_path = generate_markdown_report(dataset, output)

@@ -1,4 +1,5 @@
 import builtins
+import copy
 import csv
 import json
 import sys
@@ -46,7 +47,7 @@ def _callbacks(
 def _mock_metrics_and_report(monkeypatch: pytest.MonkeyPatch) -> None:
     def episode_metrics(_dataset, output):
         (output / "episode_metrics.csv").write_text("generated\n", encoding="utf-8")
-        return []
+        return [{"episode_index": 0}]
 
     def metrics_core(_dataset, output):
         (output / "metrics_core.json").write_text("{}", encoding="utf-8")
@@ -114,13 +115,46 @@ def _attempt_result() -> dict[str, Any]:
     }
 
 
+def _source_episode(**overrides: str) -> dict[str, str]:
+    return {
+        "episode_index": "0",
+        "outcome": "success",
+        "duration_s": "1.000",
+        **overrides,
+    }
+
+
+def _core_metrics() -> dict[str, Any]:
+    empty_summary = {"mean": None, "std": None, "min": None, "max": None, "n_episodes": 0}
+    return {
+        "schema_version": "1.0",
+        "session_id": "test-session",
+        "n_episodes": 1,
+        "n_success": 1,
+        "n_failure": 0,
+        "gsr": 1.0,
+        "mean_tts_success_s": 1.0,
+        "smoothness": {
+            "space": "joint",
+            "n_episodes": 0,
+            "left": dict(empty_summary),
+            "right": dict(empty_summary),
+        },
+    }
+
+
 def _mock_persisted_loaders(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "vla_eval.evaluation.load_session", lambda _dataset: {"session_id": "test-session"}
+        "vla_eval.evaluation.load_session",
+        lambda _dataset: {
+            "session_id": "test-session",
+            "rollout_mode": "default",
+        },
     )
+    monkeypatch.setattr("vla_eval.evaluation.load_episodes", lambda *_args: [_source_episode()])
     monkeypatch.setattr(
         "vla_eval.evaluation.load_metrics_core",
-        lambda *_args: {"n_episodes": 1, "n_success": 1, "n_failure": 0, "gsr": 1.0},
+        lambda *_args: _core_metrics(),
     )
 
 
@@ -310,10 +344,14 @@ def test_run_evaluation_calls_optional_vlm_between_metrics_and_report(
 ):
     stages: list[str] = []
     _mock_metrics_and_report(monkeypatch)
-    monkeypatch.setattr(
-        "vla_eval.evaluation.run_profile_vlm",
-        lambda _dataset, output, _profile, _callbacks: output / "attempt_summary.json",
-    )
+
+    def vlm(_dataset, output, _profile, _callbacks):
+        output.mkdir(parents=True)
+        path = output / "attempt_summary.json"
+        path.write_text(json.dumps([_attempt_result()]), encoding="utf-8")
+        return path
+
+    monkeypatch.setattr("vla_eval.evaluation.run_profile_vlm", vlm)
 
     result = run_evaluation(
         tmp_path,
@@ -780,16 +818,13 @@ def test_load_persisted_metrics_parses_episode_csv_and_checks_core_counts(
     output = tmp_path / "run"
     _persist_resume_artifacts(output)
     monkeypatch.setattr(
-        "vla_eval.evaluation.load_session", lambda _dataset: {"session_id": "test-session"}
+        "vla_eval.evaluation.load_session",
+        lambda _dataset: {"session_id": "test-session", "rollout_mode": "default"},
     )
+    monkeypatch.setattr("vla_eval.evaluation.load_episodes", lambda *_args: [_source_episode()])
     monkeypatch.setattr(
         "vla_eval.evaluation.load_metrics_core",
-        lambda *_args: {
-            "n_episodes": 1,
-            "n_success": 1,
-            "n_failure": 0,
-            "gsr": 1.0,
-        },
+        lambda *_args: _core_metrics(),
     )
 
     metrics = evaluation.load_persisted_metrics(tmp_path, output)
@@ -816,8 +851,10 @@ def test_load_persisted_metrics_rejects_inconsistent_numeric_essentials(
     output = tmp_path / "run"
     _persist_resume_artifacts(output)
     monkeypatch.setattr(
-        "vla_eval.evaluation.load_session", lambda _dataset: {"session_id": "test-session"}
+        "vla_eval.evaluation.load_session",
+        lambda _dataset: {"session_id": "test-session", "rollout_mode": "default"},
     )
+    monkeypatch.setattr("vla_eval.evaluation.load_episodes", lambda *_args: [_source_episode()])
     monkeypatch.setattr("vla_eval.evaluation.load_metrics_core", lambda *_args: metrics)
 
     with pytest.raises(ValueError, match="persisted metrics"):
@@ -831,8 +868,10 @@ def test_resume_validates_episode_metrics_before_starting_vlm(
     _persist_resume_artifacts(output)
     (output / "episode_metrics.csv").write_text("wrong,columns\n1,2\n", encoding="utf-8")
     monkeypatch.setattr(
-        "vla_eval.evaluation.load_session", lambda _dataset: {"session_id": "test-session"}
+        "vla_eval.evaluation.load_session",
+        lambda _dataset: {"session_id": "test-session", "rollout_mode": "default"},
     )
+    monkeypatch.setattr("vla_eval.evaluation.load_episodes", lambda *_args: [_source_episode()])
     monkeypatch.setattr(
         "vla_eval.evaluation.run_profile_vlm", lambda *_args: pytest.fail("VLM started")
     )
@@ -878,11 +917,13 @@ def test_resume_report_validates_attempt_summary_before_report(
     summary.parent.mkdir()
     summary.write_text("{not-json", encoding="utf-8")
     monkeypatch.setattr(
-        "vla_eval.evaluation.load_session", lambda _dataset: {"session_id": "test-session"}
+        "vla_eval.evaluation.load_session",
+        lambda _dataset: {"session_id": "test-session", "rollout_mode": "default"},
     )
+    monkeypatch.setattr("vla_eval.evaluation.load_episodes", lambda *_args: [_source_episode()])
     monkeypatch.setattr(
         "vla_eval.evaluation.load_metrics_core",
-        lambda *_args: {"n_episodes": 1, "n_success": 1, "n_failure": 0, "gsr": 1.0},
+        lambda *_args: _core_metrics(),
     )
     monkeypatch.setattr(
         "vla_eval.evaluation.generate_markdown_report",
@@ -988,6 +1029,181 @@ def test_output_preflight_rejects_child_symlinks_before_writers(
         run_evaluation(
             tmp_path,
             output,
+            load_profile(PROFILE_PATH),
+            False,
+            _callbacks(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("corruption", "value"),
+    [
+        ("mean_tts_success_s", 99.0),
+        ("smoothness", 99.0),
+        ("source_index", "1"),
+        ("source_outcome", "failure"),
+        ("source_duration", "2.000"),
+    ],
+)
+def test_persisted_metrics_rebuild_rejects_complete_core_or_source_corruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+    value: Any,
+):
+    from vla_eval import evaluation
+
+    output = tmp_path / "run"
+    _persist_resume_artifacts(output)
+    session = {"session_id": "test-session", "rollout_mode": "default"}
+    source = _source_episode()
+    persisted = copy.deepcopy(_core_metrics())
+    if corruption == "smoothness":
+        persisted["smoothness"]["left"]["mean"] = value
+    elif corruption.startswith("source_"):
+        source_field = {
+            "source_index": "episode_index",
+            "source_outcome": "outcome",
+            "source_duration": "duration_s",
+        }[corruption]
+        source[source_field] = value
+    else:
+        persisted[corruption] = value
+    monkeypatch.setattr("vla_eval.evaluation.load_session", lambda _dataset: session)
+    monkeypatch.setattr("vla_eval.evaluation.load_episodes", lambda *_args: [source])
+    monkeypatch.setattr("vla_eval.evaluation.load_metrics_core", lambda *_args: persisted)
+
+    with pytest.raises(ValueError, match="persisted metrics"):
+        evaluation.load_persisted_metrics(tmp_path, output)
+
+
+def test_zero_episode_metrics_support_initial_run_and_report_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    output = tmp_path / "run"
+    fieldnames = (
+        "session_id",
+        "episode_index",
+        "outcome",
+        "duration_s",
+        "smoothness",
+        "left_smoothness",
+        "right_smoothness",
+        "smoothness_space",
+        "smoothness_frames",
+        "smoothness_skipped_reason",
+    )
+    zero_core = _core_metrics()
+    zero_core.update(
+        n_episodes=0,
+        n_success=0,
+        n_failure=0,
+        gsr=0.0,
+        mean_tts_success_s=None,
+    )
+
+    def episode_metrics(_dataset, actual_output):
+        with (actual_output / "episode_metrics.csv").open(
+            "w", encoding="utf-8", newline=""
+        ) as handle:
+            csv.DictWriter(handle, fieldnames=fieldnames).writeheader()
+        return []
+
+    def metrics_core(_dataset, actual_output):
+        (actual_output / "metrics_core.json").write_text(json.dumps(zero_core), encoding="utf-8")
+        return zero_core
+
+    def report(_dataset, actual_output):
+        path = actual_output / "report_20260805.md"
+        path.write_text("# empty report\n", encoding="utf-8")
+        return path
+
+    monkeypatch.setattr("vla_eval.evaluation.generate_episode_metrics", episode_metrics)
+    monkeypatch.setattr("vla_eval.evaluation.generate_metrics_core", metrics_core)
+    monkeypatch.setattr("vla_eval.evaluation.generate_markdown_report", report)
+    profile = load_profile(PROFILE_PATH)
+
+    first = run_evaluation(tmp_path, output, profile, False, _callbacks())
+    assert first.metrics["n_episodes"] == 0
+
+    monkeypatch.setattr(
+        "vla_eval.evaluation.load_session",
+        lambda _dataset: {"session_id": "test-session", "rollout_mode": "default"},
+    )
+    monkeypatch.setattr("vla_eval.evaluation.load_episodes", lambda *_args: [])
+    monkeypatch.setattr("vla_eval.evaluation.load_metrics_core", lambda *_args: zero_core)
+    resumed = run_evaluation(
+        tmp_path,
+        output,
+        profile,
+        False,
+        _callbacks(),
+        resume_from="REPORT",
+    )
+    assert resumed.metrics["n_episodes"] == 0
+
+
+@pytest.mark.parametrize("branch", ["new-vlm", "report-resume"])
+@pytest.mark.parametrize("indices", [[], [0, 0], [1], [0, 1]])
+def test_attempt_summary_indices_must_exactly_match_before_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    branch: str,
+    indices: list[int],
+):
+    output = tmp_path / "run"
+    _mock_metrics_and_report(monkeypatch)
+    monkeypatch.setattr(
+        "vla_eval.evaluation.generate_markdown_report",
+        lambda *_args: pytest.fail("report started"),
+    )
+
+    def write_summary(path: Path) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps([{**_attempt_result(), "episode_index": index} for index in indices]),
+            encoding="utf-8",
+        )
+        return path
+
+    if branch == "new-vlm":
+        monkeypatch.setattr(
+            "vla_eval.evaluation.run_profile_vlm",
+            lambda _dataset, vlm_output, _profile, _callbacks: write_summary(
+                vlm_output / "attempt_summary.json"
+            ),
+        )
+        resume_from = "METRICS"
+    else:
+        _persist_resume_artifacts(output)
+        _mock_persisted_loaders(monkeypatch)
+        write_summary(output / "attempt_eval/attempt_summary.json")
+        resume_from = "REPORT"
+
+    with pytest.raises(ValueError, match="attempt_summary.json.*episode indices|duplicated"):
+        run_evaluation(
+            tmp_path,
+            output,
+            load_profile(PROFILE_PATH),
+            True,
+            _callbacks(),
+            resume_from=resume_from,
+        )
+
+
+def test_returned_report_cannot_be_another_required_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _mock_metrics_and_report(monkeypatch)
+    monkeypatch.setattr(
+        "vla_eval.evaluation.generate_markdown_report",
+        lambda _dataset, output: output / "metrics_core.json",
+    )
+
+    with pytest.raises(ValueError, match="report output pattern"):
+        run_evaluation(
+            tmp_path,
+            tmp_path / "run",
             load_profile(PROFILE_PATH),
             False,
             _callbacks(),
