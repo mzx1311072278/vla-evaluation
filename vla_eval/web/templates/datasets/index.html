@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}数据集 | VLA Evaluation{% endblock %}
+{% block content %}
+  <section>
+    <div class="page-heading">
+      <div><p class="eyebrow">数据管理</p><h1>数据集</h1></div>
+      <a class="button" href="/imports/new">导入数据</a>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>名称</th><th>类型</th><th>状态</th><th>Episode</th><th>大小</th><th><span class="sr-only">操作</span></th></tr></thead>
+        <tbody>
+          {% for dataset in datasets %}
+            <tr><td><a href="/datasets/{{ dataset.id }}">{{ dataset.name }}</a><small class="path">{{ dataset.path }}</small></td>
+              <td>{{ dataset.kind }}</td><td><span class="status status-{{ dataset.status|lower }}">{{ dataset.status }}</span></td>
+              <td>{{ dataset.episode_count }}</td><td>{{ dataset.size_bytes }} B</td><td><a href="/datasets/{{ dataset.id }}">查看</a></td></tr>
+          {% else %}<tr><td colspan="6" class="empty">暂无数据集</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

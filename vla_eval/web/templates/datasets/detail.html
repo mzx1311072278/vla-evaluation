@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}{{ dataset.name }} | 数据集{% endblock %}
+{% block content %}
+  <section>
+    <div class="page-heading">
+      <div><p class="eyebrow">数据集</p><h1>{{ dataset.name }}</h1></div>
+      {% if dataset.status == "READY" %}<a class="button" href="/evaluations/new?dataset_id={{ dataset.id }}">开始评测</a>
+      {% else %}<span class="button disabled" aria-disabled="true">暂不可评测</span>{% endif %}
+    </div>
+    <dl class="summary-grid">
+      <div><dt>状态</dt><dd><span class="status status-{{ dataset.status|lower }}">{{ dataset.status }}</span></dd></div>
+      <div><dt>类型</dt><dd>{{ dataset.kind }}</dd></div>
+      <div><dt>Episode</dt><dd>{{ dataset.episode_count }}</dd></div>
+      <div><dt>大小</dt><dd>{{ dataset.size_bytes }} B</dd></div>
+    </dl>
+    <section class="detail-band">
+      <h2>存储路径</h2>
+      <div class="path-row"><code class="path">{{ dataset.path }}</code><button class="icon-button" type="button" data-copy="{{ dataset.path }}" title="复制路径" aria-label="复制路径"><i data-lucide="copy"></i></button></div>
+    </section>
+    <section class="detail-band">
+      <h2>预检摘要</h2>
+      {% set errors = dataset.inspection_json.get('errors', []) %}
+      {% if errors %}<ul class="error-list">{% for error in errors %}<li>{{ error }}</li>{% endfor %}</ul>
+      {% else %}<p class="muted">未发现预检问题。</p>{% endif %}
+    </section>
+    <section class="detail-band">
+      <h2>附件</h2>
+      <form method="post" action="/datasets/{{ dataset.id }}/attachments" enctype="multipart/form-data" class="attachment-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label for="attachment">选择附件<input id="attachment" name="file" type="file" accept=".json,.yaml,.yml,.csv" required></label>
+        <button type="submit">上传附件</button>
+      </form>
+    </section>
+  </section>
+{% endblock %}

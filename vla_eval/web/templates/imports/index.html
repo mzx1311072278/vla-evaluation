@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}导入任务 | VLA Evaluation{% endblock %}
+{% block content %}
+  <section>
+    <div class="page-heading">
+      <div><p class="eyebrow">数据接入</p><h1>导入任务</h1></div>
+      <a class="button" href="/imports/new">新建导入</a>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>目标</th><th>来源</th><th>状态</th><th>进度</th><th><span class="sr-only">操作</span></th></tr></thead>
+        <tbody>
+          {% for job in jobs %}
+            <tr>
+              <td><a href="/imports/{{ job.id }}">{{ job.target_name }}</a><small class="path">{{ job.remote_path }}</small></td>
+              <td>{{ job.source_name }}</td><td><span class="status status-{{ job.state|lower }}">{{ job.state }}</span></td>
+              <td>{{ "%.0f"|format(job.progress) }}%</td><td><a href="/imports/{{ job.id }}">查看</a></td>
+            </tr>
+          {% else %}<tr><td colspan="5" class="empty">暂无导入任务</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

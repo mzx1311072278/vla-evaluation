@@ -1,18 +1,15 @@
 from pathlib import Path
-from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 
-from vla_eval.models import User
 from vla_eval.security import (
     authenticate_user,
     get_current_user,
     new_csrf_token,
     require_csrf,
-    require_html_user,
 )
 
 router = APIRouter()
@@ -75,15 +72,3 @@ async def logout(request: Request):
     require_csrf(request, form.getlist("csrf_token"))
     request.session.clear()
     return RedirectResponse("/login", status_code=303)
-
-
-@router.get("/datasets", name="datasets")
-def datasets_placeholder(
-    request: Request,
-    current_user: Annotated[User, Depends(require_html_user)],
-):
-    return templates.TemplateResponse(
-        request=request,
-        name="base.html",
-        context={"current_user": current_user, "csrf_token": request.session["csrf_token"]},
-    )

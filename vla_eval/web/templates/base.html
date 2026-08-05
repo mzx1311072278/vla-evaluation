@@ -4,42 +4,39 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}VLA Evaluation{% endblock %}</title>
-    <style>
-      :root { color-scheme: light; font-family: Inter, system-ui, sans-serif; color: #18201d; }
-      * { box-sizing: border-box; }
-      body { margin: 0; background: #f4f6f5; }
-      header { min-height: 3.5rem; padding: .75rem clamp(1rem, 4vw, 2rem); display: flex;
-        align-items: center; justify-content: space-between; gap: 1rem; background: #fff;
-        border-bottom: 1px solid #d9dfdc; }
-      header strong { overflow-wrap: anywhere; }
-      main { width: min(100% - 2rem, 28rem); margin: clamp(2rem, 10vh, 6rem) auto; }
-      form { display: grid; gap: 1rem; }
-      label { display: grid; gap: .4rem; font-weight: 600; }
-      input { width: 100%; min-height: 2.75rem; padding: .65rem .75rem; border: 1px solid #aab5b0;
-        border-radius: 4px; background: #fff; color: inherit; font: inherit; }
-      input:focus { outline: 3px solid #9cc9b6; outline-offset: 1px; border-color: #236b4e; }
-      button { min-height: 2.75rem; padding: .65rem 1rem; border: 0; border-radius: 4px;
-        background: #175c42; color: #fff; font: inherit; font-weight: 700; cursor: pointer; }
-      button:focus { outline: 3px solid #8cbba7; outline-offset: 2px; }
-      .logout { display: block; }
-      .logout button { min-height: 2.25rem; padding: .4rem .75rem; }
-      .panel { padding: clamp(1rem, 5vw, 1.5rem); background: #fff; border: 1px solid #d9dfdc;
-        border-radius: 6px; }
-      h1 { margin: 0 0 1.5rem; font-size: 1.5rem; letter-spacing: 0; overflow-wrap: anywhere; }
-      .error { margin: 0 0 1rem; padding: .75rem; border-left: 4px solid #b42318;
-        background: #fff1f0; color: #7a271a; overflow-wrap: anywhere; }
-    </style>
+    <link rel="stylesheet" href="/static/app.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
+    <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
   </head>
-  <body>
+  <body class="{% if current_user %}authenticated{% else %}signed-out{% endif %}">
     {% if current_user %}
-      <header>
-        <strong>VLA Evaluation</strong>
+      <header class="app-header">
+        <div class="header-primary">
+          <a class="brand" href="/datasets">VLA Evaluation</a>
+          <nav aria-label="主导航">
+            <a href="/datasets">数据集</a>
+            <a href="/imports">导入任务</a>
+          </nav>
+        </div>
         <form class="logout" method="post" action="/logout">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <button type="submit">退出</button>
+          <button class="icon-button header-action" type="submit" title="退出" aria-label="退出"><i data-lucide="log-out"></i></button>
         </form>
       </header>
     {% endif %}
     <main>{% block content %}{% endblock %}</main>
+    <script>
+      document.addEventListener("DOMContentLoaded", () => {
+        if (window.lucide) window.lucide.createIcons();
+        document.addEventListener("htmx:afterSwap", () => {
+          if (window.lucide) window.lucide.createIcons();
+        });
+        document.addEventListener("click", async (event) => {
+          const button = event.target.closest("[data-copy]");
+          if (!button || !navigator.clipboard) return;
+          await navigator.clipboard.writeText(button.dataset.copy);
+        });
+      });
+    </script>
   </body>
 </html>

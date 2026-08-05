@@ -9,7 +9,7 @@ from sqlalchemy import Engine
 
 from Genie02_report.genie02_eval_common import EPISODE_METRIC_FIELDS
 from tests.fakes import FakeQueueBundle
-from vla_eval.config import AppConfig
+from vla_eval.config import AppConfig, RemoteSource
 from vla_eval.db import session_scope
 from vla_eval.models import Dataset, EvaluationJob, User
 from vla_eval.security import hash_password
@@ -38,12 +38,24 @@ def extract_csrf(html: str) -> str:
 
 @pytest.fixture
 def app_config(data_root: Path) -> AppConfig:
+    credentials = data_root / "credentials"
+    credentials.mkdir()
     return AppConfig(
         data_root=data_root,
         database_url="sqlite://",
         redis_url="redis://unused.invalid/0",
         session_secret="test-session-secret",
-        remote_sources={},
+        remote_sources={
+            "lab-a": RemoteSource(
+                name="lab-a",
+                host="lab-a.example.test",
+                port=22,
+                username="reader",
+                key_path=credentials / "lab-a-key",
+                known_hosts_path=credentials / "known_hosts",
+                roots=("/srv/datasets", "/srv/archive"),
+            )
+        },
     )
 
 
