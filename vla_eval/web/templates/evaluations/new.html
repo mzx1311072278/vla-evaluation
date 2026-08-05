@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}新建评测 | VLA Evaluation{% endblock %}
+{% block content %}
+  <section>
+    <p class="eyebrow">评测</p><h1>新建评测</h1>
+    <form method="post" action="/evaluations" class="form-layout">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="dataset_id" value="{{ dataset.id }}">
+      <div>
+        <span class="eyebrow">数据集</span>
+        <p><a href="/datasets/{{ dataset.id }}">{{ dataset.name }}</a></p>
+      </div>
+      <label for="profile">评测配置
+        <select id="profile" name="profile" required>
+          {% for name in profiles %}<option value="{{ name }}" {% if name == profile_name %}selected{% endif %}>{{ name }}</option>{% endfor %}
+        </select>
+      </label>
+      <label for="vlm-enabled">VLM 评测
+        <select id="vlm-enabled" name="vlm_enabled" required>
+          <option value="false" selected>禁用</option>
+          <option value="true">启用</option>
+        </select>
+      </label>
+      <div class="commands"><button type="submit">开始评测</button><a href="/datasets/{{ dataset.id }}">取消</a></div>
+    </form>
+  </section>
+{% endblock %}

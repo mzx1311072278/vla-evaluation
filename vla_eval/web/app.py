@@ -10,6 +10,7 @@ from vla_eval.config import AppConfig, require_session_secret
 from vla_eval.queueing import QueueBundle
 from vla_eval.web.routes_auth import router as auth_router
 from vla_eval.web.routes_datasets import router as datasets_router
+from vla_eval.web.routes_evaluations import router as evaluations_router
 from vla_eval.web.routes_imports import router as imports_router
 
 
@@ -34,5 +35,6 @@ def create_app(config: AppConfig, engine: Engine, queues: QueueBundle) -> FastAP
     )
     app.include_router(auth_router)
     app.include_router(datasets_router)
+    app.include_router(evaluations_router)
     app.include_router(imports_router)
     return app
