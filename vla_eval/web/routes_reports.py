@@ -36,6 +36,8 @@ _EXACT_WHITELIST = frozenset(
         "smoothness_curve.svg",
     }
 )
+_OUTCOME_FILTERS = frozenset({"success", "failure", "all"})
+_REVIEW_FILTERS = frozenset({"needs_review", "reviewed", "ok", "all"})
 
 
 def _template_context(request: Request, current_user: User, **values):
@@ -133,6 +135,32 @@ def _load_attempt_summary(output_dir: Path) -> dict[int, dict[str, Any]]:
     return attempts
 
 
+def _format_timestamp(value: Any) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return f"{float(value):.3f}"
+    return str(value)
+
+
+def _episode_evidence(attempt: dict[str, Any] | None) -> tuple[str | None, str | None]:
+    """Return (video_path, timestamp_range) evidence locator for a failed episode.
+
+    The attempt-eval writer stores ``video_file``/``from_timestamp``/``to_timestamp``
+    on each summary row; ``load_attempt_summary`` preserves these extra fields.
+    """
+    if not attempt:
+        return None, None
+    video_file = attempt.get("video_file")
+    evidence_path = video_file if isinstance(video_file, str) and video_file else None
+    from_ts = _format_timestamp(attempt.get("from_timestamp"))
+    to_ts = _format_timestamp(attempt.get("to_timestamp"))
+    evidence_range: str | None = None
+    if from_ts is not None or to_ts is not None:
+        evidence_range = f"{from_ts or '—'} → {to_ts or '—'}"
+    return evidence_path, evidence_range
+
+
 def _build_episodes(
     rows: list[dict[str, str]], attempts: dict[int, dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -144,6 +172,10 @@ def _build_episodes(
             index = None
         outcome = row.get("outcome", "") or ""
         attempt = attempts.get(index) if index is not None else None
+        evidence_path: str | None = None
+        evidence_range: str | None = None
+        if outcome == "failure":
+            evidence_path, evidence_range = _episode_evidence(attempt)
         episodes.append(
             {
                 "index": index,
@@ -151,8 +183,45 @@ def _build_episodes(
                 "duration": row.get("duration_s", "") or "—",
                 "smoothness": row.get("smoothness", "") or "—",
                 "vlm": attempt,
+                "evidence_path": evidence_path,
+                "evidence_range": evidence_range,
             }
         )
+    return episodes
+
+
+def _parse_report_filters(request: Request) -> tuple[str, str]:
+    """Parse and strictly validate the optional outcome/review query filters."""
+    outcome_values = request.query_params.getlist("outcome")
+    review_values = request.query_params.getlist("review")
+    if len(outcome_values) > 1 or len(review_values) > 1:
+        raise HTTPException(status_code=422, detail="Invalid report filter")
+    outcome = outcome_values[0].strip() if outcome_values else "all"
+    review = review_values[0].strip() if review_values else "all"
+    if outcome not in _OUTCOME_FILTERS or review not in _REVIEW_FILTERS:
+        raise HTTPException(status_code=422, detail="Invalid report filter")
+    return outcome, review
+
+
+def _apply_review_filter(
+    episodes: list[dict[str, Any]], review: str
+) -> list[dict[str, Any]]:
+    if review == "needs_review":
+        return [
+            episode
+            for episode in episodes
+            if episode["vlm"] is not None
+            and episode["vlm"].get("needs_manual_review") is True
+        ]
+    if review == "reviewed":
+        return [episode for episode in episodes if episode["vlm"] is not None]
+    if review == "ok":
+        return [
+            episode
+            for episode in episodes
+            if episode["vlm"] is not None
+            and episode["vlm"].get("needs_manual_review") is False
+        ]
     return episodes
 
 
@@ -222,7 +291,18 @@ def report_detail(
     metrics = _load_core_metrics(output_dir)
     rows = _load_episode_rows(output_dir)
     attempts = _load_attempt_summary(output_dir)
+    has_vlm = bool(attempts)
+    outcome_filter, review_filter = _parse_report_filters(request)
     episodes = _build_episodes(rows, attempts)
+    total_episodes = len(episodes)
+    if outcome_filter != "all":
+        episodes = [
+            episode for episode in episodes if episode["outcome"] == outcome_filter
+        ]
+    # The review filter is a no-op when no VLM data is present.
+    if has_vlm and review_filter != "all":
+        episodes = _apply_review_filter(episodes, review_filter)
+    shown_episodes = len(episodes)
     pending_review = sum(
         1
         for attempt in attempts.values()
@@ -256,10 +336,14 @@ def report_detail(
             dataset=dataset,
             headline=headline,
             episodes=episodes,
-            has_vlm=bool(attempts),
+            has_vlm=has_vlm,
             pending_review=pending_review,
             provenance=provenance_view,
             downloads=downloads,
+            total_episodes=total_episodes,
+            shown_episodes=shown_episodes,
+            filter_outcome=outcome_filter,
+            filter_review=review_filter,
         ),
     )
 

@@ -344,6 +344,9 @@ def test_report_renders_vlm_review_alongside_original_outcome(
                     review_mode="manual_review",
                     reason="gripper did not close",
                     confidence=0.2,
+                    video_file="rollouts/episode_001.mp4",
+                    from_timestamp=1.5,
+                    to_timestamp=3.25,
                 ),
             ]
         ),
@@ -362,6 +365,159 @@ def test_report_renders_vlm_review_alongside_original_outcome(
     assert "VLM" in response.text
     # 待复核 counts the single needs_manual_review row.
     assert "待复核" in response.text
+    # Failed episode surfaces the evidence-frame locator from the attempt row
+    # (video_file + timestamp range), alongside the VLM reason.
+    assert "rollouts/episode_001.mp4" in response.text
+    assert "1.500" in response.text
+    assert "3.250" in response.text
+
+
+def test_report_episode_filters(auth_client, db_engine, ready_dataset, user, data_root):
+    metrics = {
+        "schema_version": "1.0",
+        "session_id": "ready-dataset",
+        "n_episodes": 3,
+        "n_success": 2,
+        "n_failure": 1,
+        "gsr": 0.667,
+        "mean_tts_success_s": 1.0,
+        "smoothness": {
+            "space": "joint",
+            "left": {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "n_episodes": 3},
+            "right": {
+                "mean": None,
+                "std": None,
+                "min": None,
+                "max": None,
+                "n_episodes": 0,
+            },
+            "n_episodes": 3,
+        },
+    }
+    episode_rows = [
+        {
+            "session_id": "ready-dataset",
+            "episode_index": 0,
+            "outcome": "success",
+            "duration_s": "1.100",
+            "smoothness": "0",
+            "left_smoothness": "0",
+            "right_smoothness": "",
+            "smoothness_space": "joint",
+            "smoothness_frames": 4,
+            "smoothness_skipped_reason": "",
+        },
+        {
+            "session_id": "ready-dataset",
+            "episode_index": 1,
+            "outcome": "success",
+            "duration_s": "2.200",
+            "smoothness": "0",
+            "left_smoothness": "0",
+            "right_smoothness": "",
+            "smoothness_space": "joint",
+            "smoothness_frames": 4,
+            "smoothness_skipped_reason": "",
+        },
+        {
+            "session_id": "ready-dataset",
+            "episode_index": 2,
+            "outcome": "failure",
+            "duration_s": "3.300",
+            "smoothness": "0",
+            "left_smoothness": "0",
+            "right_smoothness": "",
+            "smoothness_space": "joint",
+            "smoothness_frames": 4,
+            "smoothness_skipped_reason": "",
+        },
+    ]
+    job, _output_dir = _make_succeeded_job(
+        db_engine,
+        ready_dataset,
+        user,
+        data_root,
+        slug="filter-job",
+        metrics=metrics,
+        episode_rows=episode_rows,
+    )
+    attempt_dir = Path(job.output_dir) / "attempt_eval"
+    attempt_dir.mkdir()
+    (attempt_dir / "attempt_summary.json").write_text(
+        json.dumps(
+            [
+                _attempt_row(0, needs_manual_review=False, review_mode="auto_review"),
+                _attempt_row(1, needs_manual_review=True, review_mode="manual_review"),
+                _attempt_row(2, needs_manual_review=True, review_mode="manual_review"),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    base = f"/reports/{job.id}"
+
+    # No filter: all three episodes shown.
+    response = auth_client.get(base)
+    assert response.status_code == 200
+    assert "显示 3 / 3 个 episode" in response.text
+    assert "1.100" in response.text
+    assert "2.200" in response.text
+    assert "3.300" in response.text
+
+    # Filter by outcome=failure -> only the failed episode (duration 3.300).
+    response = auth_client.get(f"{base}?outcome=failure")
+    assert response.status_code == 200
+    assert "显示 1 / 3 个 episode" in response.text
+    assert "3.300" in response.text
+    assert "1.100" not in response.text
+    assert "2.200" not in response.text
+
+    # Filter by outcome=success -> the two success episodes.
+    response = auth_client.get(f"{base}?outcome=success")
+    assert response.status_code == 200
+    assert "显示 2 / 3 个 episode" in response.text
+    assert "1.100" in response.text
+    assert "2.200" in response.text
+    assert "3.300" not in response.text
+
+    # Filter by review=needs_review -> the two flagged episodes (indices 1 and 2).
+    response = auth_client.get(f"{base}?review=needs_review")
+    assert response.status_code == 200
+    assert "显示 2 / 3 个 episode" in response.text
+    assert "2.200" in response.text
+    assert "3.300" in response.text
+    assert "1.100" not in response.text
+
+    # Filter by review=ok -> the single clean-reviewed episode (index 0).
+    response = auth_client.get(f"{base}?review=ok")
+    assert response.status_code == 200
+    assert "显示 1 / 3 个 episode" in response.text
+    assert "1.100" in response.text
+    assert "2.200" not in response.text
+    assert "3.300" not in response.text
+
+    # Combined outcome=success + review=needs_review -> only episode 1.
+    response = auth_client.get(f"{base}?outcome=success&review=needs_review")
+    assert response.status_code == 200
+    assert "显示 1 / 3 个 episode" in response.text
+    assert "2.200" in response.text
+    assert "1.100" not in response.text
+
+    # Invalid filter values are rejected with 422.
+    assert auth_client.get(f"{base}?outcome=bogus").status_code == 422
+    assert auth_client.get(f"{base}?review=bogus").status_code == 422
+    # Duplicate filter params are rejected.
+    assert (
+        auth_client.get(f"{base}?outcome=success&outcome=failure").status_code == 422
+    )
+
+
+def test_report_review_filter_noop_without_vlm(auth_client, successful_job):
+    # successful_job has no attempt_summary.json; a review filter must be a no-op
+    # (200, all episodes still shown).
+    response = auth_client.get(f"/reports/{successful_job.id}?review=needs_review")
+    assert response.status_code == 200
+    assert "显示 1 / 1 个 episode" in response.text
 
 
 def test_download_rejects_attempt_summary_outside_dir(auth_client, successful_job):

@@ -33,6 +33,25 @@
     <section class="detail-band">
       <h2>Episode 明细</h2>
       {% if episodes %}
+        <form method="get" action="/reports/{{ job.id }}" aria-label="筛选 episode" style="display:flex; flex-wrap:wrap; gap:1rem; align-items:flex-end; margin-bottom:1rem;">
+          <label>结果
+            <select name="outcome">
+              <option value="all" {{ 'selected' if filter_outcome == 'all' else '' }}>全部</option>
+              <option value="success" {{ 'selected' if filter_outcome == 'success' else '' }}>成功</option>
+              <option value="failure" {{ 'selected' if filter_outcome == 'failure' else '' }}>失败</option>
+            </select>
+          </label>
+          <label>复核状态
+            <select name="review">
+              <option value="all" {{ 'selected' if filter_review == 'all' else '' }}>全部</option>
+              <option value="needs_review" {{ 'selected' if filter_review == 'needs_review' else '' }}>待复核</option>
+              <option value="reviewed" {{ 'selected' if filter_review == 'reviewed' else '' }}>已复核</option>
+              <option value="ok" {{ 'selected' if filter_review == 'ok' else '' }}>复核通过</option>
+            </select>
+          </label>
+          <button type="submit">筛选</button>
+        </form>
+        <p class="muted">显示 {{ shown_episodes }} / {{ total_episodes }} 个 episode</p>
         <div class="table-scroll">
           <table>
             <thead>
@@ -41,7 +60,7 @@
                 <th>结果</th>
                 <th>时长</th>
                 <th>平滑度</th>
-                {% if has_vlm %}<th>VLM 复核</th><th>VLM 原因</th>{% endif %}
+                {% if has_vlm %}<th>VLM 复核</th><th>VLM 原因</th><th>证据帧</th>{% endif %}
               </tr>
             </thead>
             <tbody>
@@ -67,6 +86,12 @@
                       {% else %}—{% endif %}
                     </td>
                     <td>{% if episode.vlm and episode.vlm.get('reason') %}{{ episode.vlm.reason }}{% else %}—{% endif %}</td>
+                    <td>
+                      {% if episode.outcome == 'failure' and episode.evidence_path %}
+                        <div class="path-row"><code class="path">{{ episode.evidence_path }}</code><button class="icon-button" type="button" data-copy="{{ episode.evidence_path }}" title="复制路径" aria-label="复制路径"><i data-lucide="copy"></i></button></div>
+                        {% if episode.evidence_range %}<small>{{ episode.evidence_range }}</small>{% endif %}
+                      {% else %}—{% endif %}
+                    </td>
                   {% endif %}
                 </tr>
               {% endfor %}
