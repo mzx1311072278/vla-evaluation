@@ -40,9 +40,7 @@ class UTCDateTime(TypeDecorator[datetime]):
 class PersistedModel:
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_string)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utc_now)
-    updated_at: Mapped[datetime] = mapped_column(
-        UTCDateTime(), default=_utc_now, onupdate=_utc_now
-    )
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utc_now, onupdate=_utc_now)
 
 
 class User(PersistedModel, Base):
@@ -80,6 +78,7 @@ class ImportJob(PersistedModel, Base):
     target_name: Mapped[str] = mapped_column(String(255))
     state: Mapped[str] = mapped_column(String(32), default="QUEUED")
     progress: Mapped[float] = mapped_column(Float, default=0.0)
+    execution_token: Mapped[str | None] = mapped_column(String(36), default=None, index=True)
     publish_fingerprint: Mapped[str | None] = mapped_column(String(64), default=None)
     error_code: Mapped[str | None] = mapped_column(String(64), default=None)
     error_message: Mapped[str | None] = mapped_column(Text, default=None)
@@ -97,6 +96,7 @@ class EvaluationJob(PersistedModel, Base):
     state: Mapped[str] = mapped_column(String(32), default="QUEUED")
     stage: Mapped[str] = mapped_column(String(32), default="PENDING")
     progress: Mapped[float] = mapped_column(Float, default=0.0)
+    execution_token: Mapped[str | None] = mapped_column(String(36), default=None, index=True)
     run_key: Mapped[str | None] = mapped_column(String(64), default=None, index=True)
     output_dir: Mapped[str | None] = mapped_column(Text, default=None)
     error_code: Mapped[str | None] = mapped_column(String(64), default=None)

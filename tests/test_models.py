@@ -36,9 +36,7 @@ def test_model_defaults_use_uuid_utc_and_independent_json(tmp_path):
     with session_scope(engine) as session:
         user = User(username="admin", password_hash="hash")
         dataset = Dataset(name="run-1", path="/data/run-1", kind="lerobot", status="READY")
-        other_dataset = Dataset(
-            name="run-2", path="/data/run-2", kind="lerobot", status="READY"
-        )
+        other_dataset = Dataset(name="run-2", path="/data/run-2", kind="lerobot", status="READY")
         import_job = ImportJob(
             source_name="lab-a",
             remote_root="/data/rollouts",
@@ -66,11 +64,13 @@ def test_model_defaults_use_uuid_utc_and_independent_json(tmp_path):
         assert import_job.state == "QUEUED"
         assert import_job.progress == 0.0
         assert import_job.publish_fingerprint is None
+        assert import_job.execution_token is None
         assert jobs[0].profile_version == "unknown"
         assert jobs[0].vlm_enabled is False
         assert jobs[0].stage == "PENDING"
         assert jobs[0].progress == 0.0
         assert jobs[0].cancel_requested is False
+        assert jobs[0].execution_token is None
         assert dataset.inspection_json == {}
         assert dataset.inspection_json is not other_dataset.inspection_json
         assert jobs[0].params_json == {}
@@ -86,6 +86,16 @@ def test_json_fields_use_sqlalchemy_json_columns():
     assert isinstance(dataset_columns.inspection_json.type, JSON)
     assert isinstance(evaluation_columns.params_json.type, JSON)
     assert isinstance(evaluation_columns.provenance_json.type, JSON)
+
+
+def test_task_execution_tokens_are_nullable_and_indexed():
+    import_token = inspect(ImportJob).columns.execution_token
+    evaluation_token = inspect(EvaluationJob).columns.execution_token
+
+    assert import_token.nullable is True
+    assert import_token.index is True
+    assert evaluation_token.nullable is True
+    assert evaluation_token.index is True
 
 
 def test_dataset_size_uses_big_integer_and_persists_large_values(tmp_path):
@@ -187,9 +197,7 @@ def test_session_scope_keeps_explicitly_loaded_data_available_after_commit(tmp_p
         session.add(EvaluationJob(dataset_id=dataset.id, profile_name="genie02-full"))
 
     with session_scope(engine) as session:
-        job = session.scalar(
-            select(EvaluationJob).options(selectinload(EvaluationJob.dataset))
-        )
+        job = session.scalar(select(EvaluationJob).options(selectinload(EvaluationJob.dataset)))
         assert job is not None
 
     assert job.state == "QUEUED"

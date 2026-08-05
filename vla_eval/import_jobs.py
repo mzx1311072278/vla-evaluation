@@ -493,6 +493,13 @@ def _validate_protected_directory(path: Path, field_name: str) -> None:
         raise ValueError(f"{field_name} must be writable and searchable")
 
 
+def validate_trusted_directory(path: Path, field_name: str) -> Path:
+    """Validate an existing service-owned directory and all of its ancestors."""
+    candidate = _absolute_path(path, field_name)
+    _validate_protected_directory(candidate, field_name)
+    return candidate
+
+
 def validate_published_target(target: Path, trusted_inbox_root: Path) -> Path:
     """Validate a published dataset path without following untrusted ancestors."""
     root = _absolute_path(trusted_inbox_root, "trusted inbox root")

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import errno
 import os
+import re
+import stat
 from dataclasses import dataclass, replace
 from pathlib import Path
+from uuid import uuid4
 
 from sqlalchemy import select, update
 from sqlalchemy.engine import Engine
@@ -20,6 +24,7 @@ from vla_eval.import_jobs import (
     TransferError,
     execute_import,
     validate_published_target,
+    validate_trusted_directory,
 )
 from vla_eval.models import Dataset, EvaluationJob, ImportJob
 from vla_eval.profiles import load_profile
@@ -38,6 +43,28 @@ _configured_runtime: TaskRuntime | None = None
 
 class ImportIntegrityError(ValueError):
     """A READY import no longer matches its durable dataset identity."""
+
+
+class StaleTaskExecution(RuntimeError):
+    """A callback belongs to an execution generation that no longer owns the job."""
+
+
+class DatasetChangedError(ValueError):
+    """The on-disk dataset no longer matches the submitted database identity."""
+
+
+_EVALUATION_CLAIM_STATES = ("QUEUED", "FAILED", "INTERRUPTED")
+_IMPORT_CLAIM_STATES = ("QUEUED", "FAILED", "INTERRUPTED")
+_IMPORT_ACTIVE_STATES = (
+    "QUEUED",
+    "FAILED",
+    "INTERRUPTED",
+    "CONNECTING",
+    "TRANSFERRING",
+    "VERIFYING",
+    "PREFLIGHT",
+)
+_PROFILE_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 
 def configure_runtime(runtime: TaskRuntime) -> None:
@@ -59,49 +86,308 @@ def _require_runtime(runtime: TaskRuntime | None) -> TaskRuntime:
     return resolved
 
 
-def _record_evaluation_failure(runtime: TaskRuntime, job_id: str) -> None:
+def _claim_evaluation_execution(runtime: TaskRuntime, job_id: str, token: str) -> None:
     with session_scope(runtime.engine) as session:
-        job = session.get_one(EvaluationJob, job_id)
-        job.state = "FAILED"
-        job.error_code = "EVALUATION_FAILED"
-        job.error_message = "Evaluation failed. Review worker logs for details."
+        claimed = session.execute(
+            update(EvaluationJob)
+            .where(
+                EvaluationJob.id == job_id,
+                EvaluationJob.state.in_(_EVALUATION_CLAIM_STATES),
+                EvaluationJob.execution_token.is_(None),
+            )
+            .values(
+                state="RUNNING",
+                execution_token=token,
+                error_code=None,
+                error_message=None,
+            )
+        )
+        if claimed.rowcount != 1:
+            raise StaleTaskExecution("evaluation execution could not claim the job")
 
 
-def _record_evaluation_success(runtime: TaskRuntime, job_id: str) -> None:
+def _walk_exceptions(error: BaseException):
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        elif current.__context__ is not None:
+            pending.append(current.__context__)
+
+
+def _classify_evaluation_failure(error: BaseException) -> tuple[str, str]:
+    chain = tuple(_walk_exceptions(error))
+    if any(isinstance(item, OSError) and item.errno == errno.ENOSPC for item in chain):
+        return "DISK_FULL", "Evaluation storage is full. Free space and retry."
+    if any(
+        item.__class__.__name__ == "OutOfMemoryError" or "cuda out of memory" in str(item).lower()
+        for item in chain
+    ):
+        return (
+            "CUDA_OUT_OF_MEMORY",
+            "GPU memory was exhausted. Reduce workload or retry.",
+        )
+    if any(
+        item.__class__.__name__ == "ModelLoadError"
+        or ("model" in str(item).lower() and "load" in str(item).lower())
+        for item in chain
+    ):
+        return (
+            "MODEL_LOAD_FAILED",
+            "The configured model could not be loaded. Review worker logs.",
+        )
+    return "EVALUATION_FAILED", "Evaluation failed. Review worker logs for details."
+
+
+def _record_evaluation_failure(
+    runtime: TaskRuntime,
+    job_id: str,
+    token: str,
+    error: BaseException,
+) -> None:
+    code, message = _classify_evaluation_failure(error)
     with session_scope(runtime.engine) as session:
-        job = session.get_one(EvaluationJob, job_id)
-        if job.cancel_requested:
-            raise EvaluationCancelled("evaluation cancelled before success commit")
-        job.state = "SUCCEEDED"
-        job.progress = 100.0
-        job.error_code = None
-        job.error_message = None
+        session.execute(
+            update(EvaluationJob)
+            .where(
+                EvaluationJob.id == job_id,
+                EvaluationJob.execution_token == token,
+                EvaluationJob.state == "RUNNING",
+            )
+            .values(
+                state="FAILED",
+                execution_token=None,
+                error_code=code,
+                error_message=message,
+            )
+        )
 
 
-def _record_evaluation_cancelled(runtime: TaskRuntime, job_id: str) -> None:
+def _record_evaluation_success(runtime: TaskRuntime, job_id: str, token: str) -> None:
+    cancellation_committed = False
     with session_scope(runtime.engine) as session:
-        job = session.get_one(EvaluationJob, job_id)
-        job.state = "CANCELLED"
-        job.error_code = "EVALUATION_CANCELLED"
-        job.error_message = "Evaluation was cancelled."
+        succeeded = session.execute(
+            update(EvaluationJob)
+            .where(
+                EvaluationJob.id == job_id,
+                EvaluationJob.execution_token == token,
+                EvaluationJob.state == "RUNNING",
+                EvaluationJob.cancel_requested.is_(False),
+            )
+            .values(
+                state="SUCCEEDED",
+                progress=100.0,
+                execution_token=None,
+                error_code=None,
+                error_message=None,
+            )
+        )
+        if succeeded.rowcount == 1:
+            return
+        cancelled = session.execute(
+            update(EvaluationJob)
+            .where(
+                EvaluationJob.id == job_id,
+                EvaluationJob.execution_token == token,
+                EvaluationJob.state == "RUNNING",
+                EvaluationJob.cancel_requested.is_(True),
+            )
+            .values(
+                state="CANCELLED",
+                execution_token=None,
+                error_code="EVALUATION_CANCELLED",
+                error_message="Evaluation was cancelled.",
+            )
+        )
+        if cancelled.rowcount == 1:
+            cancellation_committed = True
+        else:
+            raise StaleTaskExecution("evaluation success callback is stale")
+    if cancellation_committed:
+        raise EvaluationCancelled("evaluation cancelled before success commit")
 
 
-def _update_evaluation_stage(runtime: TaskRuntime, job_id: str, stage: str) -> None:
+def _record_evaluation_cancelled(runtime: TaskRuntime, job_id: str, token: str) -> None:
     with session_scope(runtime.engine) as session:
-        job = session.get_one(EvaluationJob, job_id)
-        job.state = "RUNNING"
-        job.stage = stage
+        session.execute(
+            update(EvaluationJob)
+            .where(
+                EvaluationJob.id == job_id,
+                EvaluationJob.execution_token == token,
+                EvaluationJob.state == "RUNNING",
+            )
+            .values(
+                state="CANCELLED",
+                execution_token=None,
+                error_code="EVALUATION_CANCELLED",
+                error_message="Evaluation was cancelled.",
+            )
+        )
 
 
-def _update_evaluation_progress(runtime: TaskRuntime, job_id: str, progress: float) -> None:
+def _update_evaluation_stage(runtime: TaskRuntime, job_id: str, token: str, stage: str) -> None:
     with session_scope(runtime.engine) as session:
-        job = session.get_one(EvaluationJob, job_id)
-        job.progress = progress
+        changed = session.execute(
+            update(EvaluationJob)
+            .where(
+                EvaluationJob.id == job_id,
+                EvaluationJob.execution_token == token,
+                EvaluationJob.state == "RUNNING",
+            )
+            .values(stage=stage)
+        )
+        if changed.rowcount != 1:
+            raise StaleTaskExecution("evaluation stage callback is stale")
 
 
-def _evaluation_cancel_requested(runtime: TaskRuntime, job_id: str) -> bool:
+def _update_evaluation_progress(
+    runtime: TaskRuntime, job_id: str, token: str, progress: float
+) -> None:
     with session_scope(runtime.engine) as session:
-        return session.get_one(EvaluationJob, job_id).cancel_requested
+        changed = session.execute(
+            update(EvaluationJob)
+            .where(
+                EvaluationJob.id == job_id,
+                EvaluationJob.execution_token == token,
+                EvaluationJob.state == "RUNNING",
+            )
+            .values(progress=progress)
+        )
+        if changed.rowcount != 1:
+            raise StaleTaskExecution("evaluation progress callback is stale")
+
+
+def _evaluation_cancel_requested(runtime: TaskRuntime, job_id: str, token: str) -> bool:
+    with session_scope(runtime.engine) as session:
+        value = session.scalar(
+            select(EvaluationJob.cancel_requested).where(
+                EvaluationJob.id == job_id,
+                EvaluationJob.execution_token == token,
+                EvaluationJob.state == "RUNNING",
+            )
+        )
+        if value is None:
+            raise StaleTaskExecution("evaluation cancellation callback is stale")
+        return value
+
+
+def _set_evaluation_output(runtime: TaskRuntime, job_id: str, token: str, output_dir: Path) -> None:
+    with session_scope(runtime.engine) as session:
+        changed = session.execute(
+            update(EvaluationJob)
+            .where(
+                EvaluationJob.id == job_id,
+                EvaluationJob.execution_token == token,
+                EvaluationJob.state == "RUNNING",
+            )
+            .values(output_dir=str(output_dir))
+        )
+        if changed.rowcount != 1:
+            raise StaleTaskExecution("evaluation output assignment is stale")
+
+
+def _record_dataset_changed(
+    runtime: TaskRuntime,
+    job_id: str,
+    token: str,
+    dataset_id: str,
+) -> None:
+    with session_scope(runtime.engine) as session:
+        failed = session.execute(
+            update(EvaluationJob)
+            .where(
+                EvaluationJob.id == job_id,
+                EvaluationJob.execution_token == token,
+                EvaluationJob.state == "RUNNING",
+                EvaluationJob.dataset_id == dataset_id,
+            )
+            .values(
+                state="FAILED",
+                execution_token=None,
+                error_code="DATASET_CHANGED",
+                error_message=(
+                    "Dataset contents changed after submission. Revalidate the dataset."
+                ),
+            )
+        )
+        if failed.rowcount == 1:
+            session.execute(
+                update(Dataset).where(Dataset.id == dataset_id).values(status="PREFLIGHT_FAILED")
+            )
+
+
+def _verify_evaluation_dataset_identity(
+    runtime: TaskRuntime,
+    job_id: str,
+    token: str,
+    dataset_id: str,
+    dataset_path: Path,
+    expected_kind: str,
+    expected_fingerprint: str | None,
+) -> DatasetInspection:
+    try:
+        inspection = inspect_dataset(dataset_path, allowed_root=dataset_path)
+    except (OSError, RuntimeError, ValueError) as error:
+        _record_dataset_changed(runtime, job_id, token, dataset_id)
+        raise DatasetChangedError("evaluation dataset identity changed") from error
+    actual_kind = inspection.kind.value if inspection.kind is not None else None
+    if (
+        not inspection.ready
+        or actual_kind != expected_kind
+        or inspection.fingerprint != expected_fingerprint
+    ):
+        _record_dataset_changed(runtime, job_id, token, dataset_id)
+        raise DatasetChangedError("evaluation dataset identity changed")
+    return inspection
+
+
+def _trusted_evaluation_output(
+    runtime: TaskRuntime,
+    job_id: str,
+    persisted_output: str | None,
+) -> Path:
+    runs_root = validate_trusted_directory(runtime.config.data_root / "runs", "trusted runs root")
+    expected = runs_root / job_id
+    if persisted_output is not None and persisted_output != str(expected):
+        raise ValueError("evaluation output must match the canonical job output path")
+    try:
+        if not os.path.lexists(expected):
+            expected.mkdir(mode=0o700)
+        return validate_published_target(expected, runs_root)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ValueError("evaluation output path failed trust validation") from error
+
+
+def _trusted_profile_path(runtime: TaskRuntime, profile_name: str) -> Path:
+    if not _PROFILE_NAME_PATTERN.fullmatch(profile_name):
+        raise ValueError("evaluation profile selector must be a safe identifier")
+    root = validate_trusted_directory(
+        Path(os.path.abspath(runtime.profiles_root)), "trusted profiles root"
+    )
+    candidate = root / f"{profile_name}.yaml"
+    try:
+        candidate_stat = os.lstat(candidate)
+    except OSError as error:
+        raise ValueError("evaluation profile file does not exist") from error
+    if stat.S_ISLNK(candidate_stat.st_mode) or not stat.S_ISREG(candidate_stat.st_mode):
+        raise ValueError("evaluation profile file must be a regular non-symlink file")
+    if candidate_stat.st_uid not in {0, os.geteuid()}:
+        raise ValueError("evaluation profile file has an untrusted owner")
+    if candidate_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ValueError("evaluation profile file must not be group or other writable")
+    try:
+        candidate.resolve(strict=True).relative_to(root.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ValueError("evaluation profile file escaped its trusted root") from error
+    return candidate
 
 
 def recover_interrupted_jobs(*, runtime: TaskRuntime | None = None) -> int:
@@ -119,55 +405,116 @@ def recover_interrupted_jobs(*, runtime: TaskRuntime | None = None) -> int:
         )
 
     recovered = 0
-    for job_id in evaluation_ids:
-        with session_scope(resolved.engine) as session:
-            job = session.get_one(EvaluationJob, job_id)
-            if job.state in evaluation_states:
-                job.state = "INTERRUPTED"
-                recovered += 1
-    for import_id in import_ids:
-        with session_scope(resolved.engine) as session:
-            job = session.get_one(ImportJob, import_id)
-            if job.state in import_states:
-                job.state = "INTERRUPTED"
-                recovered += 1
+    with session_scope(resolved.engine) as session:
+        for job_id in evaluation_ids:
+            changed = session.execute(
+                update(EvaluationJob)
+                .where(
+                    EvaluationJob.id == job_id,
+                    EvaluationJob.state.in_(evaluation_states),
+                )
+                .values(state="INTERRUPTED", execution_token=None)
+            )
+            recovered += int(changed.rowcount == 1)
+        for import_id in import_ids:
+            changed = session.execute(
+                update(ImportJob)
+                .where(
+                    ImportJob.id == import_id,
+                    ImportJob.state.in_(import_states),
+                )
+                .values(state="INTERRUPTED", execution_token=None)
+            )
+            recovered += int(changed.rowcount == 1)
     return recovered
 
 
-def _update_import_state(runtime: TaskRuntime, import_id: str, state: str) -> None:
+def _claim_import_execution(runtime: TaskRuntime, import_id: str, token: str) -> None:
     with session_scope(runtime.engine) as session:
-        job = session.get_one(ImportJob, import_id)
-        job.state = state
-        if state == "CONNECTING":
-            job.error_code = None
-            job.error_message = None
+        claimed = session.execute(
+            update(ImportJob)
+            .where(
+                ImportJob.id == import_id,
+                ImportJob.state.in_(_IMPORT_CLAIM_STATES),
+                ImportJob.execution_token.is_(None),
+            )
+            .values(execution_token=token, error_code=None, error_message=None)
+        )
+        if claimed.rowcount != 1:
+            raise StaleTaskExecution("import execution could not claim the job")
 
 
-def _update_import_progress(runtime: TaskRuntime, import_id: str, progress: float) -> None:
+def _update_import_state(runtime: TaskRuntime, import_id: str, token: str, state: str) -> None:
     with session_scope(runtime.engine) as session:
-        session.get_one(ImportJob, import_id).progress = progress
+        changed = session.execute(
+            update(ImportJob)
+            .where(
+                ImportJob.id == import_id,
+                ImportJob.execution_token == token,
+                ImportJob.state.in_(_IMPORT_ACTIVE_STATES),
+            )
+            .values(state=state)
+        )
+        if changed.rowcount != 1:
+            raise StaleTaskExecution("import state callback is stale")
 
 
-def _import_cancel_requested(runtime: TaskRuntime, import_id: str) -> bool:
+def _update_import_progress(
+    runtime: TaskRuntime, import_id: str, token: str, progress: float
+) -> None:
     with session_scope(runtime.engine) as session:
-        return session.get_one(ImportJob, import_id).cancel_requested
+        changed = session.execute(
+            update(ImportJob)
+            .where(
+                ImportJob.id == import_id,
+                ImportJob.execution_token == token,
+                ImportJob.state.in_(_IMPORT_ACTIVE_STATES),
+            )
+            .values(progress=progress)
+        )
+        if changed.rowcount != 1:
+            raise StaleTaskExecution("import progress callback is stale")
+
+
+def _import_cancel_requested(runtime: TaskRuntime, import_id: str, token: str) -> bool:
+    with session_scope(runtime.engine) as session:
+        value = session.scalar(
+            select(ImportJob.cancel_requested).where(
+                ImportJob.id == import_id,
+                ImportJob.execution_token == token,
+                ImportJob.state.in_(_IMPORT_ACTIVE_STATES),
+            )
+        )
+        if value is None:
+            raise StaleTaskExecution("import cancellation callback is stale")
+        return value
 
 
 def _record_publish_fingerprint(
     runtime: TaskRuntime,
     import_id: str,
+    token: str,
     fingerprint: str,
 ) -> None:
     with session_scope(runtime.engine) as session:
-        job = session.get_one(ImportJob, import_id)
-        if job.dataset_id is not None:
-            raise RuntimeError("cannot publish an import that already has a dataset")
-        job.publish_fingerprint = fingerprint
+        changed = session.execute(
+            update(ImportJob)
+            .where(
+                ImportJob.id == import_id,
+                ImportJob.execution_token == token,
+                ImportJob.state.in_(_IMPORT_ACTIVE_STATES),
+                ImportJob.dataset_id.is_(None),
+            )
+            .values(publish_fingerprint=fingerprint)
+        )
+        if changed.rowcount != 1:
+            raise StaleTaskExecution("import fingerprint callback is stale")
 
 
 def _record_import_success(
     runtime: TaskRuntime,
     import_id: str,
+    token: str,
     target_name: str,
     result: ImportResult,
 ) -> bool:
@@ -177,9 +524,11 @@ def _record_import_success(
             update(ImportJob)
             .where(
                 ImportJob.id == import_id,
+                ImportJob.execution_token == token,
                 ImportJob.dataset_id.is_(None),
                 ImportJob.publish_fingerprint == inspection.fingerprint,
                 ImportJob.state.in_(("PREFLIGHT", "INTERRUPTED")),
+                ImportJob.cancel_requested.is_(False),
             )
             .values(state="FINALIZING")
             .execution_options(synchronize_session=False)
@@ -204,12 +553,14 @@ def _record_import_success(
         job.progress = 100.0
         job.error_code = None
         job.error_message = None
+        job.execution_token = None
     return True
 
 
 def _record_import_failure(
     runtime: TaskRuntime,
     import_id: str,
+    token: str,
     error: BaseException,
 ) -> None:
     if isinstance(error, TransferError):
@@ -222,22 +573,38 @@ def _record_import_failure(
         code = "IMPORT_FAILED"
         message = "Dataset import failed. Review worker logs for details."
     with session_scope(runtime.engine) as session:
-        job = session.get_one(ImportJob, import_id)
-        if job.state == "READY" and job.dataset_id is not None:
-            return
-        job.state = "FAILED"
-        job.error_code = code
-        job.error_message = message
+        session.execute(
+            update(ImportJob)
+            .where(
+                ImportJob.id == import_id,
+                ImportJob.execution_token == token,
+                ImportJob.state.in_(_IMPORT_ACTIVE_STATES),
+            )
+            .values(
+                state="FAILED",
+                execution_token=None,
+                error_code=code,
+                error_message=message,
+            )
+        )
 
 
-def _record_import_cancelled(runtime: TaskRuntime, import_id: str) -> None:
+def _record_import_cancelled(runtime: TaskRuntime, import_id: str, token: str) -> None:
     with session_scope(runtime.engine) as session:
-        job = session.get_one(ImportJob, import_id)
-        if job.state == "READY" and job.dataset_id is not None:
-            return
-        job.state = "CANCELLED"
-        job.error_code = "IMPORT_CANCELLED"
-        job.error_message = "Dataset import was cancelled."
+        session.execute(
+            update(ImportJob)
+            .where(
+                ImportJob.id == import_id,
+                ImportJob.execution_token == token,
+                ImportJob.state.in_(_IMPORT_ACTIVE_STATES),
+            )
+            .values(
+                state="CANCELLED",
+                execution_token=None,
+                error_code="IMPORT_CANCELLED",
+                error_message="Dataset import was cancelled.",
+            )
+        )
 
 
 def _record_import_integrity_failure(
@@ -322,6 +689,7 @@ def _load_completed_import(
 def _reconcile_interrupted_import(
     runtime: TaskRuntime,
     import_id: str,
+    token: str,
     dataset_id: str | None,
     publish_fingerprint: str | None,
     staging: Path,
@@ -343,7 +711,7 @@ def _reconcile_interrupted_import(
     if inspection.fingerprint != publish_fingerprint:
         raise ValueError("interrupted published target fingerprint does not match")
     result = ImportResult(target, inspection)
-    if _record_import_success(runtime, import_id, target_name, result):
+    if _record_import_success(runtime, import_id, token, target_name, result):
         return result
     with session_scope(runtime.engine) as session:
         completed = session.get_one(ImportJob, import_id)
@@ -372,6 +740,25 @@ def run_import_task(import_id: str, *, runtime: TaskRuntime | None = None) -> Im
 
     target_path = resolved.config.data_root / "inbox" / target_name
     staging_path = resolved.config.data_root / "staging" / import_id
+    if state == "READY":
+        try:
+            return _load_completed_import(
+                resolved,
+                import_id,
+                dataset_id,
+                publish_fingerprint,
+                target_path,
+            )
+        except ImportIntegrityError:
+            _record_import_integrity_failure(
+                resolved,
+                import_id,
+                dataset_id,
+                publish_fingerprint,
+            )
+            raise
+    token = str(uuid4())
+    _claim_import_execution(resolved, import_id, token)
     captured_inspection: DatasetInspection | None = None
 
     def inspect_and_capture(path: Path) -> DatasetInspection:
@@ -381,45 +768,42 @@ def run_import_task(import_id: str, *, runtime: TaskRuntime | None = None) -> Im
             _record_publish_fingerprint(
                 resolved,
                 import_id,
+                token,
                 captured_inspection.fingerprint,
             )
         return captured_inspection
 
-    def update_state(state: str) -> None:
-        if state == "READY":
+    def update_state(next_state: str) -> None:
+        if next_state == "FAILED":
+            return
+        if next_state == "READY":
             if captured_inspection is None:
                 raise RuntimeError("import reached READY before dataset inspection completed")
             committed = _record_import_success(
                 resolved,
                 import_id,
+                token,
                 target_name,
                 ImportResult(target_path, captured_inspection),
             )
             if not committed:
                 raise ValueError("import state changed before READY commit")
             return
-        _update_import_state(resolved, import_id, state)
+        _update_import_state(resolved, import_id, token, next_state)
 
     callbacks = ImportCallbacks(
         on_state=update_state,
-        on_progress=lambda progress: _update_import_progress(resolved, import_id, progress),
-        is_cancelled=lambda: _import_cancel_requested(resolved, import_id),
+        on_progress=lambda progress: _update_import_progress(resolved, import_id, token, progress),
+        is_cancelled=lambda: _import_cancel_requested(resolved, import_id, token),
     )
     try:
-        if state == "READY":
-            return _load_completed_import(
-                resolved,
-                import_id,
-                dataset_id,
-                publish_fingerprint,
-                target_path,
-            )
         if callbacks.is_cancelled():
             raise TransferError("import cancelled before execution")
         if state == "INTERRUPTED" and os.path.lexists(target_path):
             return _reconcile_interrupted_import(
                 resolved,
                 import_id,
+                token,
                 dataset_id,
                 publish_fingerprint,
                 staging_path,
@@ -446,17 +830,14 @@ def run_import_task(import_id: str, *, runtime: TaskRuntime | None = None) -> Im
         result = execute_import(spec, inspector=inspect_and_capture, callbacks=callbacks)
     except BaseException as original:
         try:
-            if state == "READY" and isinstance(original, ImportIntegrityError):
-                _record_import_integrity_failure(
-                    resolved,
-                    import_id,
-                    dataset_id,
-                    publish_fingerprint,
-                )
-            elif callbacks.is_cancelled():
-                _record_import_cancelled(resolved, import_id)
+            try:
+                cancelled = callbacks.is_cancelled()
+            except StaleTaskExecution:
+                cancelled = False
+            if cancelled:
+                _record_import_cancelled(resolved, import_id, token)
             else:
-                _record_import_failure(resolved, import_id, original)
+                _record_import_failure(resolved, import_id, token, original)
         except BaseException as persistence_error:  # noqa: BLE001 - preserve worker interrupts
             raise BaseExceptionGroup(
                 "import and failure persistence both failed",
@@ -473,44 +854,61 @@ def run_evaluation_task(job_id: str, *, runtime: TaskRuntime | None = None):
         dataset = session.get_one(Dataset, job.dataset_id)
         dataset_path = dataset.path
         dataset_status = dataset.status
+        dataset_id = dataset.id
+        dataset_kind = dataset.kind
+        dataset_fingerprint = dataset.fingerprint
         profile_name = job.profile_name
         profile_version = job.profile_version
         vlm_enabled = job.vlm_enabled
-        output_dir = job.output_dir or str(resolved.config.data_root / "runs" / job.id)
+        persisted_output = job.output_dir
         resume_from = job.stage if job.stage in {"VLM", "REPORT"} else "METRICS"
         initial_progress = job.progress
-        job.state = "RUNNING"
-        job.stage = "PREFLIGHT"
-        job.output_dir = output_dir
-        job.error_code = None
-        job.error_message = None
+    token = str(uuid4())
+    _claim_evaluation_execution(resolved, job_id, token)
+    _update_evaluation_stage(resolved, job_id, token, "PREFLIGHT")
 
     callbacks = EvaluationCallbacks(
-        on_stage=lambda stage: _update_evaluation_stage(resolved, job_id, stage),
-        on_progress=lambda progress: _update_evaluation_progress(resolved, job_id, progress),
-        should_cancel=lambda: _evaluation_cancel_requested(resolved, job_id),
+        on_stage=lambda stage: _update_evaluation_stage(resolved, job_id, token, stage),
+        on_progress=lambda progress: _update_evaluation_progress(resolved, job_id, token, progress),
+        should_cancel=lambda: _evaluation_cancel_requested(resolved, job_id, token),
     )
     try:
         if callbacks.should_cancel():
             raise EvaluationCancelled("evaluation cancelled before execution")
         if dataset_status != "READY":
             raise ValueError("evaluation dataset is not READY")
-        profile = load_profile(resolved.profiles_root / f"{profile_name}.yaml")
+        trusted_dataset = validate_published_target(
+            Path(dataset_path), resolved.config.data_root / "inbox"
+        )
+        _verify_evaluation_dataset_identity(
+            resolved,
+            job_id,
+            token,
+            dataset_id,
+            trusted_dataset,
+            dataset_kind,
+            dataset_fingerprint,
+        )
+        output_dir = _trusted_evaluation_output(resolved, job_id, persisted_output)
+        _set_evaluation_output(resolved, job_id, token, output_dir)
+        profile = load_profile(_trusted_profile_path(resolved, profile_name))
+        if profile.name != profile_name:
+            raise ValueError("evaluation profile name changed after job submission")
         if profile.version != profile_version:
             raise ValueError("evaluation profile version changed after job submission")
         result = run_evaluation(
-            dataset_path=dataset_path,
-            output_dir=output_dir,
+            dataset_path=str(trusted_dataset),
+            output_dir=str(output_dir),
             profile=profile,
             vlm_enabled=vlm_enabled,
             callbacks=callbacks,
             resume_from=resume_from,
             initial_progress=initial_progress,
         )
-        _record_evaluation_success(resolved, job_id)
+        _record_evaluation_success(resolved, job_id, token)
     except EvaluationCancelled as original:
         try:
-            _record_evaluation_cancelled(resolved, job_id)
+            _record_evaluation_cancelled(resolved, job_id, token)
         except BaseException as persistence_error:  # noqa: BLE001 - preserve worker interrupts
             raise BaseExceptionGroup(
                 "evaluation cancellation and persistence both failed",
@@ -519,7 +917,7 @@ def run_evaluation_task(job_id: str, *, runtime: TaskRuntime | None = None):
         raise
     except BaseException as original:
         try:
-            _record_evaluation_failure(resolved, job_id)
+            _record_evaluation_failure(resolved, job_id, token, original)
         except BaseException as persistence_error:  # noqa: BLE001 - preserve worker interrupts
             raise BaseExceptionGroup(
                 "evaluation and failure persistence both failed",
