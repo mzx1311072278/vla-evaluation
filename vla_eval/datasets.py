@@ -12,10 +12,10 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
+from Genie02_report.genie02_episode_metrics import _load_file
 from Genie02_report.genie02_eval_common import load_episodes, load_session
 
 
@@ -59,14 +59,19 @@ class _Manifest:
             "size": file_stat.st_size,
             "mtime_ns": file_stat.st_mtime_ns,
         }
-        if _is_metadata_file(logical_path):
-            record["sha256"] = _hash_file(resolved_path)
         self.entries[relative] = record
         self.files[logical_path] = resolved_path
         identity = (file_stat.st_dev, file_stat.st_ino)
         if identity not in self._sized_files:
             self._sized_files.add(identity)
             self.size_bytes += file_stat.st_size
+
+    def mark_metadata(self, logical_path: Path) -> None:
+        logical_path = Path(os.path.abspath(logical_path))
+        relative = logical_path.relative_to(self.allowed_root).as_posix()
+        resolved_path = self.files.get(logical_path)
+        if resolved_path is not None:
+            self.entries[relative]["sha256"] = _hash_file(resolved_path)
 
     def fingerprint(self) -> str:
         canonical = json.dumps(
@@ -84,11 +89,6 @@ def _hash_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _is_metadata_file(path: Path) -> bool:
-    suffix = path.suffix.lower()
-    return suffix in {".json", ".csv"} or (suffix in {".parquet", ".pq"} and "meta" in path.parts)
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -411,16 +411,6 @@ def _inspect_lerobot(root: Path, manifest: _Manifest) -> tuple[int | None, list[
     return actual_count, errors
 
 
-def _trajectory_columns(path: Path) -> set[str]:
-    suffix = path.suffix.lower()
-    if suffix == ".npz":
-        with np.load(path, allow_pickle=False) as data:
-            return set(data.files)
-    if suffix in {".parquet", ".pq"}:
-        return set(pq.ParquetFile(path).schema_arrow.names)
-    return set()
-
-
 def _find_native_trajectory(directory: Path, index: int) -> Path | None:
     candidates = (
         directory / f"episode_{index:03d}.npz",
@@ -434,6 +424,7 @@ def _find_native_trajectory(directory: Path, index: int) -> Path | None:
 def _validate_genie_trajectory(
     raw_path: str,
     *,
+    session: dict[str, Any],
     root: Path,
     allowed_root: Path,
     manifest: _Manifest,
@@ -461,29 +452,28 @@ def _validate_genie_trajectory(
     if not _is_relative_to(resolved_candidate, allowed_root):
         errors.append(f"{label} is outside allowed root: {logical} -> {resolved_candidate}")
         return False
-    if resolved_candidate.is_dir():
-        found = _find_native_trajectory(resolved_candidate, episode_index)
-        if found is None:
-            errors.append(f"no native trajectory for episode {episode_index} under {logical}")
-            return False
-        logical = found
-
     entry, error = _safe_reference(logical, base=root, allowed_root=allowed_root, label=label)
     if error:
         errors.append(error)
         return False
     assert entry is not None
-    suffix = entry.resolved_path.suffix.lower()
-    if suffix not in {".npz", ".parquet", ".pq"}:
-        errors.append(f"unsupported trajectory format for {label}: {logical}")
+    if not _mark_trajectory_sidecar_metadata(entry, allowed_root, manifest, errors):
         return False
     try:
-        columns = _trajectory_columns(entry.resolved_path)
-    except Exception as exc:  # noqa: BLE001 - numpy/pyarrow corrupt-file errors vary
+        trajectory = _load_file(entry.resolved_path, session, episode_index)
+    except Exception as exc:  # noqa: BLE001 - the legacy reader wraps backend-specific errors
         errors.append(f"cannot read {label} {logical}: {exc}")
         return False
-    if not {"smooth_send_y", "sent_y", "action"} & columns:
-        errors.append(f"{label} has no supported trajectory array: {logical}")
+    if len(trajectory.values) == 0:
+        errors.append(f"{label} is empty: {logical}")
+        return False
+    if trajectory.times is not None and len(trajectory.times) != len(trajectory.values):
+        errors.append(f"{label} timestamp length does not match trajectory values: {logical}")
+        return False
+    if trajectory.intervention is not None and len(trajectory.intervention) != len(
+        trajectory.values
+    ):
+        errors.append(f"{label} intervention length does not match trajectory values: {logical}")
         return False
     try:
         manifest.add_file(entry.logical_path, entry.resolved_path)
@@ -491,6 +481,91 @@ def _validate_genie_trajectory(
         errors.append(f"cannot add {label} to manifest: {exc}")
         return False
     return True
+
+
+def _mark_trajectory_sidecar_metadata(
+    entry: _FileEntry,
+    allowed_root: Path,
+    manifest: _Manifest,
+    errors: list[str],
+) -> bool:
+    suffix = entry.resolved_path.suffix.lower()
+    if suffix == ".npz":
+        candidates = (entry.resolved_path.parent / "meta.json",)
+    elif suffix in {".parquet", ".pq"} and len(entry.resolved_path.parents) >= 3:
+        candidates = (entry.resolved_path.parents[2] / "meta/info.json",)
+    else:
+        candidates = ()
+    for candidate in candidates:
+        if not os.path.lexists(candidate):
+            continue
+        metadata_entry, error = _safe_reference(
+            candidate,
+            base=entry.resolved_path.parent,
+            allowed_root=allowed_root,
+            label="trajectory metadata",
+        )
+        if error:
+            errors.append(error)
+            return False
+        assert metadata_entry is not None
+        try:
+            manifest.add_file(metadata_entry.logical_path, metadata_entry.resolved_path)
+            manifest.mark_metadata(metadata_entry.logical_path)
+        except (OSError, ValueError) as exc:
+            errors.append(f"cannot read trajectory metadata {candidate}: {exc}")
+            return False
+    return True
+
+
+def _mark_adapter_metadata(kind: DatasetKind | None, root: Path, manifest: _Manifest) -> list[str]:
+    if kind is DatasetKind.LEROBOT:
+        paths = []
+        for path in manifest.files:
+            relative = path.relative_to(root).as_posix()
+            is_known_file = relative in {
+                "meta/info.json",
+                "meta/stats.json",
+                "meta/tasks.parquet",
+            }
+            is_episode_metadata = relative.startswith("meta/episodes/") and path.suffix.lower() in {
+                ".parquet",
+                ".pq",
+            }
+            if is_known_file or is_episode_metadata:
+                paths.append(path)
+    elif kind is DatasetKind.GENIE02_SESSION:
+        paths = [
+            path
+            for name in ("session.json", "episodes.csv", "raw_refs.json")
+            if (path := root / name) in manifest.files
+        ]
+    else:
+        paths = []
+    errors: list[str] = []
+    for path in sorted(paths):
+        try:
+            manifest.mark_metadata(path)
+        except OSError as exc:
+            relative = path.relative_to(root).as_posix()
+            errors.append(f"cannot hash adapter metadata {relative}: {exc}")
+    return errors
+
+
+def _safe_logical_path(
+    raw_path: str | Path, *, base: Path, allowed_root: Path, label: str
+) -> tuple[Path | None, str | None]:
+    candidate = Path(raw_path).expanduser()
+    logical = Path(os.path.abspath(candidate if candidate.is_absolute() else base / candidate))
+    if not _is_relative_to(logical, allowed_root):
+        return None, f"{label} is outside allowed root: {logical}"
+    try:
+        boundary_target = logical.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        return None, f"cannot resolve {label} {logical}: {exc}"
+    if not _is_relative_to(boundary_target, allowed_root):
+        return None, f"{label} is outside allowed root: {logical} -> {boundary_target}"
+    return logical, None
 
 
 def _inspect_genie02(
@@ -531,53 +606,105 @@ def _inspect_genie02(
             trajectory_directories.append(Path(str(refs["trajectory_log_dir"])))
     trajectory_directories.append(Path("trajectories"))
 
+    resolved_directories: list[Path] = []
+    for raw_directory in trajectory_directories:
+        directory, error = _safe_logical_path(
+            raw_directory,
+            base=root,
+            allowed_root=allowed_root,
+            label="trajectory directory",
+        )
+        if error:
+            errors.append(error)
+            continue
+        assert directory is not None
+        if directory.is_dir() and directory not in resolved_directories:
+            resolved_directories.append(directory)
+
     for row in rows:
         index = int(row["episode_index"])
         trajectory_path = row["trajectory_path"].strip()
         if trajectory_path:
-            _validate_genie_trajectory(
+            direct_path, error = _safe_logical_path(
                 trajectory_path,
-                root=root,
+                base=root,
                 allowed_root=allowed_root,
-                manifest=manifest,
-                episode_index=index,
                 label=f"episodes.csv trajectory_path for episode {index}",
-                errors=errors,
             )
-            continue
-        found = False
-        for raw_directory in trajectory_directories:
-            directory = raw_directory if raw_directory.is_absolute() else root / raw_directory
-            try:
-                resolved_directory = directory.resolve(strict=True)
-            except FileNotFoundError:
+            if error:
+                errors.append(error)
                 continue
-            except (OSError, RuntimeError) as exc:
-                errors.append(f"cannot resolve trajectory directory {directory}: {exc}")
-                continue
-            if not _is_relative_to(resolved_directory, allowed_root):
-                errors.append(
-                    f"trajectory directory is outside allowed root: {directory} -> {resolved_directory}"
+            assert direct_path is not None
+            selected_path: Path | None = None
+            if direct_path.is_dir():
+                selected_path = _find_native_trajectory(direct_path, index)
+            elif direct_path.is_file():
+                selected_path = direct_path
+            if selected_path is None:
+                selected_path = next(
+                    (
+                        directory / direct_path.name
+                        for directory in resolved_directories
+                        if (directory / direct_path.name).is_file()
+                    ),
+                    None,
                 )
-                continue
-            native_path = _find_native_trajectory(resolved_directory, index)
-            if native_path is not None:
-                found = _validate_genie_trajectory(
-                    str(native_path),
+            if selected_path is not None:
+                _validate_genie_trajectory(
+                    str(selected_path),
+                    session=session,
                     root=root,
                     allowed_root=allowed_root,
                     manifest=manifest,
                     episode_index=index,
-                    label=f"trajectory for episode {index}",
+                    label=f"episodes.csv trajectory_path for episode {index}",
                     errors=errors,
                 )
-                break
-        if found:
-            continue
-        episode_path = row["episode_path"].strip()
-        if episode_path:
+                continue
+
+        selected_path = next(
+            (
+                found
+                for directory in resolved_directories
+                if (found := _find_native_trajectory(directory, index)) is not None
+            ),
+            None,
+        )
+        if selected_path is not None:
             _validate_genie_trajectory(
-                episode_path,
+                str(selected_path),
+                session=session,
+                root=root,
+                allowed_root=allowed_root,
+                manifest=manifest,
+                episode_index=index,
+                label=f"trajectory for episode {index}",
+                errors=errors,
+            )
+            continue
+
+        episode_path = row["episode_path"].strip()
+        if not episode_path:
+            errors.append(f"no trajectory found for episode {index}")
+            continue
+        logical_episode_path, error = _safe_logical_path(
+            episode_path,
+            base=root,
+            allowed_root=allowed_root,
+            label=f"episodes.csv episode_path for episode {index}",
+        )
+        if error:
+            errors.append(error)
+            continue
+        assert logical_episode_path is not None
+        if session["dataset_backend"] == "native":
+            native_path = _find_native_trajectory(logical_episode_path, index)
+            if native_path is None:
+                errors.append(f"no native frames.npz for episode {index}")
+                continue
+            _validate_genie_trajectory(
+                str(native_path),
+                session=session,
                 root=root,
                 allowed_root=allowed_root,
                 manifest=manifest,
@@ -585,8 +712,36 @@ def _inspect_genie02(
                 label=f"episodes.csv episode_path for episode {index}",
                 errors=errors,
             )
+            continue
+        if not logical_episode_path.exists():
+            errors.append(f"episode_path does not exist: {logical_episode_path}")
+            continue
+        scan_errors = _scan_dataset(logical_episode_path, allowed_root, manifest)
+        errors.extend(scan_errors)
+        parquet_paths = sorted(
+            path
+            for path in manifest.files
+            if _is_relative_to(path, logical_episode_path / "data") and path.suffix == ".parquet"
+        )
+        last_errors: list[str] = []
+        for parquet_path in parquet_paths:
+            candidate_errors: list[str] = []
+            if _validate_genie_trajectory(
+                str(parquet_path),
+                session=session,
+                root=root,
+                allowed_root=allowed_root,
+                manifest=manifest,
+                episode_index=index,
+                label=f"episodes.csv episode_path for episode {index}",
+                errors=candidate_errors,
+            ):
+                last_errors = []
+                break
+            last_errors = candidate_errors
         else:
-            errors.append(f"no trajectory found for episode {index}")
+            suffix = f": {last_errors[-1]}" if last_errors else ""
+            errors.append(f"no LeRobot parquet for episode {index}{suffix}")
     return len(rows), errors
 
 
@@ -626,13 +781,13 @@ def inspect_dataset(path: Path, allowed_root: Path) -> DatasetInspection:
     scan_errors = _scan_dataset(resolved_root, resolved_allowed, manifest)
     kind = _detect_kind(resolved_root)
     episode_count: int | None = None
-    validation_errors: list[str] = []
+    validation_errors = _mark_adapter_metadata(kind, resolved_root, manifest)
     if kind is DatasetKind.LEROBOT:
-        episode_count, validation_errors = _inspect_lerobot(resolved_root, manifest)
+        episode_count, adapter_errors = _inspect_lerobot(resolved_root, manifest)
+        validation_errors.extend(adapter_errors)
     elif kind is DatasetKind.GENIE02_SESSION:
-        episode_count, validation_errors = _inspect_genie02(
-            resolved_root, resolved_allowed, manifest
-        )
+        episode_count, adapter_errors = _inspect_genie02(resolved_root, resolved_allowed, manifest)
+        validation_errors.extend(adapter_errors)
     else:
         validation_errors.append("unknown dataset format")
 

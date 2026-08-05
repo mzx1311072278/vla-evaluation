@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from vla_eval import datasets
 from vla_eval.datasets import DatasetKind, inspect_dataset
 
 EPISODE_FIELDS = (
@@ -23,7 +24,12 @@ EPISODE_FIELDS = (
 
 
 def _write_native_session(
-    root: Path, *, trajectory_path: str = "trajectories/episode_000.npz"
+    root: Path,
+    *,
+    trajectory_path: str = "trajectories/episode_000.npz",
+    episode_path: str = "",
+    dataset_backend: str = "native",
+    create_trajectory: bool = True,
 ) -> Path:
     (root / "trajectories").mkdir(parents=True)
     session = {
@@ -37,7 +43,7 @@ def _write_native_session(
         "task": "fixture",
         "num_episodes_target": 1,
         "fps": 10,
-        "dataset_backend": "native",
+        "dataset_backend": dataset_backend,
         "dataset_root": "unused",
     }
     (root / "session.json").write_text(json.dumps(session), encoding="utf-8")
@@ -48,7 +54,7 @@ def _write_native_session(
             {
                 "session_id": "native-fixture",
                 "episode_index": "0",
-                "episode_path": "",
+                "episode_path": episode_path,
                 "trajectory_path": trajectory_path,
                 "t_start": "0",
                 "t_end": "1",
@@ -59,10 +65,139 @@ def _write_native_session(
             }
         )
     trajectory = root / trajectory_path if not Path(trajectory_path).is_absolute() else None
-    if trajectory is not None:
+    if create_trajectory and trajectory is not None:
         trajectory.parent.mkdir(parents=True, exist_ok=True)
         np.savez(trajectory, action=np.arange(12, dtype=float).reshape(4, 3))
     return root
+
+
+def test_inspect_genie02_accepts_direct_parquet_trajectory(tmp_path: Path):
+    root = _write_native_session(
+        tmp_path / "run",
+        trajectory_path="trajectories/episode_000.parquet",
+        create_trajectory=False,
+    )
+    pd.DataFrame(
+        {
+            "episode_index": [0, 0, 0, 0],
+            "timestamp": [0.0, 0.1, 0.2, 0.3],
+            "action": [[0.0, 0.0, 0.0]] * 4,
+        }
+    ).to_parquet(root / "trajectories/episode_000.parquet")
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is True
+
+
+def test_inspect_genie02_falls_back_by_missing_trajectory_basename(tmp_path: Path):
+    root = _write_native_session(
+        tmp_path / "run",
+        trajectory_path="stale/custom.npz",
+        create_trajectory=False,
+    )
+    np.savez(root / "trajectories/custom.npz", action=np.ones((4, 3)))
+    np.savez(root / "trajectories/episode_000.npz", action=np.array([object()]))
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is True
+
+
+def test_inspect_genie02_rejects_object_npz_without_falling_back(tmp_path: Path):
+    root = _write_native_session(
+        tmp_path / "run", trajectory_path="bad.npz", create_trajectory=False
+    )
+    np.savez(root / "bad.npz", action=np.array([object()]))
+    np.savez(root / "trajectories/episode_000.npz", action=np.ones((4, 3)))
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is False
+    assert any("cannot read" in error for error in result.errors)
+
+
+def test_inspect_genie02_rejects_corrupt_npz(tmp_path: Path):
+    root = _write_native_session(
+        tmp_path / "run", trajectory_path="corrupt.npz", create_trajectory=False
+    )
+    (root / "corrupt.npz").write_bytes(b"not-a-zip-archive")
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is False
+    assert any("cannot read" in error for error in result.errors)
+
+
+def test_inspect_genie02_rejects_mismatched_npz_timestamps(tmp_path: Path):
+    root = _write_native_session(
+        tmp_path / "run", trajectory_path="mismatch.npz", create_trajectory=False
+    )
+    np.savez(root / "mismatch.npz", action=np.ones((4, 3)), timestamp=np.arange(3))
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is False
+    assert any("timestamp length" in error for error in result.errors)
+
+
+def test_inspect_genie02_rejects_empty_parquet_trajectory(tmp_path: Path):
+    root = _write_native_session(
+        tmp_path / "run", trajectory_path="empty.parquet", create_trajectory=False
+    )
+    pd.DataFrame(
+        {
+            "episode_index": pd.Series(dtype="int64"),
+            "timestamp": pd.Series(dtype="float64"),
+            "action": pd.Series(dtype="object"),
+        }
+    ).to_parquet(root / "empty.parquet")
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is False
+    assert any("absent" in error for error in result.errors)
+
+
+def test_inspect_genie02_rejects_wrong_episode_parquet_trajectory(tmp_path: Path):
+    root = _write_native_session(
+        tmp_path / "run", trajectory_path="wrong.parquet", create_trajectory=False
+    )
+    pd.DataFrame(
+        {
+            "episode_index": [1, 1, 1, 1],
+            "timestamp": [0.0, 0.1, 0.2, 0.3],
+            "action": [[0.0, 0.0, 0.0]] * 4,
+        }
+    ).to_parquet(root / "wrong.parquet")
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is False
+    assert any("episode 0 is absent" in error for error in result.errors)
+
+
+def test_inspect_genie02_lerobot_backend_uses_episode_path_data(tmp_path: Path):
+    root = _write_native_session(
+        tmp_path / "run",
+        trajectory_path="",
+        episode_path="recording",
+        dataset_backend="lerobot",
+        create_trajectory=False,
+    )
+    data_path = root / "recording/data/chunk-000/file-000.parquet"
+    data_path.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "episode_index": [0, 0, 0, 0],
+            "timestamp": [0.0, 0.1, 0.2, 0.3],
+            "action": [[0.0, 0.0, 0.0]] * 4,
+        }
+    ).to_parquet(data_path)
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is True
 
 
 def _write_lerobot(root: Path, *, with_video_metadata: bool = False) -> Path:
@@ -234,6 +369,34 @@ def test_large_data_content_is_not_hashed_when_size_and_mtime_do_not_change(tmp_
     assert first.ready is True
     assert second.ready is True
     assert first.fingerprint == second.fingerprint
+
+
+def test_manifest_hashes_only_adapter_metadata_independent_of_ancestors(
+    tmp_path: Path, monkeypatch
+):
+    allowed_root = tmp_path / "meta/allowed"
+    root = _write_lerobot(allowed_root / "run")
+    unrelated = root / "unrelated.json"
+    unrelated.write_text('{"same_size": true}', encoding="utf-8")
+    unrelated_meta = root / "meta/unrelated.json"
+    unrelated_meta.write_text('{"not_adapter_metadata": true}', encoding="utf-8")
+    hashed: list[Path] = []
+    original_hash_file = datasets._hash_file
+
+    def record_hash(path: Path) -> str:
+        hashed.append(path.resolve())
+        return original_hash_file(path)
+
+    monkeypatch.setattr(datasets, "_hash_file", record_hash)
+
+    result = inspect_dataset(root, allowed_root=allowed_root)
+
+    assert result.ready is True
+    assert (root / "meta/info.json").resolve() in hashed
+    assert (root / "meta/episodes/chunk-000/file-000.parquet").resolve() in hashed
+    assert (root / "data/chunk-000/file-000.parquet").resolve() not in hashed
+    assert unrelated.resolve() not in hashed
+    assert unrelated_meta.resolve() not in hashed
 
 
 def test_inspect_validates_referenced_lerobot_data_and_video(tmp_path: Path):
