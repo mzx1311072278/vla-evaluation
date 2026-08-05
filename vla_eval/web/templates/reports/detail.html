@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}{{ dataset.name }} | 评测报告{% endblock %}
+{% block content %}
+  <section>
+    <p class="eyebrow">评测报告</p><h1>{{ dataset.name }}</h1>
+    <dl class="summary-grid">
+      <div><dt>GSR</dt><dd>{{ headline.gsr }}</dd></div>
+      <div><dt>成功数</dt><dd>{{ headline.n_success }}</dd></div>
+      <div><dt>失败数</dt><dd>{{ headline.n_failure }}</dd></div>
+      <div><dt>成功 TTS</dt><dd>{{ headline.tts }}</dd></div>
+      <div><dt>平滑度</dt><dd>{{ headline.smoothness }}</dd></div>
+      <div><dt>待复核</dt><dd>{{ headline.pending_review }}</dd></div>
+    </dl>
+    {% if job.output_dir %}<div class="path-row"><code class="path">{{ job.output_dir }}</code><button class="icon-button" type="button" data-copy="{{ job.output_dir }}" title="复制路径" aria-label="复制路径"><i data-lucide="copy"></i></button></div>{% endif %}
+    {% if downloads %}
+      <div class="commands">
+        {% for item in downloads %}
+          <a class="button" href="{{ item.url }}">下载 {{ item.name }}</a>
+        {% endfor %}
+      </div>
+    {% endif %}
+    <section class="detail-band">
+      <h2>来源信息</h2>
+      <dl class="summary-grid">
+        <div><dt>配置</dt><dd>{{ provenance.profile_name }}</dd></div>
+        <div><dt>配置版本</dt><dd>{{ provenance.profile_version }}</dd></div>
+        <div><dt>VLM 模型</dt><dd>{{ provenance.vlm_model }}</dd></div>
+        <div><dt>Prompt 版本</dt><dd>{{ provenance.prompt_version }}</dd></div>
+        <div><dt>应用版本</dt><dd>{{ provenance.app_version }}</dd></div>
+        {% if provenance.git_sha %}<div><dt>Git SHA</dt><dd>{{ provenance.git_sha }}</dd></div>{% endif %}
+      </dl>
+    </section>
+    <section class="detail-band">
+      <h2>Episode 明细</h2>
+      {% if episodes %}
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Episode</th>
+                <th>结果</th>
+                <th>时长</th>
+                <th>平滑度</th>
+                {% if has_vlm %}<th>VLM 复核</th><th>VLM 原因</th>{% endif %}
+              </tr>
+            </thead>
+            <tbody>
+              {% for episode in episodes %}
+                <tr>
+                  <td>{{ episode.index if episode.index is not none else '—' }}</td>
+                  <td>
+                    <span class="status status-{{ 'success' if episode.outcome == 'success' else 'failure' }}">{{ episode.outcome or '—' }}</span>
+                    {% if episode.vlm and episode.vlm.get('vlm_valid') is false %}
+                      <small>VLM 解析失败</small>
+                    {% endif %}
+                  </td>
+                  <td>{{ episode.duration }}</td>
+                  <td>{{ episode.smoothness }}</td>
+                  {% if has_vlm %}
+                    <td>
+                      {% if episode.vlm %}
+                        {% if episode.vlm.get('needs_manual_review') is true %}待复核
+                        {% elif episode.vlm.get('review_mode') == 'manual_review' %}人工复核
+                        {% else %}自动通过
+                        {% endif %}
+                        {% if episode.vlm.get('confidence') is not none %}<small>置信度 {{ '%.2f'|format(episode.vlm.confidence) }}</small>{% endif %}
+                      {% else %}—{% endif %}
+                    </td>
+                    <td>{% if episode.vlm and episode.vlm.get('reason') %}{{ episode.vlm.reason }}{% else %}—{% endif %}</td>
+                  {% endif %}
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% if has_vlm %}<p class="muted">VLM 分析为辅助参考，不覆盖原始成功标签。</p>{% endif %}
+      {% else %}
+        <p class="empty">暂无 Episode 指标。</p>
+      {% endif %}
+    </section>
+    <div class="commands">
+      <a class="button" href="/evaluations/{{ job.id }}">查看任务</a>
+      <a class="button" href="/datasets/{{ dataset.id }}">查看数据集</a>
+    </div>
+  </section>
+{% endblock %}

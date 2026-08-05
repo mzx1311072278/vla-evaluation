@@ -12,6 +12,7 @@ from vla_eval.web.routes_auth import router as auth_router
 from vla_eval.web.routes_datasets import router as datasets_router
 from vla_eval.web.routes_evaluations import router as evaluations_router
 from vla_eval.web.routes_imports import router as imports_router
+from vla_eval.web.routes_reports import router as reports_router
 
 
 def create_app(config: AppConfig, engine: Engine, queues: QueueBundle) -> FastAPI:
@@ -37,4 +38,5 @@ def create_app(config: AppConfig, engine: Engine, queues: QueueBundle) -> FastAP
     app.include_router(datasets_router)
     app.include_router(evaluations_router)
     app.include_router(imports_router)
+    app.include_router(reports_router)
     return app
