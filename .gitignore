@@ -5,6 +5,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.coverage
 .ruff_cache/
 .vscode/
 .superpowers/
@@ -16,4 +17,3 @@ Genie02_report/attempt_eval/outputs/
 Genie02_report/report_*/
 Genie02_report/zqyh_*/
 vla_real_robot_evaluation/tmp/
-

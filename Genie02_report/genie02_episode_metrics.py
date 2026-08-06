@@ -7,7 +7,7 @@ import csv
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -76,7 +76,7 @@ def _trajectory_directories(session: dict[str, Any], session_dir: Path) -> list[
             unique.append(path)
     return unique
 
-@lru_cache(maxsize=None)
+@cache
 def _action_names_for_path(path: Path) -> list[str]:
     """读取轨迹目录 meta.json 中的 action_names；不存在时返回空列表。"""
     meta_path = path.parent / "meta.json"
@@ -86,7 +86,7 @@ def _action_names_for_path(path: Path) -> list[str]:
     names = meta.get("action_names", [])
     return [name for name in names if isinstance(name, str)]
 
-@lru_cache(maxsize=None)
+@cache
 def _lerobot_action_names_for_path(path: Path, key: str) -> list[str]:
     """读取 LeRobot meta/info.json 中的向量列名。"""
     root = path.parents[2] if len(path.parents) >= 3 else path.parent

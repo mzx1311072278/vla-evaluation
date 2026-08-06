@@ -1,14 +1,20 @@
 """Genie02 B 侧各阶段共用的数据契约与文件读写函数。"""
+
 from __future__ import annotations
+
 import argparse
 import csv
 import json
+import logging
 import math
+from collections.abc import Iterable, Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
+
 SCHEMA_VERSION = "1.0"
 DEFAULT_OUTPUT_DIR = "report"
+logger = logging.getLogger(__name__)
 EPISODE_FIELDS = (
     "session_id",
     "episode_index",
@@ -188,9 +194,13 @@ def _synthesize_lerobot_episodes(
                     intervened = bool(
                         (frame["complementary_info.is_intervention"].astype(float) != 0).any()
                     )
-            except Exception:
-                # ponytail: metadata duration is enough if optional intervention columns are absent.
-                pass
+            except (ImportError, KeyError, OSError, ValueError) as exc:
+                # Metadata duration remains valid when optional frame columns are unavailable.
+                logger.debug(
+                    "cannot read optional episode frame metadata from %s: %s",
+                    data_file,
+                    exc,
+                )
             outcome = str(item["episode_success"]).strip().lower()
             notes = "时长低于 1s" if outcome == "success" and duration < 1 else ""
             rows.append(
@@ -219,7 +229,7 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
 
 def prepare_output_dir(output_dir: Path | None = None) -> Path:
     """解析并创建输出目录。"""
-    default_dir = f"{DEFAULT_OUTPUT_DIR}_{datetime.now().strftime('%Y%m%d')}"
+    default_dir = f"{DEFAULT_OUTPUT_DIR}_{datetime.now().astimezone().strftime('%Y%m%d')}"
     root = (output_dir or Path.cwd() / default_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     return root

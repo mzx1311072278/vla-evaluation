@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import date
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -169,7 +169,7 @@ def build_report(
         "",
         "## 1. 评测配置",
         "",
-        f"- 日期：{_md_cell(session.get('date', date.today().isoformat()))}",
+        f"- 日期：{_md_cell(session.get('date', datetime.now().astimezone().date().isoformat()))}",
         f"- 任务：{_md_cell(session['task'])}",
         f"- 数据：{session['session_id']}",
         f"- 配置：{_md_cell(session['rollout_config_path'])}",
@@ -177,11 +177,13 @@ def build_report(
         f"- Episode：{metrics['n_episodes']} / {session['num_episodes_target']}（已完成 / 计划）",
         f"- FPS：{_md_cell(session['fps'])}",
         f"- 状态：{_md_cell(session['status'])}",
-        "- 评测公式：<br>"
-        "&emsp;&emsp;1. GSR = 成功 Episode 数 / Episode 总数<br>"
-        "&emsp;&emsp;2. TTS = 成功 Episode 的 duration_s 均值<br>"
-        "&emsp;&emsp;3. 报告平滑度 $S=log10(E+1)$，原始平滑度 $E=Σ||j_k||² \\cdot Δt$，其中 $j_k≈(x_k-3x_{k-1}+3x_{k-2}-x_{k-3})/(Δt)^3$ <br>"
-        "&emsp;&emsp;&emsp;参数：$S$ 为报告展示的平滑度，$E$ 为平滑度原始量，$k$ 为帧索引，$j_k$ 为第 k 帧 jerk，$x_k$ 为第 k 帧末端 xyz 位置向量，$Δt$ 为相邻轨迹帧时间间隔；综合与左右臂分别计算，越小越平滑",
+        (
+            "- 评测公式：<br>"
+            "&emsp;&emsp;1. GSR = 成功 Episode 数 / Episode 总数<br>"
+            "&emsp;&emsp;2. TTS = 成功 Episode 的 duration_s 均值<br>"
+            "&emsp;&emsp;3. 报告平滑度 $S=log10(E+1)$，原始平滑度 $E=Σ||j_k||² \\cdot Δt$，其中 $j_k≈(x_k-3x_{k-1}+3x_{k-2}-x_{k-3})/(Δt)^3$ <br>"
+            "&emsp;&emsp;&emsp;参数：$S$ 为报告展示的平滑度，$E$ 为平滑度原始量，$k$ 为帧索引，$j_k$ 为第 k 帧 jerk，$x_k$ 为第 k 帧末端 xyz 位置向量，$Δt$ 为相邻轨迹帧时间间隔；综合与左右臂分别计算，越小越平滑"
+        ),
         "",
         "## 2. 核心指标",
         "",
@@ -274,7 +276,8 @@ def generate_markdown_report(
     metrics = load_metrics_core(output_root, session)
     _write_smoothness_chart(output_root, episodes, episode_metrics)
     report = build_report(session, episodes, episode_metrics, metrics)
-    output = output_root / f"report_{date.today().strftime('%Y%m%d')}.md"
+    report_date = datetime.now().astimezone().date()
+    output = output_root / f"report_{report_date.strftime('%Y%m%d')}.md"
     output.write_text(report, encoding="utf-8")
     return output
 

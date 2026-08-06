@@ -15,8 +15,8 @@
 **Files:**
 - Modify: `.gitignore`
 
-- [ ] Add `.coverage` to the generated test artifacts in `.gitignore`.
-- [ ] Run `git status --short` and verify `.coverage` is absent.
+- [x] Add `.coverage` to the generated test artifacts in `.gitignore`.
+- [x] Run `git status --short` and verify `.coverage` is absent.
 
 ### Task 2: Resolve the current Ruff findings
 
@@ -25,10 +25,10 @@
 - Modify: `Genie02_report/genie02_eval_common.py`
 - Modify: `Genie02_report/genie02_markdown_report.py`
 
-- [ ] Run `.venv/bin/ruff check .` and retain its failing output as the red quality gate.
-- [ ] Apply only the import, cache, exception handling, timezone, and string-grouping changes required by Ruff.
-- [ ] Run focused Genie02 tests and confirm they pass.
-- [ ] Run `.venv/bin/ruff check .` and confirm it returns 0.
+- [x] Run `.venv/bin/ruff check .` and retain its failing output as the red quality gate.
+- [x] Apply only the import, cache, exception handling, timezone, and string-grouping changes required by Ruff.
+- [x] Run focused Genie02 tests and confirm they pass.
+- [x] Run `.venv/bin/ruff check .` and confirm it returns 0.
 
 ### Task 3: Verify VLM API acceptance coverage
 
@@ -38,9 +38,9 @@
 - Inspect: `tests/test_evaluation.py`
 - Inspect: `tests/web/test_evaluations.py`
 
-- [ ] Map configuration, request encoding, retry, malformed response, secret handling, orchestration, and provenance requirements to existing tests.
-- [ ] Add a focused failing test only if one of those observable behaviors has no coverage.
-- [ ] Run the VLM API focused test set and confirm it passes.
+- [x] Map configuration, request encoding, retry, malformed response, secret handling, orchestration, and provenance requirements to existing tests.
+- [x] Add a focused failing test only if one of those observable behaviors has no coverage.
+- [x] Run the VLM API focused test set and confirm it passes.
 
 ### Task 4: Run local release gates
 
@@ -48,8 +48,8 @@
 - Verify: `docker-compose.yml`
 - Verify: `deploy/Dockerfile.evaluation`
 
-- [ ] Run `.venv/bin/pytest` and record pass, skip, and warning counts.
-- [ ] Run `.venv/bin/ruff check .` and confirm it returns 0.
-- [ ] Detect Docker Compose availability and run `docker compose config --quiet` when available.
-- [ ] Run a build/config check that does not require GPU or API credentials when supported locally.
-- [ ] Review `git diff --check`, `git diff --stat`, and `git status --short` before reporting results.
+- [x] Run `.venv/bin/pytest` and record pass, skip, and warning counts.
+- [x] Run `.venv/bin/ruff check .` and confirm it returns 0.
+- [x] Detect Docker Compose availability and run `docker compose config --quiet` when available.
+- [x] Run a build/config check that does not require GPU or API credentials when supported locally.
+- [x] Review `git diff --check`, `git diff --stat`, and `git status --short` before reporting results.
