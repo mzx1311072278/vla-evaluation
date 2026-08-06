@@ -269,6 +269,18 @@ async def create_evaluation(
                 detail=f"Evaluation already completed. Reuse: /evaluations/{existing_id}",
             )
 
+    # API-backend connection details are recorded only for backend=api. The
+    # api_key_env is the env-var NAME; the secret VALUE is never persisted.
+    api_provenance = {}
+    if profile.vlm.backend == "api" and profile.vlm.api is not None:
+        api = profile.vlm.api
+        api_provenance = {
+            "vlm_api_base_url": api.base_url,
+            "vlm_api_model": api.model,
+            "vlm_api_key_env": api.api_key_env,
+            "vlm_api_timeout": api.timeout,
+            "vlm_api_max_retries": api.max_retries,
+        }
     provenance = {
         "dataset_fingerprint": dataset.fingerprint,
         "profile_name": profile.name,
@@ -278,6 +290,7 @@ async def create_evaluation(
         "image_key": profile.image_key,
         "adapter": profile.adapter,
         "plugin": profile.plugin,
+        "vlm_backend": profile.vlm.backend,
         "vlm_model_path": profile.vlm.model_path,
         "prompt_version": profile.vlm.prompt_version,
         "max_image_size": profile.vlm.max_image_size,
@@ -296,6 +309,7 @@ async def create_evaluation(
             "min_sampled_frames": profile.review.min_sampled_frames,
         },
         "params": params,
+        **api_provenance,
     }
 
     with session_scope(request.app.state.engine) as session:

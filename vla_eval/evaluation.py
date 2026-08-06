@@ -21,7 +21,7 @@ from Genie02_report.genie02_markdown_report import generate_markdown_report
 from Genie02_report.genie02_metrics_core import build_core_metrics, generate_metrics_core
 
 from .exceptions import EvaluationCancelled
-from .profiles import Profile
+from .profiles import Profile, VLMApiProfile
 
 _ATTEMPT_REQUIRED_FIELDS = frozenset(
     {
@@ -320,6 +320,35 @@ def _validate_attempt_indices(results: list[dict[str, Any]], expected: frozenset
         )
 
 
+def _build_api_client_factory(api: VLMApiProfile) -> Callable[..., Any]:
+    """Build a ``client_factory`` that constructs the API VLM client.
+
+    The vendored runner calls ``factory(config.model_path, max_new_tokens=...,
+    prompt_version=...)`` positionally. The API backend ignores that
+    ``model_path`` (it takes its model name from the profile's ``api`` block) and
+    reads its connection details from ``api``. Lazy-importing ``ApiVLMClient``
+    keeps httpx out of module load, matching this module's existing
+    "no GPU/network imports at module import time" contract. Returning a closure
+    captures the api profile without modifying ``Genie02_report``.
+    """
+    from vla_eval.vlm_api import ApiVLMClient
+
+    def factory(
+        _model_path: Any, *, max_new_tokens: int, prompt_version: str
+    ) -> ApiVLMClient:
+        return ApiVLMClient(
+            base_url=api.base_url,
+            model=api.model,
+            api_key_env=api.api_key_env,
+            max_new_tokens=max_new_tokens,
+            prompt_version=prompt_version,
+            timeout=api.timeout,
+            max_retries=api.max_retries,
+        )
+
+    return factory
+
+
 def run_profile_vlm(
     dataset_path: Path,
     output_dir: Path,
@@ -333,9 +362,19 @@ def run_profile_vlm(
     )
 
     sampling = profile.vlm.sampling
+    if profile.vlm.backend == "api":
+        api = profile.vlm.api
+        # AttemptEvalConfig requires model_path as a pathlib.Path (isinstance-checked
+        # in the vendored library) but never reads it once client_factory is injected.
+        # We pass the API model name as a placeholder so the vendored config passes
+        # untouched; the API client takes its model from the api block below. This
+        # avoids modifying Genie02_report to relax the required field.
+        model_path = Path(api.model)
+    else:
+        model_path = Path(profile.vlm.model_path)
     config = AttemptEvalConfig(
         dataset_root=dataset_path,
-        model_path=Path(profile.vlm.model_path),
+        model_path=model_path,
         prompt_version=profile.vlm.prompt_version,
         image_key=profile.image_key,
         output_dir=output_dir,
@@ -363,11 +402,19 @@ def run_profile_vlm(
         last_progress = value
         callbacks.on_progress(value)
 
-    run_attempt_evaluation(
-        config,
-        progress=progress,
-        should_cancel=callbacks.should_cancel,
-    )
+    if profile.vlm.backend == "api":
+        run_attempt_evaluation(
+            config,
+            client_factory=_build_api_client_factory(profile.vlm.api),
+            progress=progress,
+            should_cancel=callbacks.should_cancel,
+        )
+    else:
+        run_attempt_evaluation(
+            config,
+            progress=progress,
+            should_cancel=callbacks.should_cancel,
+        )
     summary_path = output_dir / "attempt_summary.json"
     if not summary_path.is_file():
         raise ValueError(f"VLM evaluation did not create required artifact: {summary_path}")

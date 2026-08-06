@@ -1196,3 +1196,120 @@ def test_task6_profile_mapping_runs_real_service_and_writes_compatible_summary(
         }
     ]
     assert progress == [30.0, 60.0, 90.0, 90.0]
+
+
+def test_api_backend_runs_service_with_injected_api_factory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The api profile routes run_profile_vlm through the injected API factory."""
+    episodes = [_episode(tmp_path, 1), _episode(tmp_path, 2)]
+    monkeypatch.setattr(service, "_read_episode_metadata", lambda *_args: episodes)
+    monkeypatch.setattr(
+        service,
+        "_sample_episode_frames",
+        lambda *_args, **_kwargs: ([tmp_path / "frame.jpg"], []),
+    )
+
+    class FakeClient:
+        def analyze(self, *_args):
+            return _valid_vlm_result(), True
+
+    factory_calls: list[dict[str, Any]] = []
+
+    def fake_builder(api):
+        def factory(_model_path, *, max_new_tokens, prompt_version):
+            factory_calls.append(
+                {
+                    "base_url": api.base_url,
+                    "model": api.model,
+                    "api_key_env": api.api_key_env,
+                    "timeout": api.timeout,
+                    "max_retries": api.max_retries,
+                    "max_new_tokens": max_new_tokens,
+                    "prompt_version": prompt_version,
+                }
+            )
+            return FakeClient()
+
+        return factory
+
+    monkeypatch.setattr("vla_eval.evaluation._build_api_client_factory", fake_builder)
+    progress: list[float] = []
+    output_dir = tmp_path / "attempt_eval"
+
+    summary_path = run_profile_vlm(
+        tmp_path,
+        output_dir,
+        load_profile(Path("config/profiles/genie02-api.yaml")),
+        EvaluationCallbacks(
+            on_stage=lambda _stage: None,
+            on_progress=progress.append,
+            should_cancel=lambda: False,
+        ),
+    )
+
+    summary = load_attempt_summary(summary_path)
+    assert [result["episode_index"] for result in summary] == [1, 2]
+    # The client is constructed once (lazy, on the first successful episode) and
+    # reused; the factory must receive the api block plus the run-level kwargs,
+    # and must ignore the vendored model_path placeholder.
+    assert factory_calls == [
+        {
+            "base_url": "http://vlm-api.example.internal/v1",
+            "model": "qwen2.5-vl-7b-instruct",
+            "api_key_env": "VLA_EVAL_VLM_API_KEY",
+            "timeout": 60,
+            "max_retries": 3,
+            "max_new_tokens": 256,
+            "prompt_version": "genie02-attempt-v1",
+        }
+    ]
+    assert progress == [30.0, 60.0, 90.0, 90.0]
+
+
+def test_api_backend_sanitizes_inference_error_without_leaking_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """An api-client inference failure becomes a sanitized per-episode fallback.
+
+    Mirrors the local-backend sanitization contract: the vendored runner wraps
+    .analyze() in a broad ``except Exception`` and converts it to a fallback, so
+    a failure carrying the API key must never reach the persisted result fields.
+    """
+    monkeypatch.setattr(
+        service, "_read_episode_metadata", lambda *_args: [_episode(tmp_path, 0)]
+    )
+    monkeypatch.setattr(
+        service,
+        "_sample_episode_frames",
+        lambda *_args, **_kwargs: ([tmp_path / "frame.jpg"], []),
+    )
+
+    secret = "Authorization: Bearer top-secret-key"
+
+    class FailingClient:
+        def analyze(self, *_args):
+            raise RuntimeError(secret)
+
+    monkeypatch.setattr(
+        "vla_eval.evaluation._build_api_client_factory",
+        lambda _api: (lambda *_args, **_kwargs: FailingClient()),
+    )
+
+    summary_path = run_profile_vlm(
+        tmp_path,
+        tmp_path / "attempt_eval",
+        load_profile(Path("config/profiles/genie02-api.yaml")),
+        EvaluationCallbacks(
+            on_stage=lambda _stage: None,
+            on_progress=lambda _progress: None,
+            should_cancel=lambda: False,
+        ),
+    )
+
+    summary = load_attempt_summary(summary_path)
+    assert summary[0]["vlm_valid"] is False
+    assert summary[0]["parse_error"] == "inference_error:RuntimeError"
+    assert summary[0]["reason"] == "Episode VLM inference failed"
+    combined = f"{summary[0]['raw_response']} {summary[0]['parse_error']} {summary[0]['reason']}"
+    assert secret not in combined

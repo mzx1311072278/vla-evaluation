@@ -90,6 +90,8 @@ def test_submit_evaluation_persists_provenance_and_enqueues_worker(
     assert job.provenance_json["app_version"]
     assert job.provenance_json["git_sha"] == ""
     assert job.provenance_json["vlm_model_path"]
+    assert job.provenance_json["vlm_backend"] == "local"
+    assert "vlm_api_model" not in job.provenance_json
     assert job.provenance_json["prompt_version"]
     assert job.provenance_json["adapter"] == "genie02"
     assert job.provenance_json["plugin"] == "genie02-attempt-eval"
@@ -115,6 +117,39 @@ def test_submit_evaluation_persists_provenance_and_enqueues_worker(
     call = fake_queues.evaluation.enqueued[0]
     assert call.function is run_evaluation_task
     assert call.args == (job_id,)
+
+
+def test_submit_evaluation_records_api_backend_provenance(
+    auth_client, db_engine: Engine, fake_queues, ready_dataset
+):
+    """An api-profile submission records backend='api' and the api connection block.
+
+    Provenance stores the env-var NAME only (vlm_api_key_env); the secret VALUE
+    is never persisted -- vlm_model_path is null for the api backend so consumers
+    see a stable key set across both backends.
+    """
+    response = auth_client.post(
+        "/evaluations",
+        data=_evaluation_form(
+            auth_client.csrf, ready_dataset.id, profile="genie02-api", vlm_enabled="true"
+        ),
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    job_id = response.headers["location"].removeprefix("/evaluations/")
+    job = reload_job(db_engine, job_id)
+    assert job.profile_name == "genie02-api"
+    provenance = job.provenance_json
+    assert provenance["vlm_backend"] == "api"
+    assert provenance["vlm_model_path"] is None
+    assert provenance["vlm_api_base_url"] == "http://vlm-api.example.internal/v1"
+    assert provenance["vlm_api_model"] == "qwen2.5-vl-7b-instruct"
+    assert provenance["vlm_api_key_env"] == "VLA_EVAL_VLM_API_KEY"
+    assert provenance["vlm_api_timeout"] == 60
+    assert provenance["vlm_api_max_retries"] == 3
+    assert fake_queues.evaluation.count == 1
+    assert fake_queues.evaluation.enqueued[0].args == (job_id,)
 
 
 def test_duplicate_successful_run_requires_explicit_force(auth_client, successful_job):

@@ -27,7 +27,11 @@ RUN apt-get update \
 WORKDIR /app
 COPY . /app
 
-RUN python -m pip install ".[gpu]"
+# One image serves both VLM backends: the local GPU model (torch) and the
+# optional OpenAI-compatible API client (httpx). For an API-only deployment with
+# no local GPU, build a slim image with ".[vlm-api]" instead and drop the
+# nvidia/cuda base.
+RUN python -m pip install ".[gpu,vlm-api]"
 
 RUN groupadd --system --gid 1001 vlaeval \
     && useradd --system --uid 1001 --gid vlaeval --home-dir /app --shell /usr/sbin/nologin vlaeval \

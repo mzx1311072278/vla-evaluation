@@ -115,6 +115,51 @@ sudo install -m 600 -o 1001 -g 1001 lab_a_key      /srv/vla-eval/secrets/lab_a_k
 ssh-keyscan -H 10.0.0.8 | sudo tee /srv/vla-eval/secrets/known_hosts >/dev/null
 ```
 
+### VLM backend: local GPU (default) or OpenAI-compatible API (optional)
+
+The evaluation's VLM phase judges grasp attempts on sampled frames. By default it
+runs **on the local 4090**, loading Qwen2.5-VL in-process (`config/profiles/
+genie02-full.yaml`, `vlm.backend: local`). A second backend calls an
+OpenAI-compatible `/chat/completions` endpoint instead — a cloud VLM provider, or
+a self-hosted **vLLM** server (which can itself run on the 4090 and serve the
+model over HTTP so the worker imports neither torch nor transformers). The choice
+is **per profile** (operator-managed in YAML), not a per-submission form field, so
+the two backends never share a dedup bucket.
+
+To use the API backend:
+
+1. Edit `config/profiles/genie02-api.yaml`: set `vlm.api.base_url` and
+   `vlm.api.model` to your endpoint, and confirm `vlm.api.api_key_env`
+   (default `VLA_EVAL_VLM_API_KEY`). The profile name (`genie02-api`) must match
+   its filename — this is enforced and keeps its results in a separate run bucket.
+2. In the same `.env` you installed above, also set the secret:
+   ```bash
+   # the bearer token sent as "Authorization: Bearer <value>" to the endpoint
+   VLA_EVAL_VLM_API_KEY=sk-your-provider-token
+   ```
+3. Rebuild the worker (the default image already installs both backends):
+   ```bash
+   docker compose build evaluation-worker
+   ```
+4. Submit an evaluation with **profile = genie02-api** and VLM enabled. Its
+   provenance records `vlm_backend: api`, the `vlm_api_*` connection fields, and
+   `vlm_api_key_env` — the env-var **NAME only**; the secret **value** is never
+   stored in the DB, provenance, or logs.
+
+> **Provider compatibility.** The client sends `max_tokens` and `temperature: 0`,
+> which vLLM and most OpenAI-compatible servers accept directly. Some newer
+> OpenAI SDKs prefer `max_completion_tokens`; if your provider rejects
+> `max_tokens`, front it with a compatible shim (e.g. vLLM's own OpenAI server).
+
+#### API-only image (no local GPU)
+
+A deployment that never loads the local model can skip the multi-GB GPU stack.
+Build a slim worker that installs only `.[vlm-api]` (httpx) and drop the
+`nvidia/cuda` base image plus the GPU device reservation in `docker-compose.yml`.
+The shipped `deploy/Dockerfile.evaluation` installs `.[gpu,vlm-api]`, so a single
+host can use **either** backend without rebuilding — the API path simply never
+touches torch.
+
 ## 7. Build and start the stack
 
 Build the web image first (the transfer worker image is derived from it):
