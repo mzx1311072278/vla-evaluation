@@ -137,7 +137,8 @@ class ApiVLMClient:
                 last_error = status_error
             if attempt < self.max_retries:
                 time.sleep(min(2.0**attempt, 30.0))
-        assert last_error is not None  # at least one attempt ran
+        if last_error is None:  # only if max_retries < 0, which profiles forbid
+            raise RuntimeError("retry loop exited without capturing an error")
         raise last_error
 
     def analyze(

@@ -147,7 +147,7 @@ def test_post_retries_5xx_then_raises(monkeypatch: pytest.MonkeyPatch, tmp_path:
     with pytest.raises(httpx.HTTPStatusError):
         client.analyze(*_write_frames(tmp_path))
     assert len(attempts) == 4  # 1 initial + 3 retries
-    assert len(sleeps) == 3
+    assert sleeps == [1.0, 2.0, 4.0]  # exponential, none after the final attempt
 
 
 def test_post_retries_429_then_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
