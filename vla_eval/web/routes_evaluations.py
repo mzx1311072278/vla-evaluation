@@ -264,9 +264,9 @@ async def create_evaluation(
             )
             existing_id = existing.id if existing is not None else None
         if existing_id is not None:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Evaluation already completed. Reuse: /evaluations/{existing_id}",
+            return RedirectResponse(
+                f"/evaluations/{existing_id}",
+                status_code=303,
             )
 
     # API-backend connection details are recorded only for backend=api. The

@@ -152,12 +152,20 @@ def test_submit_evaluation_records_api_backend_provenance(
     assert fake_queues.evaluation.enqueued[0].args == (job_id,)
 
 
-def test_duplicate_successful_run_requires_explicit_force(auth_client, successful_job):
+def test_duplicate_successful_run_redirects_to_existing_evaluation(
+    auth_client, db_engine: Engine, fake_queues, successful_job
+):
     response = auth_client.post(
-        "/evaluations", data=matching_form(successful_job, auth_client.csrf)
+        "/evaluations",
+        data=matching_form(successful_job, auth_client.csrf),
+        follow_redirects=False,
     )
-    assert response.status_code == 409
-    assert f"/evaluations/{successful_job.id}" in response.text
+
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/evaluations/{successful_job.id}"
+    assert fake_queues.evaluation.count == 0
+    with session_scope(db_engine) as session:
+        assert [job.id for job in session.scalars(select(EvaluationJob))] == [successful_job.id]
 
 
 def test_force_submission_creates_new_evaluation_after_duplicate(
