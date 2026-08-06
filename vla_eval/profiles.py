@@ -28,6 +28,8 @@ _ADAPTERS = frozenset({"genie02"})
 _PLUGINS = frozenset({"genie02-attempt-eval"})
 _PROMPT_VERSIONS = SUPPORTED_PROMPT_VERSIONS
 _REQUIRED_OUTPUTS = frozenset({"episode_metrics.csv", "metrics_core.json", _REPORT_PATTERN})
+_VLM_BACKENDS = frozenset({"local", "api"})
+_ENV_VAR = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -76,12 +78,23 @@ class SamplingProfile:
 
 
 @dataclass(frozen=True)
+class VLMApiProfile:
+    base_url: str
+    model: str
+    api_key_env: str
+    timeout: float = 60.0
+    max_retries: int = 3
+
+
+@dataclass(frozen=True)
 class VLMProfile:
-    model_path: str
     prompt_version: str
     sampling: SamplingProfile
     max_image_size: int
     max_new_tokens: int
+    backend: str = "local"
+    model_path: str | None = None
+    api: VLMApiProfile | None = None
 
 
 @dataclass(frozen=True)
@@ -123,6 +136,29 @@ def _fields(raw: Mapping[str, Any], expected: set[str], field: str) -> None:
         raise ValueError(f"{field} has unknown fields: {', '.join(sorted(map(str, unknown)))}")
     if missing:
         raise ValueError(f"{field} is missing required fields: {', '.join(sorted(missing))}")
+
+
+def _fields_optional(
+    raw: Mapping[str, Any], required: set[str], optional: set[str], field: str
+) -> None:
+    """Like ``_fields`` but ``optional`` keys may be absent.
+
+    Unknown keys (outside ``required | optional``) and missing ``required`` keys
+    are still rejected; only the optional set is permitted to be absent.
+    """
+    allowed = required | optional
+    unknown = set(raw) - allowed
+    missing = required - set(raw)
+    if unknown:
+        raise ValueError(f"{field} has unknown fields: {', '.join(sorted(map(str, unknown)))}")
+    if missing:
+        raise ValueError(f"{field} is missing required fields: {', '.join(sorted(missing))}")
+
+
+def _optional_string(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    return _string(value, field)
 
 
 def _string(value: Any, field: str) -> str:
@@ -204,9 +240,13 @@ def load_profile(path: str | Path) -> Profile:
         raise ValueError("version must be a valid semantic version")
 
     vlm = _mapping(raw["vlm"], "vlm")
-    _fields(
-        vlm, {"model_path", "prompt_version", "sampling", "max_image_size", "max_new_tokens"}, "vlm"
+    _fields_optional(
+        vlm,
+        {"prompt_version", "sampling", "max_image_size", "max_new_tokens"},
+        {"backend", "model_path", "api"},
+        "vlm",
     )
+    backend = _enum_identifier(vlm.get("backend", "local"), "vlm.backend", _VLM_BACKENDS)
     sampling = _mapping(vlm["sampling"], "vlm.sampling")
     _fields(
         sampling,
@@ -222,6 +262,40 @@ def load_profile(path: str | Path) -> Profile:
     dense_region = _string(sampling["dense_region"], "vlm.sampling.dense_region")
     if dense_region not in _DENSE_REGIONS:
         raise ValueError(f"vlm.sampling.dense_region must be one of {sorted(_DENSE_REGIONS)}")
+
+    if backend == "local":
+        if "api" in vlm:
+            raise ValueError("vlm.api must not be set when backend=local")
+        model_path: str | None = _string(vlm["model_path"], "vlm.model_path")
+        api_profile: VLMApiProfile | None = None
+    else:
+        if "api" not in vlm:
+            raise ValueError("vlm is missing required fields: api")
+        api_raw = _mapping(vlm["api"], "vlm.api")
+        _fields_optional(
+            api_raw,
+            {"base_url", "model", "api_key_env"},
+            {"timeout", "max_retries"},
+            "vlm.api",
+        )
+        base_url = _string(api_raw["base_url"], "vlm.api.base_url")
+        if not base_url.startswith(("http://", "https://")):
+            raise ValueError("vlm.api.base_url must use the http:// or https:// scheme")
+        api_model = _string(api_raw["model"], "vlm.api.model")
+        api_key_env = _string(api_raw["api_key_env"], "vlm.api.api_key_env")
+        if not _ENV_VAR.fullmatch(api_key_env):
+            raise ValueError(
+                "vlm.api.api_key_env must be an uppercase environment variable name "
+                "(letters, digits, underscores; leading letter)"
+            )
+        api_profile = VLMApiProfile(
+            base_url=base_url,
+            model=api_model,
+            api_key_env=api_key_env,
+            timeout=_number(api_raw.get("timeout", 60.0), "vlm.api.timeout", 1, 600),
+            max_retries=_integer(api_raw.get("max_retries", 3), "vlm.api.max_retries", 0, 10),
+        )
+        model_path = _optional_string(vlm.get("model_path"), "vlm.model_path")
 
     review = _mapping(raw["review"], "review")
     _fields(
@@ -254,7 +328,9 @@ def load_profile(path: str | Path) -> Profile:
         plugin=_enum_identifier(raw["plugin"], "plugin", _PLUGINS),
         image_key=_string(raw["image_key"], "image_key"),
         vlm=VLMProfile(
-            model_path=_string(vlm["model_path"], "vlm.model_path"),
+            backend=backend,
+            model_path=model_path,
+            api=api_profile,
             prompt_version=_enum_identifier(
                 vlm["prompt_version"], "vlm.prompt_version", _PROMPT_VERSIONS
             ),

@@ -194,6 +194,9 @@ def test_genie02_profile_matches_cli_contract_and_is_deeply_immutable():
     assert profile.vlm.sampling.dense_region == "full"
     assert profile.vlm.max_image_size == 336
     assert profile.vlm.max_new_tokens == 256
+    assert profile.vlm.backend == "local"
+    assert profile.vlm.api is None
+    assert profile.vlm.model_path
     assert profile.review.confidence_threshold == 0.7
     assert profile.review.min_episode_duration == 3.0
     assert profile.review.min_sampled_frames == 3
@@ -337,6 +340,86 @@ def test_load_profile_rejects_duplicate_and_missing_required_outputs(tmp_path: P
     incomplete["outputs"]["required"].remove("metrics_core.json")
     with pytest.raises(ValueError, match="required output"):
         load_profile(_write_profile(tmp_path, incomplete))
+
+
+def _api_profile_data() -> dict[str, Any]:
+    """A valid API-backend profile derived from the shipped local profile."""
+    raw = _profile_data()
+    raw["name"] = "genie02-api"
+    raw["vlm"] = {
+        "backend": "api",
+        "prompt_version": raw["vlm"]["prompt_version"],
+        "api": {
+            "base_url": "https://vlm.example.internal/v1",
+            "model": "qwen2.5-vl-7b-instruct",
+            "api_key_env": "VLA_EVAL_VLM_API_KEY",
+            "timeout": 60,
+            "max_retries": 3,
+        },
+        "sampling": raw["vlm"]["sampling"],
+        "max_image_size": raw["vlm"]["max_image_size"],
+        "max_new_tokens": raw["vlm"]["max_new_tokens"],
+    }
+    return raw
+
+
+def test_api_profile_loads_with_backend_api(tmp_path: Path):
+    profile = load_profile(_write_profile(tmp_path, _api_profile_data()))
+    assert profile.vlm.backend == "api"
+    assert profile.vlm.model_path is None
+    assert profile.vlm.api is not None
+    assert profile.vlm.api.base_url == "https://vlm.example.internal/v1"
+    assert profile.vlm.api.model == "qwen2.5-vl-7b-instruct"
+    assert profile.vlm.api.api_key_env == "VLA_EVAL_VLM_API_KEY"
+    assert profile.vlm.api.timeout == 60.0
+    assert profile.vlm.api.max_retries == 3
+
+
+def test_api_profile_applies_optional_defaults(tmp_path: Path):
+    raw = _api_profile_data()
+    del raw["vlm"]["api"]["timeout"]
+    del raw["vlm"]["api"]["max_retries"]
+    profile = load_profile(_write_profile(tmp_path, raw))
+    assert profile.vlm.api.timeout == 60.0
+    assert profile.vlm.api.max_retries == 3
+
+
+def test_load_profile_rejects_api_block_when_backend_local(tmp_path: Path):
+    raw = _profile_data()
+    raw["vlm"]["api"] = {
+        "base_url": "https://vlm.example.internal/v1",
+        "model": "qwen2.5-vl-7b-instruct",
+        "api_key_env": "VLA_EVAL_VLM_API_KEY",
+    }
+    with pytest.raises(ValueError, match="backend=local"):
+        load_profile(_write_profile(tmp_path, raw))
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (lambda r: r["vlm"].pop("api"), "missing required fields.*api"),
+        (lambda r: r["vlm"]["api"].pop("base_url"), "missing required fields.*base_url"),
+        (lambda r: r["vlm"]["api"].pop("model"), "missing required fields.*model"),
+        (lambda r: r["vlm"]["api"].pop("api_key_env"), "missing required fields.*api_key_env"),
+        (lambda r: r["vlm"]["api"].__setitem__("api_key_env", "lowercase"), "api_key_env"),
+        (lambda r: r["vlm"]["api"].__setitem__("api_key_env", "9LEADING"), "api_key_env"),
+        (lambda r: r["vlm"]["api"].__setitem__("base_url", "ftp://x/v1"), "base_url"),
+        (lambda r: r["vlm"]["api"].__setitem__("timeout", 0), "timeout"),
+        (lambda r: r["vlm"]["api"].__setitem__("timeout", 601), "timeout"),
+        (lambda r: r["vlm"]["api"].__setitem__("max_retries", -1), "max_retries"),
+        (lambda r: r["vlm"]["api"].__setitem__("max_retries", 11), "max_retries"),
+        (lambda r: r["vlm"].__setitem__("backend", "cloud"), "backend"),
+        (lambda r: r["vlm"]["api"].__setitem__("surprise", "x"), "unknown fields.*surprise"),
+    ],
+)
+def test_load_profile_rejects_invalid_api_backend_config(
+    tmp_path: Path, mutate, match: str
+):
+    raw = _api_profile_data()
+    mutate(raw)
+    with pytest.raises((TypeError, ValueError), match=match):
+        load_profile(_write_profile(tmp_path, raw))
 
 
 def test_run_evaluation_calls_optional_vlm_between_metrics_and_report(

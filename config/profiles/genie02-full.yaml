@@ -4,6 +4,7 @@ adapter: genie02
 plugin: genie02-attempt-eval
 image_key: observation.images.right_wrist
 vlm:
+  backend: local
   model_path: /srv/vla-eval/data/models/Qwen2.5-VL-7B-Instruct
   prompt_version: genie02-attempt-v1
   sampling:
