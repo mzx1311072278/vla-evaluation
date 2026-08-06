@@ -1311,5 +1311,39 @@ def test_api_backend_sanitizes_inference_error_without_leaking_secret(
     assert summary[0]["vlm_valid"] is False
     assert summary[0]["parse_error"] == "inference_error:RuntimeError"
     assert summary[0]["reason"] == "Episode VLM inference failed"
-    combined = f"{summary[0]['raw_response']} {summary[0]['parse_error']} {summary[0]['reason']}"
-    assert secret not in combined
+    # The secret must not appear in ANY persisted field -- sweep all values so a
+    # regression in any field (incl. future-added ones) is caught.
+    rendered = " ".join(str(value) for value in summary[0].values())
+    assert secret not in rendered
+
+
+def test_build_api_client_factory_wires_profile_fields_into_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The real (un-monkeypatched) factory forwards the api block to ApiVLMClient.
+
+    The two service tests above inject a fake factory, so without this test the
+    7-kwarg pass-through from the profile's api block into ApiVLMClient.__init__
+    is never exercised -- a transposition there would only surface in production.
+    """
+    from vla_eval.evaluation import _build_api_client_factory
+    from vla_eval.profiles import load_profile
+
+    monkeypatch.setenv("VLA_EVAL_VLM_API_KEY", "test-key")
+    api = load_profile(Path("config/profiles/genie02-api.yaml")).vlm.api
+
+    factory = _build_api_client_factory(api)
+    # The vendored runner calls factory(config.model_path, max_new_tokens=...,
+    # prompt_version=...); the placeholder model_path is accepted and ignored.
+    client = factory(
+        tmp_path / "ignored-model-path-placeholder",
+        max_new_tokens=256,
+        prompt_version="genie02-attempt-v1",
+    )
+    try:
+        assert client.base_url == "http://vlm-api.example.internal/v1"
+        assert client.model == "qwen2.5-vl-7b-instruct"
+        assert client.max_new_tokens == 256
+        assert client.max_retries == 3
+    finally:
+        client.close()

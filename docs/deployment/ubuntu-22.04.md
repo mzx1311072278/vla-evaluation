@@ -130,8 +130,12 @@ To use the API backend:
 
 1. Edit `config/profiles/genie02-api.yaml`: set `vlm.api.base_url` and
    `vlm.api.model` to your endpoint, and confirm `vlm.api.api_key_env`
-   (default `VLA_EVAL_VLM_API_KEY`). The profile name (`genie02-api`) must match
-   its filename — this is enforced and keeps its results in a separate run bucket.
+   (default `VLA_EVAL_VLM_API_KEY`). **Keep the YAML `name:` in sync with the
+   filename** (it already is: `name: genie02-api` in `genie02-api.yaml`). The
+   worker resolves and dedups a profile by its `name:`, not the filename you
+   select — so if you copy this file (e.g. to `genie02-vllm.yaml`) you must also
+   change `name:`, otherwise the copy silently dedups and runs against the
+   original `genie02-api` bucket instead of its own.
 2. In the same `.env` you installed above, also set the secret:
    ```bash
    # the bearer token sent as "Authorization: Bearer <value>" to the endpoint
