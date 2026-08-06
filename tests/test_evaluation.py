@@ -19,6 +19,7 @@ from vla_eval.evaluation import (
 from vla_eval.profiles import load_profile
 
 PROFILE_PATH = Path("config/profiles/genie02-full.yaml")
+API_PROFILE_PATH = Path("config/profiles/genie02-api.yaml")
 
 
 def _profile_data() -> dict[str, Any]:
@@ -395,6 +396,38 @@ def test_load_profile_rejects_api_block_when_backend_local(tmp_path: Path):
         load_profile(_write_profile(tmp_path, raw))
 
 
+def test_load_profile_rejects_local_backend_without_model_path(tmp_path: Path):
+    raw = _profile_data()
+    del raw["vlm"]["model_path"]
+    with pytest.raises(ValueError, match="missing required fields.*model_path"):
+        load_profile(_write_profile(tmp_path, raw))
+
+
+def test_backend_defaults_to_local_when_absent(tmp_path: Path):
+    raw = _profile_data()
+    del raw["vlm"]["backend"]
+    profile = load_profile(_write_profile(tmp_path, raw))
+    assert profile.vlm.backend == "local"
+    assert profile.vlm.api is None
+
+
+def test_genie02_api_profile_contract():
+    profile = load_profile(API_PROFILE_PATH)
+    assert profile.name == "genie02-api"
+    assert profile.version == "1.0.0"
+    assert profile.vlm.backend == "api"
+    assert profile.vlm.model_path is None
+    assert profile.vlm.api is not None
+    assert profile.vlm.api.base_url.startswith("http")
+    assert profile.vlm.api.model
+    assert profile.vlm.api.api_key_env == "VLA_EVAL_VLM_API_KEY"
+    # sampling/review/outputs mirror the local profile so both backends are comparable
+    local = load_profile(PROFILE_PATH)
+    assert profile.vlm.sampling == local.vlm.sampling
+    assert profile.review == local.review
+    assert profile.outputs == local.outputs
+
+
 @pytest.mark.parametrize(
     ("mutate", "match"),
     [
@@ -405,10 +438,13 @@ def test_load_profile_rejects_api_block_when_backend_local(tmp_path: Path):
         (lambda r: r["vlm"]["api"].__setitem__("api_key_env", "lowercase"), "api_key_env"),
         (lambda r: r["vlm"]["api"].__setitem__("api_key_env", "9LEADING"), "api_key_env"),
         (lambda r: r["vlm"]["api"].__setitem__("base_url", "ftp://x/v1"), "base_url"),
+        (lambda r: r["vlm"]["api"].__setitem__("base_url", "https://"), "host"),
         (lambda r: r["vlm"]["api"].__setitem__("timeout", 0), "timeout"),
         (lambda r: r["vlm"]["api"].__setitem__("timeout", 601), "timeout"),
+        (lambda r: r["vlm"]["api"].__setitem__("timeout", True), "timeout"),
         (lambda r: r["vlm"]["api"].__setitem__("max_retries", -1), "max_retries"),
         (lambda r: r["vlm"]["api"].__setitem__("max_retries", 11), "max_retries"),
+        (lambda r: r["vlm"]["api"].__setitem__("max_retries", True), "max_retries"),
         (lambda r: r["vlm"].__setitem__("backend", "cloud"), "backend"),
         (lambda r: r["vlm"]["api"].__setitem__("surprise", "x"), "unknown fields.*surprise"),
     ],

@@ -266,6 +266,8 @@ def load_profile(path: str | Path) -> Profile:
     if backend == "local":
         if "api" in vlm:
             raise ValueError("vlm.api must not be set when backend=local")
+        if "model_path" not in vlm:
+            raise ValueError("vlm is missing required fields: model_path")
         model_path: str | None = _string(vlm["model_path"], "vlm.model_path")
         api_profile: VLMApiProfile | None = None
     else:
@@ -281,6 +283,9 @@ def load_profile(path: str | Path) -> Profile:
         base_url = _string(api_raw["base_url"], "vlm.api.base_url")
         if not base_url.startswith(("http://", "https://")):
             raise ValueError("vlm.api.base_url must use the http:// or https:// scheme")
+        scheme_len = 8 if base_url.startswith("https://") else 7
+        if len(base_url) <= scheme_len or base_url[scheme_len] == "/":
+            raise ValueError("vlm.api.base_url must include a host")
         api_model = _string(api_raw["model"], "vlm.api.model")
         api_key_env = _string(api_raw["api_key_env"], "vlm.api.api_key_env")
         if not _ENV_VAR.fullmatch(api_key_env):
