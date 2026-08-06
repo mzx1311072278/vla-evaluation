@@ -18,7 +18,7 @@ from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
 from vla_eval.db import session_scope
-from vla_eval.models import Dataset, User
+from vla_eval.models import Dataset, EvaluationJob, User
 from vla_eval.security import require_csrf, require_html_user
 
 router = APIRouter()
@@ -294,10 +294,22 @@ def dataset_detail(
     current_user: Annotated[User, Depends(require_html_user)],
 ):
     dataset = _load_dataset(request, dataset_id)
+    with session_scope(request.app.state.engine) as session:
+        recent_evaluations = session.scalars(
+            select(EvaluationJob)
+            .where(EvaluationJob.dataset_id == dataset_id)
+            .order_by(EvaluationJob.created_at.desc())
+            .limit(5)
+        ).all()
     return templates.TemplateResponse(
         request=request,
         name="datasets/detail.html",
-        context=_template_context(request, current_user, dataset=dataset),
+        context=_template_context(
+            request,
+            current_user,
+            dataset=dataset,
+            recent_evaluations=recent_evaluations,
+        ),
     )
 
 

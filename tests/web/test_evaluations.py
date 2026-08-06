@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -33,9 +34,78 @@ def matching_form(job: EvaluationJob, csrf: str) -> dict[str, str]:
     }
 
 
+def test_evaluation_list_shows_newest_jobs_and_report_links(
+    auth_client, db_engine: Engine, ready_dataset
+):
+    created_at = datetime(2026, 8, 6, 9, 30, tzinfo=UTC)
+    with session_scope(db_engine) as session:
+        older = EvaluationJob(
+            dataset_id=ready_dataset.id,
+            profile_name="genie02-full",
+            profile_version="1.0.0",
+            vlm_enabled=False,
+            state="RUNNING",
+            stage="METRICS",
+            progress=35,
+            created_at=created_at,
+        )
+        newer = EvaluationJob(
+            dataset_id=ready_dataset.id,
+            profile_name="genie02-api",
+            profile_version="1.0.0",
+            vlm_enabled=True,
+            state="SUCCEEDED",
+            stage="REPORT",
+            progress=100,
+            created_at=created_at + timedelta(hours=1),
+        )
+        session.add_all([older, newer])
+        session.flush()
+        older_id, newer_id = older.id, newer.id
+
+    response = auth_client.get("/evaluations")
+
+    assert response.status_code == 200
+    assert response.text.index(newer_id) < response.text.index(older_id)
+    for value in (ready_dataset.name, "genie02-api", "SUCCEEDED", "REPORT", "100%"):
+        assert value in response.text
+    assert "已启用" in response.text
+    assert f'href="/evaluations/{newer_id}"' in response.text
+    assert f'href="/reports/{newer_id}"' in response.text
+    assert f'href="/reports/{older_id}"' not in response.text
+
+
+def test_evaluation_list_filters_state_and_rejects_invalid_values(
+    auth_client, db_engine: Engine, ready_dataset
+):
+    with session_scope(db_engine) as session:
+        session.add_all(
+            [
+                EvaluationJob(
+                    dataset_id=ready_dataset.id,
+                    profile_name="visible-profile",
+                    state="FAILED",
+                ),
+                EvaluationJob(
+                    dataset_id=ready_dataset.id,
+                    profile_name="hidden-profile",
+                    state="SUCCEEDED",
+                ),
+            ]
+        )
+
+    filtered = auth_client.get("/evaluations?state=FAILED")
+
+    assert filtered.status_code == 200
+    assert "visible-profile" in filtered.text
+    assert "hidden-profile" not in filtered.text
+    assert auth_client.get("/evaluations?state=UNKNOWN").status_code == 422
+    assert auth_client.get("/evaluations?state=FAILED&state=FAILED").status_code == 422
+
+
 @pytest.mark.parametrize(
     "path",
-    ["/evaluations/new", "/evaluations/missing", "/api/evaluations/missing"],
+    ["/evaluations", "/evaluations/new", "/evaluations/missing", "/api/evaluations/missing"],
 )
 def test_evaluation_pages_require_login(client: TestClient, path: str):
     response = client.get(path, follow_redirects=False)

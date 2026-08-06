@@ -31,5 +31,23 @@
         <button type="submit">上传附件</button>
       </form>
     </section>
+    <section class="detail-band">
+      <div class="section-heading"><h2>最近评测</h2><a href="/evaluations?dataset_id={{ dataset.id }}">查看全部</a></div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>配置</th><th>状态</th><th>阶段</th><th>进度</th><th><span class="sr-only">操作</span></th></tr></thead>
+          <tbody>
+            {% for job in recent_evaluations %}
+              <tr>
+                <td><a href="/evaluations/{{ job.id }}">{{ job.profile_name }}</a><small>{{ job.created_at.strftime('%Y-%m-%d %H:%M') }}</small></td>
+                <td><span class="status status-{{ job.state|lower }}">{{ job.state }}</span></td>
+                <td>{{ job.stage }}</td><td>{{ "%.0f"|format(job.progress) }}%</td>
+                <td><a href="/evaluations/{{ job.id }}">查看</a></td>
+              </tr>
+            {% else %}<tr><td colspan="5" class="empty">暂无评测任务</td></tr>{% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
   </section>
 {% endblock %}

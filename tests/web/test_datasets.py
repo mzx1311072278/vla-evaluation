@@ -3,9 +3,10 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import Engine
 
 from vla_eval.db import session_scope
-from vla_eval.models import Dataset
+from vla_eval.models import Dataset, EvaluationJob
 
 
 @pytest.mark.parametrize("path", ["/datasets", "/datasets/missing"])
@@ -27,6 +28,38 @@ def test_dataset_list_and_ready_detail_show_evaluation_entry(auth_client, ready_
     assert str(ready_dataset.size_bytes) in detail.text
     assert f"/evaluations/new?dataset_id={ready_dataset.id}" in detail.text
     assert 'aria-disabled="true"' not in detail.text
+
+
+def test_dataset_detail_shows_only_five_most_recent_evaluations(
+    auth_client, db_engine: Engine, ready_dataset, dataset
+):
+    with session_scope(db_engine) as session:
+        for index in range(6):
+            session.add(
+                EvaluationJob(
+                    dataset_id=ready_dataset.id,
+                    profile_name=f"recent-{index}",
+                    state="SUCCEEDED",
+                )
+            )
+            session.flush()
+        session.add(
+            EvaluationJob(
+                dataset_id=dataset.id,
+                profile_name="other-dataset-job",
+                state="FAILED",
+            )
+        )
+
+    detail = auth_client.get(f"/datasets/{ready_dataset.id}")
+
+    assert detail.status_code == 200
+    assert "最近评测" in detail.text
+    assert "recent-5" in detail.text
+    assert "recent-1" in detail.text
+    assert "recent-0" not in detail.text
+    assert "other-dataset-job" not in detail.text
+    assert f'href="/evaluations?dataset_id={ready_dataset.id}"' in detail.text
 
 
 def test_non_ready_dataset_detail_disables_evaluation_and_shows_preflight(
@@ -245,10 +278,11 @@ def test_base_layout_loads_static_responsive_styles_and_keeps_login_usable(clien
     assert "@media (max-width: 720px)" in stylesheet.text
 
 
-def test_authenticated_layout_has_dataset_and_import_navigation(auth_client):
+def test_authenticated_layout_has_dataset_import_and_evaluation_navigation(auth_client):
     response = auth_client.get("/datasets")
 
     assert 'href="/datasets"' in response.text
     assert 'href="/imports"' in response.text
+    assert 'href="/evaluations"' in response.text
     assert "htmx.org" in response.text
     assert "lucide" in response.text

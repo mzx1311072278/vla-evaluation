@@ -23,6 +23,7 @@ templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 
 _TERMINAL_STATES = frozenset({"SUCCEEDED", "FAILED", "CANCELLED", "INTERRUPTED"})
 _ACTIVE_STATES = frozenset({"QUEUED", "PREFLIGHT", "METRICS", "VLM", "REPORT", "RUNNING"})
+_JOB_STATES = tuple(sorted(_TERMINAL_STATES | _ACTIVE_STATES))
 _ALLOWED_FIELDS = frozenset(
     {"csrf_token", "dataset_id", "profile", "vlm_enabled", "force"}
 )
@@ -205,6 +206,45 @@ def evaluation_new(
     )
 
 
+@router.get("/evaluations")
+def evaluation_list(
+    request: Request,
+    current_user: Annotated[User, Depends(require_html_user)],
+):
+    state_values = request.query_params.getlist("state")
+    dataset_id_values = request.query_params.getlist("dataset_id")
+    if len(state_values) > 1 or len(dataset_id_values) > 1:
+        raise HTTPException(status_code=422, detail="Invalid evaluation filters")
+    selected_state = state_values[0] if state_values else ""
+    dataset_id = dataset_id_values[0] if dataset_id_values else ""
+    if selected_state and selected_state not in _JOB_STATES:
+        raise HTTPException(status_code=422, detail="Invalid evaluation state")
+    if dataset_id:
+        _load_dataset(request, dataset_id)
+
+    query = (
+        select(EvaluationJob, Dataset)
+        .join(Dataset, EvaluationJob.dataset_id == Dataset.id)
+        .order_by(EvaluationJob.created_at.desc())
+    )
+    if selected_state:
+        query = query.where(EvaluationJob.state == selected_state)
+    if dataset_id:
+        query = query.where(EvaluationJob.dataset_id == dataset_id)
+    with session_scope(request.app.state.engine) as session:
+        jobs = session.execute(query).all()
+    return templates.TemplateResponse(
+        request=request,
+        name="evaluations/index.html",
+        context=_template_context(
+            request,
+            current_user,
+            jobs=jobs,
+            job_states=_JOB_STATES,
+            selected_state=selected_state,
+            dataset_id=dataset_id,
+        ),
+    )
 @router.post("/evaluations")
 async def create_evaluation(
     request: Request,

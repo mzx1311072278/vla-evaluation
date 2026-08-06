@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}评测任务 | VLA Evaluation{% endblock %}
+{% block content %}
+  <section>
+    <div class="page-heading">
+      <div><p class="eyebrow">模型评测</p><h1>评测任务</h1></div>
+      <form class="filter-form" method="get" action="/evaluations">
+        {% if dataset_id %}<input type="hidden" name="dataset_id" value="{{ dataset_id }}">{% endif %}
+        <label for="state">状态
+          <select id="state" name="state" onchange="this.form.submit()">
+            <option value="">全部</option>
+            {% for state in job_states %}<option value="{{ state }}"{% if state == selected_state %} selected{% endif %}>{{ state }}</option>{% endfor %}
+          </select>
+        </label>
+      </form>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>数据集</th><th>配置</th><th>VLM</th><th>状态</th><th>阶段</th><th>进度</th><th>创建时间</th><th><span class="sr-only">操作</span></th></tr></thead>
+        <tbody>
+          {% for job, dataset in jobs %}
+            <tr>
+              <td><a href="/evaluations/{{ job.id }}">{{ dataset.name }}</a></td>
+              <td>{{ job.profile_name }}</td><td>{{ "已启用" if job.vlm_enabled else "未启用" }}</td>
+              <td><span class="status status-{{ job.state|lower }}">{{ job.state }}</span></td>
+              <td>{{ job.stage }}</td><td>{{ "%.0f"|format(job.progress) }}%</td>
+              <td>{{ job.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+              <td>{% if job.state == "SUCCEEDED" %}<a href="/reports/{{ job.id }}">报告</a>{% else %}<a href="/evaluations/{{ job.id }}">查看</a>{% endif %}</td>
+            </tr>
+          {% else %}<tr><td colspan="8" class="empty">暂无评测任务</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

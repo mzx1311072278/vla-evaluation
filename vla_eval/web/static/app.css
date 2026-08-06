@@ -39,6 +39,8 @@ h2 { margin: 0 0 .9rem; font-size: 1.05rem; line-height: 1.35; letter-spacing: 0
 .eyebrow { margin: 0; color: #68726e; font-size: .78rem; font-weight: 750; letter-spacing: 0; text-transform: uppercase; }
 .muted, small { color: #68726e; }
 .page-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
+.section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+.filter-form { width: 12rem; }
 
 form { display: grid; gap: 1rem; }
 label { display: grid; gap: .4rem; color: #333c39; font-weight: 650; }
