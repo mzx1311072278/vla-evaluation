@@ -36,6 +36,14 @@ _EXACT_WHITELIST = frozenset(
         "smoothness_curve.svg",
     }
 )
+_ARTIFACT_PRESENTATION = {
+    "episode_metrics.csv": {"description": "Episode 逐项指标", "format": "CSV"},
+    "metrics_core.json": {"description": "评测汇总指标", "format": "JSON"},
+    "smoothness_curve.svg": {"description": "平滑度矢量图", "format": "SVG"},
+    "attempt_summary.json": {"description": "VLM 尝试汇总", "format": "JSON"},
+    "attempt_summary.csv": {"description": "VLM 尝试明细", "format": "CSV"},
+}
+_REPORT_PRESENTATION = {"description": "完整文本报告", "format": "MD"}
 _OUTCOME_FILTERS = frozenset({"success", "failure", "all"})
 _REVIEW_FILTERS = frozenset({"needs_review", "reviewed", "ok", "all"})
 
@@ -245,7 +253,11 @@ def _available_downloads(output_dir: Path, job_id: str) -> list[dict[str, str]]:
         path = output_dir / name
         if path.is_file():
             downloads.append(
-                {"name": name, "url": f"/reports/{job_id}/files/{name}"}
+                {
+                    "name": name,
+                    "url": f"/reports/{job_id}/files/{name}",
+                    **_ARTIFACT_PRESENTATION[name],
+                }
             )
     try:
         children = sorted(output_dir.glob(_REPORT_GLOB))
@@ -254,7 +266,11 @@ def _available_downloads(output_dir: Path, job_id: str) -> list[dict[str, str]]:
     for path in children:
         if path.is_file():
             downloads.append(
-                {"name": path.name, "url": f"/reports/{job_id}/files/{path.name}"}
+                {
+                    "name": path.name,
+                    "url": f"/reports/{job_id}/files/{path.name}",
+                    **_REPORT_PRESENTATION,
+                }
             )
     return downloads
 
@@ -340,6 +356,14 @@ def report_detail(
         "git_sha": provenance.get("git_sha") or "",
     }
     downloads = _available_downloads(output_dir, job.id)
+    smoothness_preview_url = next(
+        (
+            item["url"]
+            for item in downloads
+            if item["name"] == "smoothness_curve.svg"
+        ),
+        None,
+    )
     return templates.TemplateResponse(
         request=request,
         name="reports/detail.html",
@@ -354,6 +378,7 @@ def report_detail(
             pending_review=pending_review,
             provenance=provenance_view,
             downloads=downloads,
+            smoothness_preview_url=smoothness_preview_url,
             total_episodes=total_episodes,
             shown_episodes=shown_episodes,
             filter_outcome=outcome_filter,

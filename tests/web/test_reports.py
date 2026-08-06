@@ -152,6 +152,44 @@ def test_report_page_shows_core_metrics(auth_client, successful_job):
     assert "1.0.0" in response.text
 
 
+def test_report_page_shows_artifact_metadata_and_smoothness_preview(
+    auth_client, successful_job
+):
+    output_dir = Path(successful_job.output_dir)
+    (output_dir / "smoothness_curve.svg").write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg"></svg>', encoding="utf-8"
+    )
+    (output_dir / "attempt_summary.json").write_text("[]", encoding="utf-8")
+    (output_dir / "attempt_summary.csv").write_text("episode_index\n", encoding="utf-8")
+    (output_dir / "report_summary.md").write_text("# Report", encoding="utf-8")
+
+    response = auth_client.get(f"/reports/{successful_job.id}")
+
+    assert response.status_code == 200
+    svg_url = f"/reports/{successful_job.id}/files/smoothness_curve.svg"
+    assert f'<img src="{svg_url}"' in response.text
+    assert f'href="{svg_url}"' in response.text
+    assert 'class="smoothness-preview"' in response.text
+    for description, file_format in (
+        ("Episode 逐项指标", "CSV"),
+        ("评测汇总指标", "JSON"),
+        ("平滑度矢量图", "SVG"),
+        ("VLM 尝试汇总", "JSON"),
+        ("VLM 尝试明细", "CSV"),
+        ("完整文本报告", "MD"),
+    ):
+        assert description in response.text
+        assert f">{file_format}<" in response.text
+
+
+def test_report_page_omits_smoothness_preview_without_svg(auth_client, successful_job):
+    response = auth_client.get(f"/reports/{successful_job.id}")
+
+    assert response.status_code == 200
+    assert 'class="smoothness-preview"' not in response.text
+    assert 'class="report-files-table"' in response.text
+
+
 def test_report_page_404_when_job_has_no_output_dir(auth_client, evaluation_job):
     response = auth_client.get(f"/reports/{evaluation_job.id}")
     assert response.status_code == 404
