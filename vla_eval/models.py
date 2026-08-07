@@ -109,3 +109,17 @@ class EvaluationJob(PersistedModel, Base):
     cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
 
     dataset: Mapped[Dataset] = relationship(back_populates="evaluation_jobs")
+
+
+class EvaluationJobArchive(Base):
+    __tablename__ = "evaluation_job_archives"
+
+    evaluation_job_id: Mapped[str] = mapped_column(
+        ForeignKey("evaluation_jobs.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    archived_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utc_now)
+    archived_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )

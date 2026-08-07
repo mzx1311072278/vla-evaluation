@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import UTC, timedelta
 from uuid import UUID
 
 import pytest
@@ -9,7 +9,7 @@ from sqlalchemy.orm import selectinload
 
 import vla_eval.db as db_module
 from vla_eval.db import create_engine_for_url, init_db, session_scope
-from vla_eval.models import Dataset, EvaluationJob, ImportJob, User
+from vla_eval.models import Dataset, EvaluationJob, EvaluationJobArchive, ImportJob, User
 
 
 def test_database_persists_dataset_and_job(tmp_path):
@@ -153,6 +153,64 @@ def test_evaluation_job_dataset_id_is_indexed():
     indexes = inspect(EvaluationJob).local_table.indexes
 
     assert any(tuple(index.columns.keys()) == ("dataset_id",) for index in indexes)
+
+
+def _persist_evaluation_archive(engine):
+    with session_scope(engine) as session:
+        user = User(username="archiver", password_hash="hash")
+        dataset = Dataset(name="run-1", path="/data/run-1", kind="lerobot", status="READY")
+        session.add_all([user, dataset])
+        session.flush()
+        job = EvaluationJob(dataset_id=dataset.id, profile_name="genie02-full")
+        session.add(job)
+        session.flush()
+        archive = EvaluationJobArchive(
+            evaluation_job_id=job.id,
+            archived_by=user.id,
+        )
+        session.add(archive)
+        session.flush()
+        assert archive.archived_at.tzinfo == UTC
+        return user.id, job.id
+
+
+def test_evaluation_archive_is_unique_per_job(tmp_path):
+    engine = create_engine_for_url(f"sqlite:///{tmp_path / 'app.db'}")
+    init_db(engine)
+    user_id, job_id = _persist_evaluation_archive(engine)
+
+    with pytest.raises(IntegrityError), session_scope(engine) as session:
+        session.add(
+            EvaluationJobArchive(
+                evaluation_job_id=job_id,
+                archived_by=user_id,
+            )
+        )
+
+
+def test_deleting_evaluation_cascades_archive_record(tmp_path):
+    engine = create_engine_for_url(f"sqlite:///{tmp_path / 'app.db'}")
+    init_db(engine)
+    _user_id, job_id = _persist_evaluation_archive(engine)
+
+    with session_scope(engine) as session:
+        session.delete(session.get_one(EvaluationJob, job_id))
+
+    with session_scope(engine) as session:
+        assert session.get(EvaluationJobArchive, job_id) is None
+
+
+def test_deleting_archiver_preserves_archive_and_clears_user(tmp_path):
+    engine = create_engine_for_url(f"sqlite:///{tmp_path / 'app.db'}")
+    init_db(engine)
+    user_id, job_id = _persist_evaluation_archive(engine)
+
+    with session_scope(engine) as session:
+        session.delete(session.get_one(User, user_id))
+
+    with session_scope(engine) as session:
+        archive = session.get_one(EvaluationJobArchive, job_id)
+        assert archive.archived_by is None
 
 
 @pytest.mark.parametrize("url", ["sqlite://", "sqlite+pysqlite:///:memory:"])
