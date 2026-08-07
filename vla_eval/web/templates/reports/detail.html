@@ -36,16 +36,62 @@
         <p>本报告仅陈述当前任务已记录的评测事实，不替代发版审批。</p>
       </div>
       <section class="detail-band report-overview">
-        {% if smoothness_preview_url %}
+        {% if smoothness_chart.points %}
           <figure class="smoothness-preview">
             <figcaption class="section-heading">
               <div>
-                <h2>平滑度曲线</h2>
+                <h2>平滑度趋势</h2>
                 <p class="muted">覆盖 {{ summary_facts.smoothness_coverage }} / {{ summary_facts.episode_count }} 个 Episode</p>
               </div>
-              <a class="icon-button" href="{{ smoothness_preview_url }}" title="下载平滑度矢量图" aria-label="下载平滑度矢量图"><i data-lucide="download"></i></a>
+              {% if smoothness_preview_url %}<a class="icon-button" href="{{ smoothness_preview_url }}" title="下载平滑度矢量图" aria-label="下载平滑度矢量图"><i data-lucide="download"></i></a>{% endif %}
             </figcaption>
-            <img src="{{ smoothness_preview_url }}" alt="平滑度曲线图">
+            <dl class="smoothness-stats">
+              <div><dt>中位数</dt><dd>{{ '%.3f'|format(smoothness_chart.median) }}</dd></div>
+              <div><dt>P90</dt><dd>{{ '%.3f'|format(smoothness_chart.p90) }}</dd></div>
+              <div><dt>最大值</dt><dd>{{ '%.3f'|format(smoothness_chart.maximum) }}</dd></div>
+              <div><dt>有效数据</dt><dd>{{ smoothness_chart.points|length }}</dd></div>
+            </dl>
+            <div class="smoothness-chart-shell table-scroll" data-smoothness-chart>
+              <svg viewBox="0 0 900 330" role="img" aria-label="Episode 平滑度趋势，数值越低越好"></svg>
+              <output class="smoothness-tooltip" data-chart-tooltip hidden></output>
+            </div>
+            <div class="smoothness-legend" aria-label="图例">
+              <span><i class="chart-key chart-key-success"></i>成功</span>
+              <span><i class="chart-key chart-key-failure"></i>失败</span>
+              <span><i class="chart-key chart-key-intervened"></i>遥操介入</span>
+              <span><i class="chart-key chart-key-reference"></i>统计参考线</span>
+            </div>
+            {% if smoothness_chart.points|length > 50 %}
+              <div class="smoothness-controls">
+                <label>显示范围
+                  <select data-chart-window>
+                    <option value="all">全部</option>
+                    <option value="100">100 个</option>
+                    <option value="50">50 个</option>
+                    <option value="25">25 个</option>
+                  </select>
+                </label>
+                <label class="chart-range-label">起始位置
+                  <input type="range" min="0" max="{{ smoothness_chart.points|length - 25 }}" value="0" step="1" data-chart-start disabled>
+                </label>
+                <output data-chart-range-label>全部 {{ smoothness_chart.points|length }} 个 Episode</output>
+              </div>
+            {% endif %}
+            <section class="smoothness-outliers" aria-labelledby="smoothness-outliers-title">
+              <div class="section-heading compact-heading">
+                <div><h3 id="smoothness-outliers-title">最不平滑的 10 个 Episode</h3><p class="muted">按平滑度 S 从高到低，数值越低越好</p></div>
+              </div>
+              <div class="table-scroll">
+                <table>
+                  <thead><tr><th>Episode</th><th>平滑度 S</th><th>结果</th><th>遥操介入</th></tr></thead>
+                  <tbody>
+                    {% for point in smoothness_chart.worst %}
+                      <tr><th scope="row">{{ point.episode }}</th><td>{{ '%.6f'|format(point.value) }}</td><td><span class="status status-{{ 'success' if point.outcome == 'success' else 'failure' }}">{{ point.outcome }}</span></td><td>{{ '是' if point.intervened else '否' }}</td></tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+            </section>
           </figure>
         {% else %}
           <div class="smoothness-summary">
@@ -261,4 +307,116 @@
       {% else %}<p class="empty">暂无可下载结果文件。</p>{% endif %}
     </section>
   </article>
+  {% if smoothness_chart.points %}
+    <script id="smoothness-chart-data" type="application/json">{{ smoothness_chart|tojson }}</script>
+    <script>
+      document.addEventListener("DOMContentLoaded", () => {
+        const root = document.querySelector("[data-smoothness-chart]");
+        const payload = document.querySelector("#smoothness-chart-data");
+        if (!root || !payload) return;
+        const data = JSON.parse(payload.textContent);
+        const svg = root.querySelector("svg");
+        const tooltip = root.querySelector("[data-chart-tooltip]");
+        const windowSelect = document.querySelector("[data-chart-window]");
+        const startInput = document.querySelector("[data-chart-start]");
+        const rangeLabel = document.querySelector("[data-chart-range-label]");
+        const ns = "http://www.w3.org/2000/svg";
+        const width = 900;
+        const height = 330;
+        const pad = { left: 62, right: 26, top: 28, bottom: 48 };
+        const plotWidth = width - pad.left - pad.right;
+        const plotHeight = height - pad.top - pad.bottom;
+
+        const add = (name, attrs, text) => {
+          const node = document.createElementNS(ns, name);
+          Object.entries(attrs).forEach(([key, value]) => node.setAttribute(key, value));
+          if (text !== undefined) node.textContent = text;
+          svg.append(node);
+          return node;
+        };
+        const showTooltip = (point, x, y) => {
+          tooltip.textContent = `Episode ${point.episode} · S ${point.value.toFixed(6)} · ${point.outcome}${point.intervened ? " · 遥操介入" : ""}`;
+          tooltip.style.left = `${Math.min(86, Math.max(8, x / width * 100))}%`;
+          tooltip.style.top = `${Math.max(3, y / height * 100 - 3)}%`;
+          tooltip.hidden = false;
+        };
+        const hideTooltip = () => { tooltip.hidden = true; };
+        const tickIndices = (count, limit = 10) => {
+          if (count <= limit) return Array.from({ length: count }, (_, index) => index);
+          const step = Math.ceil((count - 1) / (limit - 1));
+          const ticks = [];
+          for (let index = 0; index < count; index += step) ticks.push(index);
+          if (ticks.at(-1) !== count - 1) ticks.push(count - 1);
+          return ticks;
+        };
+        const render = () => {
+          const requested = windowSelect?.value || "all";
+          const windowSize = requested === "all" ? data.points.length : Number(requested);
+          const maxStart = Math.max(0, data.points.length - windowSize);
+          if (startInput) {
+            startInput.disabled = requested === "all";
+            startInput.max = String(maxStart);
+            if (Number(startInput.value) > maxStart) startInput.value = String(maxStart);
+          }
+          const start = requested === "all" ? 0 : Number(startInput?.value || 0);
+          const points = data.points.slice(start, start + windowSize);
+          if (rangeLabel) {
+            rangeLabel.textContent = requested === "all"
+              ? `全部 ${data.points.length} 个 Episode`
+              : `Episode ${points[0].episode}–${points.at(-1).episode} / ${data.points.length}`;
+          }
+          svg.replaceChildren();
+          add("title", {}, "Episode 平滑度趋势，数值越低越好");
+          const valueSpan = data.maximum - data.minimum;
+          const yPadding = valueSpan ? valueSpan * 0.1 : Math.max(Math.abs(data.maximum) * 0.05, 0.1);
+          const yMin = Math.max(0, data.minimum - yPadding);
+          const yMax = data.maximum + yPadding;
+          const x = (index) => points.length === 1
+            ? pad.left + plotWidth / 2
+            : pad.left + index / (points.length - 1) * plotWidth;
+          const y = (value) => pad.top + plotHeight - (value - yMin) / (yMax - yMin) * plotHeight;
+          for (let tick = 0; tick <= 4; tick += 1) {
+            const value = yMin + (yMax - yMin) * tick / 4;
+            const position = y(value);
+            add("line", { x1: pad.left, y1: position, x2: width - pad.right, y2: position, class: "chart-grid" });
+            add("text", { x: pad.left - 9, y: position + 4, "text-anchor": "end", class: "chart-axis-label" }, value.toFixed(1));
+          }
+          [["median", "中位数", 14], ["p90", "P90", -6]].forEach(([key, label, labelOffset]) => {
+            const position = y(data[key]);
+            add("line", { x1: pad.left, y1: position, x2: width - pad.right, y2: position, class: `chart-reference chart-reference-${key}` });
+            add("text", { x: pad.left + 7, y: position + labelOffset, class: "chart-reference-label" }, `${label} ${data[key].toFixed(3)}`);
+          });
+          if (points.length > 1) {
+            add("polyline", {
+              points: points.map((point, index) => `${x(index)},${y(point.value)}`).join(" "),
+              class: "chart-trend",
+            });
+          }
+          points.forEach((point, index) => {
+            const cx = x(index);
+            const cy = y(point.value);
+            const circle = add("circle", {
+              cx, cy, r: points.length > 100 ? 3 : 4,
+              class: `chart-point chart-point-${point.outcome}${point.intervened ? " chart-point-intervened" : ""}`,
+              tabindex: "0",
+              role: "img",
+              "aria-label": `Episode ${point.episode}，平滑度 ${point.value.toFixed(6)}，${point.outcome}${point.intervened ? "，遥操介入" : ""}`,
+            });
+            circle.addEventListener("mouseenter", () => showTooltip(point, cx, cy));
+            circle.addEventListener("mouseleave", hideTooltip);
+            circle.addEventListener("focus", () => showTooltip(point, cx, cy));
+            circle.addEventListener("blur", hideTooltip);
+          });
+          tickIndices(points.length).forEach((index) => {
+            add("text", { x: x(index), y: height - 21, "text-anchor": "middle", class: "chart-axis-label" }, `Ep ${points[index].episode}`);
+          });
+          add("text", { x: 17, y: pad.top + plotHeight / 2, transform: `rotate(-90 17 ${pad.top + plotHeight / 2})`, "text-anchor": "middle", class: "chart-axis-title" }, "平滑度 S");
+          add("text", { x: pad.left + plotWidth / 2, y: height - 2, "text-anchor": "middle", class: "chart-axis-title" }, "Episode");
+        };
+        windowSelect?.addEventListener("change", render);
+        startInput?.addEventListener("input", render);
+        render();
+      });
+    </script>
+  {% endif %}
 {% endblock %}

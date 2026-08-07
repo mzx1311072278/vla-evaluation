@@ -20,6 +20,7 @@ if __package__:
         require_session_dir,
     )
     from .metric_definitions import markdown_formula_lines, metric_definition_rows
+    from .smoothness_presentation import summarize_smoothness
 else:
     from genie02_eval_common import (
         EvaluationError,
@@ -32,6 +33,7 @@ else:
         require_session_dir,
     )
     from metric_definitions import markdown_formula_lines, metric_definition_rows
+    from smoothness_presentation import summarize_smoothness
 
 
 SMOOTHNESS_CHART = "smoothness_curve.svg"
@@ -87,23 +89,41 @@ def _write_smoothness_chart(
         return False
 
     values = [float(row["smoothness"]) for row in rows]
+    summary = summarize_smoothness(values)
     width, height = 820, 330
-    left_pad, right_pad, top_pad, bottom_pad = 68, 28, 44, 62
+    left_pad, right_pad, top_pad, bottom_pad = 68, 34, 62, 58
     plot_w = width - left_pad - right_pad
     plot_h = height - top_pad - bottom_pad
-    y_max = max(1.0, max(values) * 1.15)
-    bar_gap = 8
-    bar_w = max(10, (plot_w - bar_gap * (len(rows) - 1)) / len(rows))
+    value_span = summary["maximum"] - summary["minimum"]
+    y_padding = value_span * 0.1 if value_span else max(abs(summary["maximum"]) * 0.05, 0.1)
+    y_min = max(0.0, summary["minimum"] - y_padding)
+    y_max = summary["maximum"] + y_padding
 
     def y_pos(value: float) -> float:
-        return top_pad + plot_h - (value / y_max * plot_h)
+        return top_pad + plot_h - ((value - y_min) / (y_max - y_min) * plot_h)
 
-    y_ticks = [y_max * index / 4 for index in range(5)]
+    def x_pos(index: int) -> float:
+        if len(rows) == 1:
+            return left_pad + plot_w / 2
+        return left_pad + index / (len(rows) - 1) * plot_w
+
+    def tick_indices() -> list[int]:
+        if len(rows) <= 12:
+            return list(range(len(rows)))
+        step = (len(rows) - 1 + 10) // 11
+        indices = list(range(0, len(rows), step))
+        if indices[-1] != len(rows) - 1:
+            indices.append(len(rows) - 1)
+        return indices
+
+    y_ticks = [y_min + (y_max - y_min) * index / 4 for index in range(5)]
     svg = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" data-y-min="{y_min:.3f}" data-y-max="{y_max:.3f}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
         '<style>text{font-family:Arial,"Noto Sans CJK SC",sans-serif}</style>',
-        f'<text x="{width / 2:.1f}" y="24" text-anchor="middle" font-size="16">Episode 平滑度概览</text>',
+        '<title>Episode 平滑度概览</title>',
+        f'<text x="{width / 2:.1f}" y="24" text-anchor="middle" font-size="16" font-weight="700">Episode 平滑度概览</text>',
+        f'<text class="smoothness-summary" x="{left_pad}" y="47" font-size="11" fill="#4e5955">中位数 {summary["median"]:.2f} · P90 {summary["p90"]:.2f} · 最大值 {summary["maximum"]:.2f}</text>',
         f'<line x1="{left_pad}" y1="{top_pad}" x2="{left_pad}" y2="{top_pad + plot_h}" stroke="#333"/>',
         f'<line x1="{left_pad}" y1="{top_pad + plot_h}" x2="{left_pad + plot_w}" y2="{top_pad + plot_h}" stroke="#333"/>',
     ]
@@ -115,30 +135,47 @@ def _write_smoothness_chart(
                 f'<text x="{left_pad - 10}" y="{y + 4:.1f}" text-anchor="end" font-size="12">{tick:.1f}</text>',
             ]
         )
+    for stat_name in ("median", "p90"):
+        value = summary[stat_name]
+        y = y_pos(value)
+        dash = "5 4" if stat_name == "median" else "2 4"
+        svg.append(
+            f'<line data-stat="{stat_name}" x1="{left_pad}" y1="{y:.1f}" x2="{left_pad + plot_w}" y2="{y:.1f}" stroke="#68726e" stroke-dasharray="{dash}"/>'
+        )
+
+    path_points = " ".join(
+        f"{x_pos(index):.1f},{y_pos(value):.1f}" for index, value in enumerate(values)
+    )
+    svg.append(
+        f'<polyline class="smoothness-trend" points="{path_points}" fill="none" stroke="#286a56" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>'
+    )
+
     for index, row in enumerate(rows):
         episode = episodes_by_index[row["episode_index"]]
         outcome = episode["outcome"].strip().lower()
         intervened = episode["operator_intervened"].strip().lower() == "true"
         value = float(row["smoothness"])
-        x = left_pad + index * (bar_w + bar_gap)
+        x = x_pos(index)
         y = y_pos(value)
         fill = "#2f7d59" if outcome == "success" else "#c44e3b"
         stroke = "#111827" if intervened else "#ffffff"
         stroke_width = 2 if intervened else 1
-        svg.extend(
-            [
-                f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" height="{top_pad + plot_h - y:.1f}" fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width}"/>',
-                f'<text x="{x + bar_w / 2:.1f}" y="{y - 5:.1f}" text-anchor="middle" font-size="10">{value:.2f}</text>',
-                f'<text x="{x + bar_w / 2:.1f}" y="{top_pad + plot_h + 18}" text-anchor="middle" font-size="11">Ep {row["episode_index"]}</text>',
-            ]
+        svg.append(
+            f'<circle class="smoothness-point" cx="{x:.1f}" cy="{y:.1f}" r="3" fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width}"><title>Ep {row["episode_index"]}: S={value:.6f}, {outcome}{", 有遥操介入" if intervened else ""}</title></circle>'
+        )
+    for index in tick_indices():
+        row = rows[index]
+        x = x_pos(index)
+        svg.append(
+            f'<text class="x-tick-label" x="{x:.1f}" y="{top_pad + plot_h + 19}" text-anchor="middle" font-size="10">Ep {row["episode_index"]}</text>'
         )
     svg.extend(
         [
-            f'<text x="{left_pad + plot_w / 2:.1f}" y="{height - 16}" text-anchor="middle" font-size="13">Episode</text>',
+            f'<text x="{left_pad + plot_w / 2:.1f}" y="{height - 12}" text-anchor="middle" font-size="13">Episode</text>',
             f'<text x="18" y="{top_pad + plot_h / 2:.1f}" text-anchor="middle" transform="rotate(-90 18 {top_pad + plot_h / 2:.1f})" font-size="13">平滑度 S</text>',
-            f'<rect x="{width - 220}" y="38" width="12" height="12" fill="#2f7d59"/><text x="{width - 202}" y="49" font-size="12">success</text>',
-            f'<rect x="{width - 140}" y="38" width="12" height="12" fill="#c44e3b"/><text x="{width - 122}" y="49" font-size="12">failure</text>',
-            f'<rect x="{width - 220}" y="58" width="12" height="12" fill="#ffffff" stroke="#111827" stroke-width="2"/><text x="{width - 202}" y="69" font-size="12">有遥操介入</text>',
+            f'<circle cx="{width - 254}" cy="44" r="5" fill="#2f7d59"/><text x="{width - 244}" y="48" font-size="11">success</text>',
+            f'<circle cx="{width - 174}" cy="44" r="5" fill="#c44e3b"/><text x="{width - 164}" y="48" font-size="11">failure</text>',
+            f'<circle cx="{width - 94}" cy="44" r="5" fill="#ffffff" stroke="#111827" stroke-width="2"/><text x="{width - 84}" y="48" font-size="11">遥操介入</text>',
         ]
     )
     svg.append("</svg>")

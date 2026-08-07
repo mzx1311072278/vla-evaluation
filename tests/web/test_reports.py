@@ -206,6 +206,122 @@ def test_report_view_uses_current_persisted_evidence(successful_job, ready_datas
     assert "dc67326" not in rendered
 
 
+def test_report_view_builds_smoothness_trend_and_worst_episode_rows(
+    db_engine, ready_dataset, user, data_root
+):
+    values = [1.0, 9.0, 2.0, 8.0, 3.0, 7.0, 4.0, 6.0, 5.0, 10.0, 11.0, 0.5]
+    rows = [
+        {
+            "session_id": "ready-dataset",
+            "episode_index": index,
+            "outcome": "failure" if index in {1, 10} else "success",
+            "duration_s": "1.000",
+            "smoothness": str(value),
+            "left_smoothness": str(value),
+            "right_smoothness": "",
+            "smoothness_space": "joint",
+            "smoothness_frames": 4,
+            "smoothness_skipped_reason": "",
+        }
+        for index, value in enumerate(values)
+    ]
+    metrics = {
+        **_METRICS_SUCCESS,
+        "n_episodes": len(rows),
+        "n_success": 10,
+        "n_failure": 2,
+        "gsr": 10 / 12,
+        "smoothness": {
+            **_METRICS_SUCCESS["smoothness"],
+            "n_episodes": len(rows),
+        },
+    }
+    job, output_dir = _make_succeeded_job(
+        db_engine,
+        ready_dataset,
+        user,
+        data_root,
+        slug="smoothness-presentation",
+        metrics=metrics,
+        episode_rows=rows,
+    )
+    from vla_eval.web.report_view import build_report_view
+
+    view = build_report_view(job=job, dataset=ready_dataset, output_dir=output_dir)
+
+    chart = view["smoothness_chart"]
+    assert len(chart["points"]) == 12
+    assert chart["points"][1] == {
+        "episode": 1,
+        "value": 9.0,
+        "outcome": "failure",
+        "intervened": False,
+    }
+    assert chart["median"] == 5.5
+    assert chart["p90"] == 10.0
+    assert chart["minimum"] == 0.5
+    assert chart["maximum"] == 11.0
+    assert [row["episode"] for row in chart["worst"]] == [10, 9, 1, 3, 5, 7, 8, 6, 4, 2]
+
+
+def test_report_page_renders_interactive_smoothness_diagnostics(
+    auth_client, db_engine, ready_dataset, user, data_root
+):
+    row_count = 60
+    rows = [
+        {
+            "session_id": "ready-dataset",
+            "episode_index": index,
+            "outcome": "failure" if index == 59 else "success",
+            "duration_s": "1.000",
+            "smoothness": str(index / 10),
+            "left_smoothness": str(index / 10),
+            "right_smoothness": "",
+            "smoothness_space": "joint",
+            "smoothness_frames": 4,
+            "smoothness_skipped_reason": "",
+        }
+        for index in range(row_count)
+    ]
+    metrics = {
+        **_METRICS_SUCCESS,
+        "n_episodes": row_count,
+        "n_success": row_count - 1,
+        "n_failure": 1,
+        "gsr": (row_count - 1) / row_count,
+        "smoothness": {
+            **_METRICS_SUCCESS["smoothness"],
+            "n_episodes": row_count,
+        },
+    }
+    job, output_dir = _make_succeeded_job(
+        db_engine,
+        ready_dataset,
+        user,
+        data_root,
+        slug="interactive-smoothness",
+        metrics=metrics,
+        episode_rows=rows,
+    )
+    (output_dir / "smoothness_curve.svg").write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg"></svg>', encoding="utf-8"
+    )
+
+    response = auth_client.get(f"/reports/{job.id}")
+
+    assert response.status_code == 200
+    assert 'data-smoothness-chart' in response.text
+    assert 'id="smoothness-chart-data"' in response.text
+    assert 'data-chart-window' in response.text
+    assert 'data-chart-start' in response.text
+    assert 'class="smoothness-stats"' in response.text
+    assert 'class="smoothness-outliers"' in response.text
+    assert "最不平滑的 10 个 Episode" in response.text
+    assert 'aria-label="下载平滑度矢量图"' in response.text
+    assert 'data-chart-tooltip' in response.text
+    assert 'class="smoothness-chart-shell table-scroll"' in response.text
+
+
 @pytest.mark.parametrize(
     "path",
     [
@@ -342,7 +458,7 @@ def test_report_page_shows_artifact_metadata_and_smoothness_preview(
 
     assert response.status_code == 200
     svg_url = f"/reports/{successful_job.id}/files/smoothness_curve.svg"
-    assert f'<img src="{svg_url}"' in response.text
+    assert 'data-smoothness-chart' in response.text
     assert f'href="{svg_url}"' in response.text
     assert 'class="smoothness-preview"' in response.text
     assert 'aria-label="下载 metrics_core.json"' in response.text
@@ -432,11 +548,15 @@ def test_archived_evaluation_preserves_report_and_every_available_download(
         assert session.get(EvaluationJobArchive, successful_job.id) is None
 
 
-def test_report_page_omits_smoothness_preview_without_svg(auth_client, successful_job):
+def test_report_page_keeps_interactive_smoothness_without_svg_download(
+    auth_client, successful_job
+):
     response = auth_client.get(f"/reports/{successful_job.id}")
 
     assert response.status_code == 200
-    assert 'class="smoothness-preview"' not in response.text
+    assert 'class="smoothness-preview"' in response.text
+    assert 'data-smoothness-chart' in response.text
+    assert 'aria-label="下载平滑度矢量图"' not in response.text
     assert 'class="report-files-table"' in response.text
 
 

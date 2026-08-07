@@ -76,3 +76,17 @@
 - 真实 HTTPS 验收对数据集和评测列表都执行了部分关键词搜索和四种排序；自动化 Chromium 在 1440x1000 和 390x844 视口确认工具栏、控件、操作区无页面级横向溢出或内容越界。
 - 最终只运行一次全量验证：`.venv/bin/pytest -q` 100% 通过，1 个既有跳过项；`.venv/bin/ruff check Genie02_report vla_eval tests` 输出 `All checks passed!`；`git diff --check` 退出 0。
 - 既有依赖仍输出 `StarletteDeprecationWarning`（FastAPI TestClient 的 httpx 兼容过渡），本次功能无新增警告或失败。
+
+## 2026-08-07：平滑度趋势图优化
+
+- 功能继续在 `feature/vla-eval-web-vlm-api-backend` 实施，`main` 未修改，无关未跟踪 `uv.lock` 未纳入修改。
+- 已确认旧 SVG 固定为 820px，且每个柱最少 10px、间隔 8px；199 条数据所需宽度远超画布，导致后续 Episode 被裁切并伴随标签重叠。
+- 新生成的 `smoothness_curve.svg` 使用固定画布折线散点图，保留全部有效 Episode，横轴最多 12 个标签，并使用成功、失败和遥操介入三种可区分标记。
+- Web 报告直接从现有 `episode_metrics.csv` 构建交互趋势，不要求历史任务重新评测；默认显示全部数据，可切换 100/50/25 条窗口并拖动起始位置。
+- 鼠标悬停或键盘聚焦可读取 Episode、六位平滑度、结果和遥操介入；页面同时显示中位数、最近秩 P90、最大值及平滑度最高的 10 个 Episode。
+- 折线图纵轴按当前最小值和最大值自动留出 10% 边距，避免 4.5 至 5.0 一类窄范围数据被零基线压缩；平滑度计算公式和 `metrics_core.json` 未改变。
+- 历史 SVG、CSV 和其他报告下载接口保持不变；未来评测生成新版 SVG，历史任务页面也可通过 CSV 获得新版交互总览。
+- 真实任务 `d7a7e869-4897-4211-8ead-558e0162226a`（199 Episode）验收：默认 199 个点、10 个横轴刻度、中位数 4.833、P90 4.894、最大值 4.976，异常表 10 行。
+- 区间验收切换为 50 条并拖到末尾后准确显示 Episode 149–198；悬停 Episode 149 显示 `S 4.896401`，与持久化 CSV 一致。
+- 1440x1000 桌面宽度无页面横向溢出；390x844 手机宽度下图表和异常表分别局部滚动，页面主体无横向溢出；浏览器无新增 error/warn 日志。
+- 最终执行 `.venv/bin/pytest -q`：100% 通过，1 个既有跳过项；`.venv/bin/ruff check Genie02_report vla_eval tests` 与 `git diff --check` 均通过。

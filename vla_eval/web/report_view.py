@@ -14,6 +14,7 @@ from Genie02_report.genie02_eval_common import (
     load_session,
 )
 from Genie02_report.metric_definitions import METRIC_DEFINITIONS
+from Genie02_report.smoothness_presentation import summarize_smoothness
 from vla_eval.models import Dataset, EvaluationJob
 
 
@@ -60,6 +61,37 @@ def _episode_evidence(attempt: dict[str, Any] | None) -> tuple[str | None, str |
     if from_ts is not None or to_ts is not None:
         evidence_range = f"{from_ts or '—'} → {to_ts or '—'}"
     return evidence_path, evidence_range
+
+
+def _smoothness_chart_data(
+    episode_metrics: list[dict[str, Any]],
+    original_by_index: dict[int, dict[str, str]],
+) -> dict[str, Any]:
+    points = [
+        {
+            "episode": int(row["episode_index"]),
+            "value": float(row["smoothness"]),
+            "outcome": str(row["outcome"]),
+            "intervened": original_by_index[int(row["episode_index"])][
+                "operator_intervened"
+            ].lower()
+            == "true",
+        }
+        for row in episode_metrics
+        if row["smoothness"] is not None
+    ]
+    if not points:
+        return {
+            "points": [],
+            "minimum": None,
+            "median": None,
+            "p90": None,
+            "maximum": None,
+            "worst": [],
+        }
+    summary = summarize_smoothness(point["value"] for point in points)
+    worst = sorted(points, key=lambda point: (-point["value"], point["episode"]))[:10]
+    return {**summary, "points": points, "worst": worst}
 
 
 def _load_attempts(output_dir: Path) -> tuple[dict[int, dict[str, Any]], str]:
@@ -284,6 +316,10 @@ def build_report_view(
             "vlm_executed": attempt_status == "available",
             "vlm_artifact_status": attempt_status,
         },
+        "smoothness_chart": _smoothness_chart_data(
+            episode_metrics,
+            original_by_index,
+        ),
         "configuration_rows": _configuration_rows(job, dataset, session),
         "source_rows": _source_rows(dataset, output_dir, attempt_status),
         "quality_rows": quality_rows,

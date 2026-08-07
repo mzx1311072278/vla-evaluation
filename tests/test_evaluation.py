@@ -22,6 +22,38 @@ PROFILE_PATH = Path("config/profiles/genie02-full.yaml")
 API_PROFILE_PATH = Path("config/profiles/genie02-api.yaml")
 
 
+def test_smoothness_svg_keeps_large_episode_series_readable(tmp_path: Path):
+    from Genie02_report.genie02_markdown_report import _write_smoothness_chart
+
+    episodes = [
+        {
+            "episode_index": str(index),
+            "outcome": "failure" if index in {41, 157} else "success",
+            "operator_intervened": "true" if index == 88 else "false",
+        }
+        for index in range(199)
+    ]
+    episode_metrics = [
+        {
+            "episode_index": index,
+            "smoothness": 4.5 + (index % 17) / 20,
+        }
+        for index in range(199)
+    ]
+
+    assert _write_smoothness_chart(tmp_path, episodes, episode_metrics) is True
+
+    svg = (tmp_path / "smoothness_curve.svg").read_text(encoding="utf-8")
+    assert svg.count('class="smoothness-point"') == 199
+    assert svg.count('class="x-tick-label"') <= 12
+    assert 'class="smoothness-trend"' in svg
+    assert 'data-stat="median"' in svg
+    assert 'data-stat="p90"' in svg
+    assert 'data-y-min="4.420"' in svg
+    assert 'data-value-label=' not in svg
+    assert "Ep 198" in svg
+
+
 def _profile_data() -> dict[str, Any]:
     return yaml.safe_load(PROFILE_PATH.read_text(encoding="utf-8"))
 
