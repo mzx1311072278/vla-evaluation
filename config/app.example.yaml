@@ -4,6 +4,11 @@ redis_url: redis://redis:6379/0
 model_path: /srv/vla-eval/data/models/Qwen2.5-VL-7B-Instruct
 session_secret: "${VLA_EVAL_SESSION_SECRET}"
 
+local_sources:
+  this-host:
+    roots:
+      - /mnt/vla-datasets
+
 remote_sources:
   lab-a:
     host: 10.0.0.8

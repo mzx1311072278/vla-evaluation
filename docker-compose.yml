@@ -70,6 +70,7 @@ services:
       - /srv/vla-eval/data:/srv/vla-eval/data
       - /srv/vla-eval/config:/srv/vla-eval/config:ro
       - /srv/vla-eval/secrets:/run/secrets:ro
+      - /mnt/vla-datasets:/mnt/vla-datasets:ro
     command: ["python", "-m", "vla_eval.cli", "worker", "--queue", "transfers"]
     networks:
       - frontend

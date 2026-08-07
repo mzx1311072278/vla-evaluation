@@ -91,6 +91,10 @@ database_url: sqlite:////srv/vla-eval/data/db/app.sqlite3
 redis_url: redis://redis:6379/0
 model_path: /srv/vla-eval/data/models/Qwen2.5-VL-7B-Instruct
 session_secret: "${VLA_EVAL_SESSION_SECRET}"
+local_sources:
+  this-host:
+    roots:
+      - /mnt/vla-datasets
 remote_sources:
   lab-a:
     host: 10.0.0.8
@@ -114,6 +118,33 @@ credentials under `/srv/vla-eval/secrets/` (uid 1001 readable):
 sudo install -m 600 -o 1001 -g 1001 lab_a_key      /srv/vla-eval/secrets/lab_a_key
 ssh-keyscan -H 10.0.0.8 | sudo tee /srv/vla-eval/secrets/known_hosts >/dev/null
 ```
+
+### Controlled local dataset sources
+
+`local_sources` refers to directories visible on the **transfer Worker host**,
+not to the laptop running the browser. The shipped Compose file mounts the host
+directory `/mnt/vla-datasets` at the same path inside `transfer-worker` with
+read-only access. Keep the configured path and the container mount aligned if
+you choose a different directory.
+
+An SMB/NAS share can be used by mounting it on the Ubuntu host first, then
+adding that mount point as a whitelisted root. For example:
+
+```bash
+sudo mkdir -p /mnt/vla-datasets
+sudo mount -t cifs //nas.example/vla /mnt/vla-datasets \
+  -o credentials=/root/.smb-vla,ro,uid=1001,gid=1001
+```
+
+The Web form accepts only a configured source, an exact configured root, and a
+relative path beneath that root. The transfer Worker copies the selected
+dataset into its task-specific staging directory, runs preflight inspection,
+and atomically publishes a valid dataset into `/srv/vla-eval/data/inbox` before
+evaluation. It never evaluates directly from `/mnt`, Downloads, SMB, or NAS,
+and the source mount remains read-only.
+
+For an SSH-accessible source that is not mounted on this server, continue to
+use `remote_sources`; the Worker pulls it over the pinned SSH configuration.
 
 ### VLM backend: local GPU (default) or OpenAI-compatible API (optional)
 
