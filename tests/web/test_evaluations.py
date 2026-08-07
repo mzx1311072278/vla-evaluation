@@ -9,7 +9,7 @@ from sqlalchemy import Engine, select
 
 from tests.conftest import reload_job
 from vla_eval.db import session_scope
-from vla_eval.models import EvaluationJob
+from vla_eval.models import Dataset, EvaluationJob
 from vla_eval.tasks import run_evaluation_task
 
 
@@ -513,6 +513,47 @@ def test_retry_rejected_when_dataset_not_ready(
 
     response = auth_client.post(
         f"/evaluations/{job_id}/retry", data={"csrf_token": auth_client.csrf}
+    )
+
+    assert response.status_code == 422
+    assert fake_queues.evaluation.count == 0
+
+
+def test_archived_dataset_cannot_open_new_evaluation(auth_client, db_engine, ready_dataset):
+    with session_scope(db_engine) as session:
+        session.get_one(Dataset, ready_dataset.id).status = "ARCHIVED"
+
+    response = auth_client.get(f"/evaluations/new?dataset_id={ready_dataset.id}")
+
+    assert response.status_code == 422
+
+
+def test_archived_dataset_cannot_submit_evaluation(
+    auth_client, db_engine, fake_queues, ready_dataset
+):
+    with session_scope(db_engine) as session:
+        session.get_one(Dataset, ready_dataset.id).status = "ARCHIVED"
+
+    response = auth_client.post(
+        "/evaluations",
+        data=_evaluation_form(auth_client.csrf, ready_dataset.id),
+    )
+
+    assert response.status_code == 422
+    assert fake_queues.evaluation.count == 0
+
+
+def test_failed_evaluation_cannot_retry_while_dataset_archived(
+    auth_client, db_engine, fake_queues, evaluation_job
+):
+    with session_scope(db_engine) as session:
+        job = session.get_one(EvaluationJob, evaluation_job.id)
+        job.state = "FAILED"
+        session.get_one(Dataset, job.dataset_id).status = "ARCHIVED"
+
+    response = auth_client.post(
+        f"/evaluations/{evaluation_job.id}/retry",
+        data={"csrf_token": auth_client.csrf},
     )
 
     assert response.status_code == 422

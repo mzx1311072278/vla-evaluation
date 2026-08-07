@@ -6,6 +6,7 @@ import secrets
 import stat
 import unicodedata
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, BinaryIO
 
@@ -20,6 +21,7 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 from vla_eval.db import session_scope
 from vla_eval.models import Dataset, EvaluationJob, User
 from vla_eval.security import require_csrf, require_html_user
+from vla_eval.web.list_management import validate_return_to
 
 router = APIRouter()
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
@@ -30,6 +32,12 @@ _MAX_DATASET_ATTACHMENTS_BYTES = 100 * 1024 * 1024
 _READ_CHUNK_BYTES = 1024 * 1024
 _PERCENT_ESCAPE = re.compile(r"%([0-9A-Fa-f]{2})")
 _FILE_TOO_LARGE_MESSAGE = "attachment-file-too-large"
+_ARCHIVE_KEY = "_archive"
+_ARCHIVABLE_DATASET_STATES = frozenset({"READY", "PREFLIGHT_FAILED"})
+_ARCHIVE_FORM_FIELDS = frozenset({"csrf_token", "return_to"})
+_TERMINAL_EVALUATION_STATES = frozenset(
+    {"SUCCEEDED", "FAILED", "CANCELLED", "INTERRUPTED"}
+)
 
 
 class _AttachmentValidationError(ValueError):
@@ -89,6 +97,41 @@ def _load_dataset(request: Request, dataset_id: str) -> Dataset:
     if dataset is None:
         raise HTTPException(status_code=404, detail="Dataset not found")
     return dataset
+
+
+async def _archive_form_target(request: Request, dataset_id: str) -> str:
+    form = await request.form()
+    require_csrf(request, form.getlist("csrf_token"))
+    if set(form.keys()) != _ARCHIVE_FORM_FIELDS:
+        raise HTTPException(status_code=422, detail="Invalid dataset archive form")
+    return_values = form.getlist("return_to")
+    if len(return_values) != 1 or not isinstance(return_values[0], str):
+        raise HTTPException(status_code=422, detail="Invalid dataset archive form")
+    return validate_return_to(
+        return_values[0],
+        allowed_paths=frozenset({"/datasets", f"/datasets/{dataset_id}"}),
+        fallback="/datasets",
+    )
+
+
+def _valid_archive_snapshot(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "previous_status",
+        "archived_at",
+        "archived_by",
+    }:
+        return False
+    if value["previous_status"] not in _ARCHIVABLE_DATASET_STATES:
+        return False
+    archived_at = value["archived_at"]
+    archived_by = value["archived_by"]
+    if not isinstance(archived_at, str) or not isinstance(archived_by, str) or not archived_by:
+        return False
+    try:
+        parsed_archived_at = datetime.fromisoformat(archived_at)
+    except ValueError:
+        return False
+    return parsed_archived_at.tzinfo is not None
 
 
 def _validate_attachment_name(raw_name: str | None) -> str:
@@ -311,6 +354,70 @@ def dataset_detail(
             recent_evaluations=recent_evaluations,
         ),
     )
+
+
+@router.post("/datasets/{dataset_id}/archive")
+async def archive_dataset(
+    request: Request,
+    dataset_id: str,
+    current_user: Annotated[User, Depends(require_html_user)],
+):
+    return_to = await _archive_form_target(request, dataset_id)
+    with session_scope(request.app.state.engine) as session:
+        dataset = session.get(Dataset, dataset_id)
+        if dataset is None:
+            raise HTTPException(status_code=404, detail="Dataset not found")
+        if dataset.status not in _ARCHIVABLE_DATASET_STATES:
+            raise HTTPException(status_code=409, detail="Dataset cannot be archived")
+        active_job_id = session.scalar(
+            select(EvaluationJob.id)
+            .where(
+                EvaluationJob.dataset_id == dataset_id,
+                EvaluationJob.state.not_in(_TERMINAL_EVALUATION_STATES),
+            )
+            .limit(1)
+        )
+        if active_job_id is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Dataset has an active evaluation",
+            )
+        if not isinstance(dataset.inspection_json, dict):
+            raise HTTPException(status_code=409, detail="Dataset metadata is invalid")
+        metadata = dict(dataset.inspection_json)
+        if _ARCHIVE_KEY in metadata:
+            raise HTTPException(status_code=409, detail="Dataset metadata is invalid")
+        metadata[_ARCHIVE_KEY] = {
+            "previous_status": dataset.status,
+            "archived_at": datetime.now(UTC).isoformat(),
+            "archived_by": current_user.id,
+        }
+        dataset.inspection_json = metadata
+        dataset.status = "ARCHIVED"
+    return RedirectResponse(return_to, status_code=303)
+
+
+@router.post("/datasets/{dataset_id}/restore")
+async def restore_dataset(
+    request: Request,
+    dataset_id: str,
+    _current_user: Annotated[User, Depends(require_html_user)],
+):
+    return_to = await _archive_form_target(request, dataset_id)
+    with session_scope(request.app.state.engine) as session:
+        dataset = session.get(Dataset, dataset_id)
+        if dataset is None:
+            raise HTTPException(status_code=404, detail="Dataset not found")
+        if dataset.status != "ARCHIVED" or not isinstance(dataset.inspection_json, dict):
+            raise HTTPException(status_code=409, detail="Dataset cannot be restored")
+        metadata = dict(dataset.inspection_json)
+        snapshot = metadata.get(_ARCHIVE_KEY)
+        if not _valid_archive_snapshot(snapshot):
+            raise HTTPException(status_code=409, detail="Dataset archive metadata is invalid")
+        metadata.pop(_ARCHIVE_KEY)
+        dataset.inspection_json = metadata
+        dataset.status = snapshot["previous_status"]
+    return RedirectResponse(return_to, status_code=303)
 
 
 @router.post("/datasets/{dataset_id}/attachments")

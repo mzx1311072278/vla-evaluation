@@ -1,5 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlencode
 
 import pytest
 from fastapi.testclient import TestClient
@@ -84,6 +86,198 @@ def test_non_ready_dataset_detail_disables_evaluation_and_shows_preflight(
 
 def test_missing_dataset_is_not_found(auth_client):
     assert auth_client.get("/datasets/not-a-dataset").status_code == 404
+
+
+def _dataset_files(path: str) -> dict[str, bytes]:
+    root = Path(path)
+    return {
+        str(file.relative_to(root)): file.read_bytes()
+        for file in sorted(root.rglob("*"))
+        if file.is_file()
+    }
+
+
+def _archive_dataset(client, dataset_id: str, *, return_to: str = "/datasets"):
+    return client.post(
+        f"/datasets/{dataset_id}/archive",
+        data={"csrf_token": client.csrf, "return_to": return_to},
+        follow_redirects=False,
+    )
+
+
+def _restore_dataset(client, dataset_id: str, *, return_to: str = "/datasets"):
+    return client.post(
+        f"/datasets/{dataset_id}/restore",
+        data={"csrf_token": client.csrf, "return_to": return_to},
+        follow_redirects=False,
+    )
+
+
+def test_archive_ready_dataset_preserves_files_and_records_restore_snapshot(
+    auth_client, db_engine: Engine, ready_dataset, user
+):
+    with session_scope(db_engine) as session:
+        stored = session.get_one(Dataset, ready_dataset.id)
+        stored.inspection_json = {"errors": ["historical warning"]}
+    files_before = _dataset_files(ready_dataset.path)
+
+    response = _archive_dataset(
+        auth_client,
+        ready_dataset.id,
+        return_to="/datasets?q=ready",
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/datasets?q=ready"
+    assert _dataset_files(ready_dataset.path) == files_before
+    with session_scope(db_engine) as session:
+        stored = session.get_one(Dataset, ready_dataset.id)
+        assert stored.status == "ARCHIVED"
+        assert stored.inspection_json["errors"] == ["historical warning"]
+        archive = stored.inspection_json["_archive"]
+        assert archive["previous_status"] == "READY"
+        assert archive["archived_by"] == user.id
+        assert datetime.fromisoformat(archive["archived_at"]).tzinfo is not None
+
+
+def test_archive_dataset_requires_one_valid_csrf_token(
+    auth_client, db_engine: Engine, ready_dataset
+):
+    response = auth_client.post(
+        f"/datasets/{ready_dataset.id}/archive",
+        data={"return_to": "/datasets"},
+    )
+    duplicate = auth_client.post(
+        f"/datasets/{ready_dataset.id}/archive",
+        content=urlencode(
+            [
+                ("csrf_token", auth_client.csrf),
+                ("csrf_token", auth_client.csrf),
+                ("return_to", "/datasets"),
+            ]
+        ),
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == duplicate.status_code == 403
+    with session_scope(db_engine) as session:
+        assert session.get_one(Dataset, ready_dataset.id).status == "READY"
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        [("csrf_token", "{csrf}")],
+        [("csrf_token", "{csrf}"), ("return_to", "/datasets"), ("extra", "1")],
+        [
+            ("csrf_token", "{csrf}"),
+            ("return_to", "/datasets"),
+            ("return_to", "/datasets?q=ready"),
+        ],
+    ],
+)
+def test_archive_dataset_rejects_unknown_or_duplicate_fields(
+    auth_client, db_engine: Engine, ready_dataset, data
+):
+    submitted = [(key, auth_client.csrf if value == "{csrf}" else value) for key, value in data]
+
+    response = auth_client.post(
+        f"/datasets/{ready_dataset.id}/archive",
+        content=urlencode(submitted),
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 422
+    with session_scope(db_engine) as session:
+        assert session.get_one(Dataset, ready_dataset.id).status == "READY"
+
+
+def test_archive_dataset_rejects_repeat_and_uses_safe_return_fallback(
+    auth_client, ready_dataset
+):
+    archived = _archive_dataset(
+        auth_client,
+        ready_dataset.id,
+        return_to="https://evil.example/steal",
+    )
+    repeated = _archive_dataset(auth_client, ready_dataset.id)
+
+    assert archived.status_code == 303
+    assert archived.headers["location"] == "/datasets"
+    assert repeated.status_code == 409
+
+
+@pytest.mark.parametrize("state", ["QUEUED", "RUNNING"])
+def test_archive_dataset_rejects_active_evaluation(
+    auth_client, db_engine: Engine, ready_dataset, state: str
+):
+    with session_scope(db_engine) as session:
+        session.add(
+            EvaluationJob(
+                dataset_id=ready_dataset.id,
+                profile_name="active-profile",
+                state=state,
+            )
+        )
+
+    response = _archive_dataset(auth_client, ready_dataset.id)
+
+    assert response.status_code == 409
+    with session_scope(db_engine) as session:
+        assert session.get_one(Dataset, ready_dataset.id).status == "READY"
+
+
+def test_restore_dataset_restores_previous_status_and_preserves_metadata(
+    auth_client, db_engine: Engine, ready_dataset
+):
+    with session_scope(db_engine) as session:
+        stored = session.get_one(Dataset, ready_dataset.id)
+        stored.status = "ARCHIVED"
+        stored.inspection_json = {
+            "errors": ["historical warning"],
+            "_archive": {
+                "previous_status": "READY",
+                "archived_at": "2026-08-07T08:00:00+00:00",
+                "archived_by": "user-id",
+            },
+        }
+
+    response = _restore_dataset(
+        auth_client,
+        ready_dataset.id,
+        return_to=f"/datasets/{ready_dataset.id}",
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/datasets/{ready_dataset.id}"
+    with session_scope(db_engine) as session:
+        stored = session.get_one(Dataset, ready_dataset.id)
+        assert stored.status == "READY"
+        assert stored.inspection_json == {"errors": ["historical warning"]}
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {},
+        {"_archive": "invalid"},
+        {"_archive": {"previous_status": "PENDING"}},
+        {"_archive": {"previous_status": "READY"}},
+    ],
+)
+def test_restore_dataset_rejects_missing_or_corrupt_archive_metadata(
+    auth_client, db_engine: Engine, ready_dataset, metadata
+):
+    with session_scope(db_engine) as session:
+        stored = session.get_one(Dataset, ready_dataset.id)
+        stored.status = "ARCHIVED"
+        stored.inspection_json = metadata
+
+    response = _restore_dataset(auth_client, ready_dataset.id)
+
+    assert response.status_code == 409
+    with session_scope(db_engine) as session:
+        assert session.get_one(Dataset, ready_dataset.id).status == "ARCHIVED"
 
 
 def _upload(client, dataset_id: str, filename: str, content: bytes, csrf: str | None = None):
