@@ -65,14 +65,14 @@
       {% if downloads %}
         <div class="table-scroll report-files">
           <table class="report-files-table">
-            <thead><tr><th>文件</th><th>内容</th><th>格式</th><th class="sr-only">操作</th></tr></thead>
+            <thead><tr><th>文件</th><th>内容</th><th>格式</th><th><span class="sr-only">操作</span></th></tr></thead>
             <tbody>
               {% for item in downloads %}
                 <tr>
                   <td><code>{{ item.name }}</code></td>
                   <td>{{ item.description }}</td>
                   <td>{{ item.format }}</td>
-                  <td><a class="download-action" href="{{ item.url }}"><i data-lucide="download"></i>下载</a></td>
+                  <td><a class="table-action" href="{{ item.url }}"><i data-lucide="download"></i>下载</a></td>
                 </tr>
               {% endfor %}
             </tbody>

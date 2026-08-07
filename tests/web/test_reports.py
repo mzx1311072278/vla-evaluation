@@ -150,6 +150,9 @@ def test_report_page_shows_core_metrics(auth_client, successful_job):
     assert 'class="section-heading"' in response.text
     assert "2 个文件" in response.text
     assert 'data-lucide="download"' in response.text
+    assert 'class="table-scroll report-files"' in response.text
+    assert '<th><span class="sr-only">操作</span></th>' in response.text
+    assert 'class="table-action"' in response.text
     assert "GSR" in response.text
     # successful_job fixture has gsr=1.0 -> rendered as 100.0% (one decimal).
     assert "100.0%" in response.text
@@ -181,6 +184,16 @@ def test_report_page_shows_artifact_metadata_and_smoothness_preview(
     assert f'<img src="{svg_url}"' in response.text
     assert f'href="{svg_url}"' in response.text
     assert 'class="smoothness-preview"' in response.text
+    assert "<figcaption>" in response.text
+    for filename in (
+        "episode_metrics.csv",
+        "metrics_core.json",
+        "smoothness_curve.svg",
+        "attempt_summary.json",
+        "attempt_summary.csv",
+        "report_summary.md",
+    ):
+        assert f'href="/reports/{successful_job.id}/files/{filename}"' in response.text
     for description, file_format in (
         ("Episode 逐项指标", "CSV"),
         ("评测汇总指标", "JSON"),
