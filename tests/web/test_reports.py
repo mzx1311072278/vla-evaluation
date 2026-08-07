@@ -10,7 +10,7 @@ from sqlalchemy import Engine
 
 from Genie02_report.genie02_eval_common import EPISODE_METRIC_FIELDS
 from vla_eval.db import session_scope
-from vla_eval.models import Dataset, EvaluationJob, User
+from vla_eval.models import Dataset, EvaluationJob, EvaluationJobArchive, User
 
 _METRICS_SUCCESS = {
     "schema_version": "1.0",
@@ -370,6 +370,66 @@ def test_report_page_shows_artifact_metadata_and_smoothness_preview(
     ):
         assert description in response.text
         assert f">{file_format}<" in response.text
+
+
+def test_archived_evaluation_preserves_report_and_every_available_download(
+    auth_client, db_engine: Engine, successful_job
+):
+    output_dir = Path(successful_job.output_dir)
+    (output_dir / "smoothness_curve.svg").write_bytes(
+        b'<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0"/></svg>'
+    )
+    attempt_dir = output_dir / "attempt_eval"
+    attempt_dir.mkdir()
+    (attempt_dir / "attempt_summary.json").write_bytes(b"[]")
+    (attempt_dir / "attempt_summary.csv").write_bytes(b"episode_index\n")
+    (output_dir / "report_acceptance.md").write_bytes(b"# Full report\n")
+    filenames = (
+        "metrics_core.json",
+        "episode_metrics.csv",
+        "smoothness_curve.svg",
+        "attempt_eval/attempt_summary.json",
+        "attempt_eval/attempt_summary.csv",
+        "report_acceptance.md",
+    )
+    report_url = f"/reports/{successful_job.id}"
+    report_before = auth_client.get(report_url)
+    downloads_before = {
+        filename: auth_client.get(f"{report_url}/files/{filename}")
+        for filename in filenames
+    }
+
+    archived = auth_client.post(
+        f"/evaluations/{successful_job.id}/archive",
+        data={
+            "csrf_token": auth_client.csrf,
+            "return_to": f"/evaluations/{successful_job.id}",
+        },
+        follow_redirects=False,
+    )
+
+    assert archived.status_code == 303
+    report_after = auth_client.get(report_url)
+    assert report_after.status_code == report_before.status_code == 200
+    assert report_after.content == report_before.content
+    for filename, before in downloads_before.items():
+        after = auth_client.get(f"{report_url}/files/{filename}")
+        assert before.status_code == after.status_code == 200
+        assert after.content == before.content
+        assert after.headers["content-disposition"] == before.headers["content-disposition"]
+    with session_scope(db_engine) as session:
+        assert session.get(EvaluationJobArchive, successful_job.id) is not None
+
+    restored = auth_client.post(
+        f"/evaluations/{successful_job.id}/restore",
+        data={"csrf_token": auth_client.csrf, "return_to": report_url},
+        follow_redirects=False,
+    )
+
+    assert restored.status_code == 303
+    assert restored.headers["location"] == report_url
+    with session_scope(db_engine) as session:
+        assert session.get(EvaluationJobArchive, successful_job.id) is None
 
 
 def test_report_page_omits_smoothness_preview_without_svg(auth_client, successful_job):

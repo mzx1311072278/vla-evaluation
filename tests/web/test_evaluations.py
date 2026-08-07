@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
@@ -9,7 +10,7 @@ from sqlalchemy import Engine, select
 
 from tests.conftest import reload_job
 from vla_eval.db import session_scope
-from vla_eval.models import Dataset, EvaluationJob
+from vla_eval.models import Dataset, EvaluationJob, EvaluationJobArchive
 from vla_eval.tasks import run_evaluation_task
 
 
@@ -112,6 +113,176 @@ def test_evaluation_pages_require_login(client: TestClient, path: str):
 
     assert response.status_code == 303
     assert response.headers["location"] == "/login"
+
+
+def _archive_evaluation(client, job_id: str, *, return_to: str = "/evaluations"):
+    return client.post(
+        f"/evaluations/{job_id}/archive",
+        data={"csrf_token": client.csrf, "return_to": return_to},
+        follow_redirects=False,
+    )
+
+
+def _restore_evaluation(client, job_id: str, *, return_to: str = "/evaluations"):
+    return client.post(
+        f"/evaluations/{job_id}/restore",
+        data={"csrf_token": client.csrf, "return_to": return_to},
+        follow_redirects=False,
+    )
+
+
+def _job_snapshot(job: EvaluationJob) -> dict[str, object]:
+    return {
+        column.name: deepcopy(getattr(job, column.name))
+        for column in EvaluationJob.__table__.columns
+    }
+
+
+@pytest.mark.parametrize("state", ["SUCCEEDED", "FAILED", "CANCELLED", "INTERRUPTED"])
+def test_archive_terminal_evaluation_preserves_every_job_field(
+    auth_client, db_engine: Engine, evaluation_job, user, state: str
+):
+    with session_scope(db_engine) as session:
+        job = session.get_one(EvaluationJob, evaluation_job.id)
+        job.state = state
+        job.stage = "REPORT"
+        job.progress = 73.5
+        job.error_code = "HISTORICAL_ERROR"
+        job.error_message = "historical details"
+        job.params_json = {"vlm_enabled": True}
+        job.provenance_json = {"dataset_fingerprint": "abc123"}
+        session.flush()
+        before = _job_snapshot(job)
+
+    response = _archive_evaluation(
+        auth_client,
+        evaluation_job.id,
+        return_to=f"/evaluations?state={state}",
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/evaluations?state={state}"
+    with session_scope(db_engine) as session:
+        assert _job_snapshot(session.get_one(EvaluationJob, evaluation_job.id)) == before
+        archive = session.get_one(EvaluationJobArchive, evaluation_job.id)
+        assert archive.archived_by == user.id
+        assert archive.archived_at.tzinfo is not None
+
+
+@pytest.mark.parametrize("state", ["QUEUED", "RUNNING"])
+def test_archive_evaluation_rejects_nonterminal_state(
+    auth_client, db_engine: Engine, evaluation_job, state: str
+):
+    with session_scope(db_engine) as session:
+        session.get_one(EvaluationJob, evaluation_job.id).state = state
+
+    response = _archive_evaluation(auth_client, evaluation_job.id)
+
+    assert response.status_code == 409
+    with session_scope(db_engine) as session:
+        assert session.get(EvaluationJobArchive, evaluation_job.id) is None
+
+
+def test_archive_evaluation_requires_one_valid_csrf_token(
+    auth_client, db_engine: Engine, evaluation_job
+):
+    with session_scope(db_engine) as session:
+        session.get_one(EvaluationJob, evaluation_job.id).state = "FAILED"
+
+    missing = auth_client.post(
+        f"/evaluations/{evaluation_job.id}/archive",
+        data={"return_to": "/evaluations"},
+    )
+    duplicate = auth_client.post(
+        f"/evaluations/{evaluation_job.id}/archive",
+        content=urlencode(
+            [
+                ("csrf_token", auth_client.csrf),
+                ("csrf_token", auth_client.csrf),
+                ("return_to", "/evaluations"),
+            ]
+        ),
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert missing.status_code == duplicate.status_code == 403
+    with session_scope(db_engine) as session:
+        assert session.get(EvaluationJobArchive, evaluation_job.id) is None
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        [("csrf_token", "{csrf}")],
+        [("csrf_token", "{csrf}"), ("return_to", "/evaluations"), ("extra", "1")],
+        [
+            ("csrf_token", "{csrf}"),
+            ("return_to", "/evaluations"),
+            ("return_to", "/evaluations?state=FAILED"),
+        ],
+    ],
+)
+def test_archive_evaluation_rejects_missing_unknown_or_duplicate_fields(
+    auth_client, db_engine: Engine, evaluation_job, fields
+):
+    with session_scope(db_engine) as session:
+        session.get_one(EvaluationJob, evaluation_job.id).state = "FAILED"
+    submitted = [
+        (key, auth_client.csrf if value == "{csrf}" else value) for key, value in fields
+    ]
+
+    response = auth_client.post(
+        f"/evaluations/{evaluation_job.id}/archive",
+        content=urlencode(submitted),
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 422
+    with session_scope(db_engine) as session:
+        assert session.get(EvaluationJobArchive, evaluation_job.id) is None
+
+
+def test_evaluation_archive_restore_lifecycle_and_safe_return_target(
+    auth_client, db_engine: Engine, evaluation_job
+):
+    with session_scope(db_engine) as session:
+        job = session.get_one(EvaluationJob, evaluation_job.id)
+        job.state = "INTERRUPTED"
+        session.flush()
+        before = _job_snapshot(job)
+
+    archived = _archive_evaluation(
+        auth_client,
+        evaluation_job.id,
+        return_to="https://evil.example/steal",
+    )
+    repeated_archive = _archive_evaluation(auth_client, evaluation_job.id)
+    restored = _restore_evaluation(
+        auth_client,
+        evaluation_job.id,
+        return_to=f"/evaluations/{evaluation_job.id}",
+    )
+    repeated_restore = _restore_evaluation(auth_client, evaluation_job.id)
+
+    assert archived.status_code == 303
+    assert archived.headers["location"] == "/evaluations"
+    assert repeated_archive.status_code == 409
+    assert restored.status_code == 303
+    assert restored.headers["location"] == f"/evaluations/{evaluation_job.id}"
+    assert repeated_restore.status_code == 409
+    with session_scope(db_engine) as session:
+        assert session.get(EvaluationJobArchive, evaluation_job.id) is None
+        assert _job_snapshot(session.get_one(EvaluationJob, evaluation_job.id)) == before
+
+
+@pytest.mark.parametrize("operation", ["archive", "restore"])
+def test_evaluation_archive_operations_reject_missing_job(auth_client, operation: str):
+    response = auth_client.post(
+        f"/evaluations/not-a-job/{operation}",
+        data={"csrf_token": auth_client.csrf, "return_to": "/evaluations"},
+    )
+
+    assert response.status_code == 404
 
 
 def test_submit_evaluation_enqueues_business_id(auth_client, ready_dataset, fake_queues):

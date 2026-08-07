@@ -9,14 +9,16 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy.exc import IntegrityError
 
 import vla_eval
 from vla_eval.datasets import inspect_dataset
 from vla_eval.db import session_scope
-from vla_eval.models import Dataset, EvaluationJob, User
+from vla_eval.models import Dataset, EvaluationJob, EvaluationJobArchive, User
 from vla_eval.profiles import Profile, load_profile
 from vla_eval.security import require_csrf, require_html_user
 from vla_eval.tasks import run_evaluation_task
+from vla_eval.web.list_management import validate_return_to
 
 router = APIRouter()
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
@@ -24,6 +26,8 @@ templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 _TERMINAL_STATES = frozenset({"SUCCEEDED", "FAILED", "CANCELLED", "INTERRUPTED"})
 _ACTIVE_STATES = frozenset({"QUEUED", "PREFLIGHT", "METRICS", "VLM", "REPORT", "RUNNING"})
 _JOB_STATES = tuple(sorted(_TERMINAL_STATES | _ACTIVE_STATES))
+_ARCHIVABLE_JOB_STATES = _TERMINAL_STATES
+_ARCHIVE_FORM_FIELDS = frozenset({"csrf_token", "return_to"})
 _ALLOWED_FIELDS = frozenset(
     {"csrf_token", "dataset_id", "profile", "vlm_enabled", "force"}
 )
@@ -59,6 +63,27 @@ def _load_dataset(request: Request, dataset_id: str) -> Dataset:
     if dataset is None:
         raise HTTPException(status_code=404, detail="Dataset not found")
     return dataset
+
+
+async def _archive_form_target(request: Request, job_id: str) -> str:
+    form = await request.form()
+    require_csrf(request, form.getlist("csrf_token"))
+    if set(form.keys()) != _ARCHIVE_FORM_FIELDS:
+        raise HTTPException(status_code=422, detail="Invalid evaluation archive form")
+    return_values = form.getlist("return_to")
+    if len(return_values) != 1 or not isinstance(return_values[0], str):
+        raise HTTPException(status_code=422, detail="Invalid evaluation archive form")
+    return validate_return_to(
+        return_values[0],
+        allowed_paths=frozenset(
+            {
+                "/evaluations",
+                f"/evaluations/{job_id}",
+                f"/reports/{job_id}",
+            }
+        ),
+        fallback="/evaluations",
+    )
 
 
 def _profiles_root() -> Path:
@@ -443,6 +468,62 @@ def evaluation_status(
     if finished:
         response.headers["HX-Trigger"] = "job-finished"
     return response
+
+
+@router.post("/evaluations/{job_id}/archive")
+async def archive_evaluation(
+    request: Request,
+    job_id: str,
+    current_user: Annotated[User, Depends(require_html_user)],
+):
+    return_to = await _archive_form_target(request, job_id)
+    try:
+        with session_scope(request.app.state.engine) as session:
+            job = session.get(EvaluationJob, job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="Evaluation job not found")
+            if job.state not in _ARCHIVABLE_JOB_STATES:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Evaluation cannot be archived",
+                )
+            session.add(
+                EvaluationJobArchive(
+                    evaluation_job_id=job_id,
+                    archived_by=current_user.id,
+                )
+            )
+            session.flush()
+    except IntegrityError as error:
+        raise HTTPException(
+            status_code=409,
+            detail="Evaluation is already archived",
+        ) from error
+    return RedirectResponse(return_to, status_code=303)
+
+
+@router.post("/evaluations/{job_id}/restore")
+async def restore_evaluation(
+    request: Request,
+    job_id: str,
+    _current_user: Annotated[User, Depends(require_html_user)],
+):
+    return_to = await _archive_form_target(request, job_id)
+    with session_scope(request.app.state.engine) as session:
+        job = session.get(EvaluationJob, job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Evaluation job not found")
+        removed = session.execute(
+            delete(EvaluationJobArchive).where(
+                EvaluationJobArchive.evaluation_job_id == job_id
+            )
+        )
+        if removed.rowcount != 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Evaluation is not archived",
+            )
+    return RedirectResponse(return_to, status_code=303)
 
 
 @router.post("/evaluations/{job_id}/retry")
