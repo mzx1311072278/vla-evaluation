@@ -15,6 +15,28 @@ SAMPLE = Path(
 )
 
 
+def test_metric_definitions_match_implemented_formulas():
+    from Genie02_report.metric_definitions import (
+        METRIC_DEFINITIONS,
+        markdown_formula_lines,
+    )
+
+    assert [metric.key for metric in METRIC_DEFINITIONS] == [
+        "gsr",
+        "tts_success",
+        "smoothness",
+    ]
+    formulas = "\n".join(markdown_formula_lines(METRIC_DEFINITIONS))
+    assert "GSR = N_success / N_total" in formulas
+    assert "TTS = mean(duration_s | outcome = success)" in formulas
+    assert "S = log10(E + 1)" in formulas
+    assert "E = sum(||j_k||^2) * delta_t" in formulas
+    assert (
+        "j_k = (x_k - 3 x_(k-1) + 3 x_(k-2) - x_(k-3)) / delta_t^3"
+        in formulas
+    )
+
+
 @pytest.fixture
 def minimal_native_session(tmp_path):
     session_dir = tmp_path / "native_session"
@@ -179,6 +201,23 @@ def test_minimal_native_session_generates_complete_report_in_output_dir(
         for path in PROJECT_ROOT.glob(pattern)
     }
     assert repository_artifacts_after == repository_artifacts_before
+
+
+def test_markdown_report_uses_shared_metric_wording(
+    minimal_native_session, tmp_path, monkeypatch
+):
+    from Genie02_report import genie02_markdown_report
+
+    monkeypatch.setattr(
+        genie02_markdown_report,
+        "metric_definition_rows",
+        lambda: [("sentinel", "shared-definition", "smaller")],
+    )
+    output_dir = tmp_path / "shared-definitions"
+    generate_report(minimal_native_session, output_dir)
+    report_path = next(output_dir.glob("report_*.md"))
+
+    assert "shared-definition" in report_path.read_text(encoding="utf-8")
 
 
 @pytest.mark.skipif(not SAMPLE.exists(), reason="large local sample is not installed")

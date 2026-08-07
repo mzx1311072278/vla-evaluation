@@ -19,6 +19,7 @@ if __package__:
         prepare_output_dir,
         require_session_dir,
     )
+    from .metric_definitions import markdown_formula_lines, metric_definition_rows
 else:
     from genie02_eval_common import (
         EvaluationError,
@@ -30,6 +31,7 @@ else:
         prepare_output_dir,
         require_session_dir,
     )
+    from metric_definitions import markdown_formula_lines, metric_definition_rows
 
 
 SMOOTHNESS_CHART = "smoothness_curve.svg"
@@ -52,6 +54,21 @@ def _md_cell(value: Any) -> str:
 def _mean_number(values: Sequence[Any]) -> float | None:
     numbers = [float(value) for value in values if value is not None and value != ""]
     return sum(numbers) / len(numbers) if numbers else None
+
+
+def _metric_definition_markdown() -> list[str]:
+    lines = [
+        "- 指标口径：",
+        "",
+        "| 指标 | 定义 | 方向 |",
+        "|:---:|:---|:---:|",
+    ]
+    lines.extend(
+        f"| {_md_cell(label)} | {_md_cell(definition)} | {_md_cell(direction)} |"
+        for label, definition, direction in metric_definition_rows()
+    )
+    lines.extend(["", "```text", *markdown_formula_lines(), "```"])
+    return lines
 
 
 def _write_smoothness_chart(
@@ -177,13 +194,7 @@ def build_report(
         f"- Episode：{metrics['n_episodes']} / {session['num_episodes_target']}（已完成 / 计划）",
         f"- FPS：{_md_cell(session['fps'])}",
         f"- 状态：{_md_cell(session['status'])}",
-        (
-            "- 评测公式：<br>"
-            "&emsp;&emsp;1. GSR = 成功 Episode 数 / Episode 总数<br>"
-            "&emsp;&emsp;2. TTS = 成功 Episode 的 duration_s 均值<br>"
-            "&emsp;&emsp;3. 报告平滑度 $S=log10(E+1)$，原始平滑度 $E=Σ||j_k||² \\cdot Δt$，其中 $j_k≈(x_k-3x_{k-1}+3x_{k-2}-x_{k-3})/(Δt)^3$ <br>"
-            "&emsp;&emsp;&emsp;参数：$S$ 为报告展示的平滑度，$E$ 为平滑度原始量，$k$ 为帧索引，$j_k$ 为第 k 帧 jerk，$x_k$ 为第 k 帧末端 xyz 位置向量，$Δt$ 为相邻轨迹帧时间间隔；综合与左右臂分别计算，越小越平滑"
-        ),
+        *_metric_definition_markdown(),
         "",
         "## 2. 核心指标",
         "",
