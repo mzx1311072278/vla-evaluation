@@ -4,7 +4,7 @@
   <section id="job-status" {% if job.state not in ['SUCCEEDED', 'FAILED', 'CANCELLED', 'INTERRUPTED'] %}hx-get="/evaluations/{{ job.id }}" hx-trigger="every 2s" hx-select="#job-status" hx-target="this" hx-swap="outerHTML"{% endif %}>
     <p class="eyebrow">评测任务</p><h1>{{ dataset.name }}</h1>
     <dl class="summary-grid">
-      <div><dt>状态</dt><dd><span class="status status-{{ job.state|lower }}">{{ job.state }}</span></dd></div>
+      <div><dt>状态</dt><dd><span class="status status-{{ job.state|lower }}">{{ job.state }}</span>{% if job_archive %}<span class="archive-badge">已归档</span>{% endif %}</dd></div>
       <div><dt>阶段</dt><dd>{{ job.stage }}</dd></div>
       <div><dt>进度</dt><dd>{{ "%.0f"|format(job.progress) }}%</dd></div>
       <div><dt>配置</dt><dd>{{ job.profile_name }}</dd></div>
@@ -29,6 +29,19 @@
         <form method="post" action="/evaluations/{{ job.id }}/cancel">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button type="submit">取消任务</button>
+        </form>
+      {% endif %}
+      {% if job_archive %}
+        <form class="inline-action-form" method="post" action="/evaluations/{{ job.id }}/restore">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="return_to" value="/evaluations/{{ job.id }}">
+          <button class="secondary-button" type="submit"><i data-lucide="archive-restore"></i><span>恢复</span></button>
+        </form>
+      {% elif job.state in archivable_states %}
+        <form class="inline-action-form" method="post" action="/evaluations/{{ job.id }}/archive" onsubmit="return confirm('只从默认列表隐藏，不会删除任务输出或报告。确认归档？')">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="return_to" value="/evaluations/{{ job.id }}">
+          <button class="secondary-button" type="submit"><i data-lucide="archive"></i><span>归档</span></button>
         </form>
       {% endif %}
       <a class="button" href="/datasets/{{ dataset.id }}">查看数据集</a>

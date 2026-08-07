@@ -314,6 +314,59 @@ def test_core_pages_have_no_horizontal_overflow(
 
 
 @pytest.mark.parametrize("viewport", _VIEWPORTS)
+def test_list_toolbars_and_row_actions_are_contained(
+    page,
+    live_server,
+    ready_dataset,
+    report_job,
+    viewport,
+):
+    page.set_viewport_size(viewport)
+    login(page, live_server)
+
+    for path in ("/datasets", "/evaluations"):
+        page.goto(f"{live_server}{path}")
+        page.wait_for_load_state("networkidle")
+        toolbar = page.locator(".list-toolbar")
+        assert toolbar.count() == 1
+        assert toolbar.is_visible()
+        assert page.evaluate(_NO_CHROME_OVERFLOW_JS) is False
+        measurements = toolbar.locator("input, select, button, a").evaluate_all(
+            """
+            (controls) => controls.map((control) => {
+              const rect = control.getBoundingClientRect();
+              return {left: rect.left, right: rect.right, width: rect.width};
+            })
+            """
+        )
+        assert all(
+            item["left"] >= -1
+            and item["right"] <= viewport["width"] + 1
+            and item["width"] > 0
+            for item in measurements
+        ), measurements
+        action_measurements = page.locator(".row-actions").evaluate_all(
+            """
+            (actions) => actions.map((action) => ({
+              clientWidth: action.clientWidth,
+              scrollWidth: action.scrollWidth,
+              childrenContained: Array.from(action.children).every((child) => {
+                const parentRect = action.getBoundingClientRect();
+                const childRect = child.getBoundingClientRect();
+                return childRect.left >= parentRect.left - 1 &&
+                  childRect.right <= parentRect.right + 1;
+              }),
+            }))
+            """
+        )
+        assert all(
+            item["scrollWidth"] <= item["clientWidth"] + 1
+            and item["childrenContained"]
+            for item in action_measurements
+        ), action_measurements
+
+
+@pytest.mark.parametrize("viewport", _VIEWPORTS)
 def test_report_sections_and_formulas_are_contained(
     page,
     live_server,

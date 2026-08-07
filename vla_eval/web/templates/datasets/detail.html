@@ -4,11 +4,26 @@
   <section>
     <div class="page-heading">
       <div><p class="eyebrow">数据集</p><h1>{{ dataset.name }}</h1></div>
-      {% if dataset.status == "READY" %}<a class="button" href="/evaluations/new?dataset_id={{ dataset.id }}">开始评测</a>
-      {% else %}<span class="button disabled" aria-disabled="true">暂不可评测</span>{% endif %}
+      <div class="commands">
+        {% if dataset.status == "READY" %}<a class="button" href="/evaluations/new?dataset_id={{ dataset.id }}">开始评测</a>
+        {% else %}<span class="button disabled" aria-disabled="true">暂不可评测</span>{% endif %}
+        {% if dataset.status == "ARCHIVED" %}
+          <form class="inline-action-form" method="post" action="/datasets/{{ dataset.id }}/restore">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="return_to" value="/datasets/{{ dataset.id }}">
+            <button class="secondary-button" type="submit"><i data-lucide="archive-restore"></i><span>恢复</span></button>
+          </form>
+        {% elif dataset.status in ["READY", "PREFLIGHT_FAILED"] %}
+          <form class="inline-action-form" method="post" action="/datasets/{{ dataset.id }}/archive" onsubmit="return confirm('只从默认列表隐藏，不会删除文件或历史评测。确认归档？')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="return_to" value="/datasets/{{ dataset.id }}">
+            <button class="secondary-button" type="submit"><i data-lucide="archive"></i><span>归档</span></button>
+          </form>
+        {% endif %}
+      </div>
     </div>
     <dl class="summary-grid">
-      <div><dt>状态</dt><dd><span class="status status-{{ dataset.status|lower }}">{{ dataset.status }}</span></dd></div>
+      <div><dt>状态</dt><dd><span class="status status-{{ dataset.status|lower }}">{{ dataset.status }}</span>{% if dataset.status == "ARCHIVED" %}<span class="archive-badge">已归档</span>{% endif %}</dd></div>
       <div><dt>类型</dt><dd>{{ dataset.kind }}</dd></div>
       <div><dt>Episode</dt><dd>{{ dataset.episode_count }}</dd></div>
       <div><dt>大小</dt><dd>{{ dataset.size_bytes }} B</dd></div>

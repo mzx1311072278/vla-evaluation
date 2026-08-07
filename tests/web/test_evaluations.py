@@ -275,6 +275,72 @@ def test_evaluation_list_rejects_invalid_duplicate_or_unknown_controls(
     assert auth_client.get(f"/evaluations?{query}").status_code == 422
 
 
+def test_evaluation_list_renders_combined_controls_and_allowed_row_actions(
+    auth_client, db_engine: Engine, ready_dataset, evaluation_job
+):
+    with session_scope(db_engine) as session:
+        active = session.get_one(EvaluationJob, evaluation_job.id)
+        active.profile_name = "genie-active"
+        active.state = "RUNNING"
+        terminal = EvaluationJob(
+            dataset_id=ready_dataset.id,
+            profile_name="genie-terminal",
+            state="FAILED",
+        )
+        archived = EvaluationJob(
+            dataset_id=ready_dataset.id,
+            profile_name="genie-archived",
+            state="INTERRUPTED",
+        )
+        session.add_all([terminal, archived])
+        session.flush()
+        terminal_id, archived_id = terminal.id, archived.id
+        session.add(EvaluationJobArchive(evaluation_job_id=archived_id))
+
+    response = auth_client.get(
+        f"/evaluations?q=genie&sort=name_desc&archived=1&dataset_id={ready_dataset.id}"
+    )
+    selected_state = auth_client.get("/evaluations?state=FAILED")
+    plain = auth_client.get("/evaluations")
+
+    assert response.status_code == 200
+    assert '<form class="list-toolbar" method="get" action="/evaluations">' in response.text
+    assert 'id="evaluation-search" name="q"' in response.text
+    assert 'value="genie"' in response.text
+    assert '<option value="name_desc" selected>' in response.text
+    assert '<option value="FAILED" selected>' in selected_state.text
+    assert 'name="archived" value="1" checked' in response.text
+    assert f'name="dataset_id" value="{ready_dataset.id}"' in response.text
+    assert 'class="clear-filters" href="/evaluations"' in response.text
+    assert 'class="clear-filters"' not in plain.text
+    assert f'action="/evaluations/{terminal_id}/archive"' in response.text
+    assert f'action="/evaluations/{archived_id}/restore"' in response.text
+    assert f'action="/evaluations/{evaluation_job.id}/archive"' not in response.text
+    assert 'data-lucide="archive"' in response.text
+    assert 'data-lucide="archive-restore"' in response.text
+    assert "只从默认列表隐藏，不会删除任务输出或报告" in response.text
+    assert 'class="archive-badge"' in response.text
+
+
+def test_evaluation_detail_renders_archive_restore_only_for_allowed_states(
+    auth_client, db_engine: Engine, evaluation_job, successful_job
+):
+    active = auth_client.get(f"/evaluations/{evaluation_job.id}")
+    terminal = auth_client.get(f"/evaluations/{successful_job.id}")
+
+    assert f'action="/evaluations/{evaluation_job.id}/archive"' not in active.text
+    assert f'action="/evaluations/{successful_job.id}/archive"' in terminal.text
+    with session_scope(db_engine) as session:
+        session.add(EvaluationJobArchive(evaluation_job_id=successful_job.id))
+
+    archived = auth_client.get(f"/evaluations/{successful_job.id}")
+
+    assert archived.status_code == 200
+    assert f'action="/evaluations/{successful_job.id}/restore"' in archived.text
+    assert f'/reports/{successful_job.id}' in archived.text
+    assert 'class="archive-badge"' in archived.text
+
+
 @pytest.mark.parametrize(
     "path",
     ["/evaluations", "/evaluations/new", "/evaluations/missing", "/api/evaluations/missing"],

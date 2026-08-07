@@ -281,7 +281,7 @@ def evaluation_list(
     if dataset_id:
         _load_dataset(request, dataset_id)
 
-    query = select(EvaluationJob, Dataset).join(
+    query = select(EvaluationJob, Dataset, EvaluationJobArchive).join(
         Dataset, EvaluationJob.dataset_id == Dataset.id
     ).outerjoin(
         EvaluationJobArchive,
@@ -475,6 +475,8 @@ def evaluation_detail(
 ):
     job = _load_job(request, job_id)
     dataset = _load_dataset(request, job.dataset_id)
+    with session_scope(request.app.state.engine) as session:
+        job_archive = session.get(EvaluationJobArchive, job_id)
     phases = _evaluation_phases(job.vlm_enabled)
     phase_states = [state for state, _label in phases]
     phase_index = phase_states.index(job.stage) if job.stage in phase_states else -1
@@ -490,6 +492,8 @@ def evaluation_detail(
             phase_index=phase_index,
             active_states=sorted(_ACTIVE_STATES),
             retry_states=["FAILED", "INTERRUPTED"],
+            archivable_states=sorted(_ARCHIVABLE_JOB_STATES),
+            job_archive=job_archive,
         ),
     )
 

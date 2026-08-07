@@ -141,6 +141,75 @@ def test_dataset_list_rejects_invalid_duplicate_or_unknown_controls(auth_client,
     assert auth_client.get(f"/datasets?{query}").status_code == 422
 
 
+def test_dataset_list_renders_management_controls_and_row_actions(
+    auth_client, db_engine: Engine, ready_dataset
+):
+    archived = Dataset(
+        id="70000000-0000-0000-0000-000000000001",
+        name="Archived Ready",
+        path="/srv/archived-ready",
+        kind="fixture",
+        status="ARCHIVED",
+        inspection_json={
+            "_archive": {
+                "previous_status": "READY",
+                "archived_at": "2026-08-07T08:00:00+00:00",
+                "archived_by": "user-id",
+            }
+        },
+    )
+    with session_scope(db_engine) as session:
+        session.add(archived)
+
+    response = auth_client.get("/datasets?q=ready&sort=name_desc&archived=1")
+    plain = auth_client.get("/datasets")
+
+    assert response.status_code == 200
+    assert '<form class="list-toolbar" method="get" action="/datasets">' in response.text
+    assert 'id="dataset-search" name="q"' in response.text
+    assert 'value="ready"' in response.text
+    assert '<option value="name_desc" selected>' in response.text
+    assert 'name="archived" value="1" checked' in response.text
+    assert 'class="clear-filters" href="/datasets"' in response.text
+    assert 'class="clear-filters"' not in plain.text
+    assert f'action="/datasets/{ready_dataset.id}/archive"' in response.text
+    assert f'action="/datasets/{archived.id}/restore"' in response.text
+    assert 'name="csrf_token"' in response.text
+    assert 'name="return_to"' in response.text
+    assert 'data-lucide="archive"' in response.text
+    assert 'data-lucide="archive-restore"' in response.text
+    assert "只从默认列表隐藏，不会删除文件或历史评测" in response.text
+    assert 'class="archive-badge"' in response.text
+
+
+def test_dataset_detail_renders_archive_or_restore_action(
+    auth_client, db_engine: Engine, ready_dataset
+):
+    active = auth_client.get(f"/datasets/{ready_dataset.id}")
+
+    assert f'action="/datasets/{ready_dataset.id}/archive"' in active.text
+    assert 'data-lucide="archive"' in active.text
+    with session_scope(db_engine) as session:
+        dataset = session.get_one(Dataset, ready_dataset.id)
+        dataset.status = "ARCHIVED"
+        dataset.inspection_json = {
+            "_archive": {
+                "previous_status": "READY",
+                "archived_at": "2026-08-07T08:00:00+00:00",
+                "archived_by": "user-id",
+            }
+        }
+
+    archived = auth_client.get(f"/datasets/{ready_dataset.id}")
+
+    assert archived.status_code == 200
+    assert f'action="/datasets/{ready_dataset.id}/restore"' in archived.text
+    assert f'/evaluations?dataset_id={ready_dataset.id}' in archived.text
+    assert f'/evaluations/new?dataset_id={ready_dataset.id}' not in archived.text
+    assert 'aria-disabled="true"' in archived.text
+    assert 'class="archive-badge"' in archived.text
+
+
 def test_dataset_detail_shows_only_five_most_recent_evaluations(
     auth_client, db_engine: Engine, ready_dataset, dataset
 ):
