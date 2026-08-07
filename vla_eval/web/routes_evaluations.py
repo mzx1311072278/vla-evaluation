@@ -348,6 +348,10 @@ async def create_evaluation(
             "min_episode_duration": profile.review.min_episode_duration,
             "min_sampled_frames": profile.review.min_sampled_frames,
         },
+        "outputs": {
+            "required": list(profile.outputs.required),
+            "optional": list(profile.outputs.optional),
+        },
         "params": params,
         **api_provenance,
     }

@@ -280,8 +280,12 @@ def test_report_page_shows_artifact_metadata_and_smoothness_preview(
     (output_dir / "smoothness_curve.svg").write_text(
         '<svg xmlns="http://www.w3.org/2000/svg"></svg>', encoding="utf-8"
     )
-    (output_dir / "attempt_summary.json").write_text("[]", encoding="utf-8")
-    (output_dir / "attempt_summary.csv").write_text("episode_index\n", encoding="utf-8")
+    attempt_dir = output_dir / "attempt_eval"
+    attempt_dir.mkdir()
+    (attempt_dir / "attempt_summary.json").write_text("[]", encoding="utf-8")
+    (attempt_dir / "attempt_summary.csv").write_text(
+        "episode_index\n", encoding="utf-8"
+    )
     (output_dir / "report_summary.md").write_text("# Report", encoding="utf-8")
 
     response = auth_client.get(f"/reports/{successful_job.id}")
@@ -301,8 +305,8 @@ def test_report_page_shows_artifact_metadata_and_smoothness_preview(
         "episode_metrics.csv",
         "metrics_core.json",
         "smoothness_curve.svg",
-        "attempt_summary.json",
-        "attempt_summary.csv",
+        "attempt_eval/attempt_summary.json",
+        "attempt_eval/attempt_summary.csv",
         "report_summary.md",
     ):
         assert f'href="/reports/{successful_job.id}/files/{filename}"' in response.text
@@ -395,6 +399,47 @@ def test_download_serves_smoothness_curve_svg(auth_client, successful_job):
         'attachment; filename="smoothness_curve.svg"'
         in response.headers["content-disposition"]
     )
+
+
+@pytest.mark.parametrize("filename", ["attempt_summary.json", "attempt_summary.csv"])
+def test_download_serves_nested_vlm_artifacts(auth_client, successful_job, filename):
+    attempt_dir = Path(successful_job.output_dir) / "attempt_eval"
+    attempt_dir.mkdir()
+    payload = "[]" if filename.endswith(".json") else "episode_index\n"
+    (attempt_dir / filename).write_text(payload, encoding="utf-8")
+
+    response = auth_client.get(
+        f"/reports/{successful_job.id}/files/attempt_eval/{filename}"
+    )
+
+    assert response.status_code == 200
+    assert response.text == payload
+    assert filename in response.headers["content-disposition"]
+
+
+def test_download_rejects_obsolete_root_vlm_artifact(auth_client, successful_job):
+    path = Path(successful_job.output_dir) / "attempt_summary.json"
+    path.write_text("SECRET-ROOT", encoding="utf-8")
+
+    response = auth_client.get(
+        f"/reports/{successful_job.id}/files/attempt_summary.json"
+    )
+
+    assert response.status_code == 404
+    assert "SECRET-ROOT" not in response.text
+
+
+def test_download_rejects_unknown_nested_artifact(auth_client, successful_job):
+    attempt_dir = Path(successful_job.output_dir) / "attempt_eval"
+    attempt_dir.mkdir()
+    (attempt_dir / "unknown.json").write_text("SECRET-NESTED", encoding="utf-8")
+
+    response = auth_client.get(
+        f"/reports/{successful_job.id}/files/attempt_eval/unknown.json"
+    )
+
+    assert response.status_code == 404
+    assert "SECRET-NESTED" not in response.text
 
 
 def test_download_serves_report_markdown_glob(

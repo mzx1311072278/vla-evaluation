@@ -181,6 +181,14 @@ def test_submit_evaluation_persists_provenance_and_enqueues_worker(
         "min_episode_duration": 3.0,
         "min_sampled_frames": 3,
     }
+    assert job.provenance_json["outputs"] == {
+        "required": ["episode_metrics.csv", "metrics_core.json", "report_*.md"],
+        "optional": [
+            "smoothness_curve.svg",
+            "attempt_eval/attempt_summary.json",
+            "attempt_eval/attempt_summary.csv",
+        ],
+    }
     assert job.provenance_json["params"] == {"vlm_enabled": True}
 
     assert fake_queues.evaluation.count == 1
