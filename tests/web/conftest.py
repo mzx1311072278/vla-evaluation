@@ -9,7 +9,7 @@ from sqlalchemy import Engine
 
 from Genie02_report.genie02_eval_common import EPISODE_METRIC_FIELDS
 from tests.fakes import FakeQueueBundle
-from vla_eval.config import AppConfig, RemoteSource
+from vla_eval.config import AppConfig, LocalSource, RemoteSource
 from vla_eval.db import session_scope
 from vla_eval.models import Dataset, EvaluationJob, User
 from vla_eval.security import hash_password
@@ -40,6 +40,8 @@ def extract_csrf(html: str) -> str:
 def app_config(data_root: Path) -> AppConfig:
     credentials = data_root / "credentials"
     credentials.mkdir()
+    local_root = data_root / "local-sources"
+    local_root.mkdir()
     return AppConfig(
         data_root=data_root,
         database_url="sqlite://",
@@ -56,7 +58,9 @@ def app_config(data_root: Path) -> AppConfig:
                 roots=("/srv/datasets", "/srv/archive"),
             )
         },
-        local_sources={},
+        local_sources={
+            "this-host": LocalSource(name="this-host", roots=(local_root,))
+        },
     )
 
 

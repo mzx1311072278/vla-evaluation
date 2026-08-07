@@ -99,6 +99,7 @@ def import_new(
             request,
             current_user,
             remote_sources=request.app.state.config.remote_sources,
+            local_sources=request.app.state.config.local_sources,
         ),
     )
 
@@ -117,8 +118,15 @@ async def create_import(
     remote_root = _single_form_value(form, "root")
     remote_path = _single_form_value(form, "relative_path")
     target_name = _single_form_value(form, "target_name")
-    source = request.app.state.config.remote_sources.get(source_name)
-    if source is None or remote_root not in source.roots:
+    remote_source = request.app.state.config.remote_sources.get(source_name)
+    local_source = request.app.state.config.local_sources.get(source_name)
+    if remote_source is not None:
+        configured_roots = remote_source.roots
+    elif local_source is not None:
+        configured_roots = tuple(str(root) for root in local_source.roots)
+    else:
+        configured_roots = ()
+    if remote_root not in configured_roots:
         raise HTTPException(status_code=422, detail="Invalid import source")
     try:
         remote_path = normalize_remote_relative_path(remote_path)

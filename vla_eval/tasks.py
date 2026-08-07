@@ -844,20 +844,37 @@ def run_import_task(import_id: str, *, runtime: TaskRuntime | None = None) -> Im
                 target_path,
                 target_name,
             )
-        configured_source = resolved.config.remote_sources[source_name]
-        if remote_root not in configured_source.roots:
-            raise ValueError("persisted remote root is not registered for the selected source")
-        source = replace(configured_source, roots=(remote_root,))
+        configured_remote = resolved.config.remote_sources.get(source_name)
+        configured_local = resolved.config.local_sources.get(source_name)
+        source = None
+        local_source = None
+        trusted_credentials_root = None
+        if configured_remote is not None:
+            if remote_root not in configured_remote.roots:
+                raise ValueError("persisted remote root is not registered for the selected source")
+            source = replace(configured_remote, roots=(remote_root,))
+            trusted_credentials_root = resolved.credentials_root
+        elif configured_local is not None:
+            selected_root = next(
+                (root for root in configured_local.roots if str(root) == remote_root),
+                None,
+            )
+            if selected_root is None:
+                raise ValueError("persisted local root is not registered for the selected source")
+            local_source = replace(configured_local, roots=(selected_root,))
+        else:
+            raise KeyError(source_name)
         spec = ImportSpec(
             job_id=import_id,
-            source_name=source.name,
+            source_name=source_name,
             remote_root=remote_root,
             remote_relative_path=remote_path,
             staging_path=staging_path,
             target_path=target_path,
             mode="production",
             source=source,
-            trusted_credentials_root=resolved.credentials_root,
+            local_source=local_source,
+            trusted_credentials_root=trusted_credentials_root,
             trusted_staging_root=resolved.config.data_root / "staging",
             trusted_inbox_root=resolved.config.data_root / "inbox",
         )

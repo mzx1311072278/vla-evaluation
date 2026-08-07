@@ -5,19 +5,46 @@
     <p class="eyebrow">数据接入</p><h1>新建导入</h1>
     <form method="post" action="/imports" class="form-layout">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <label for="source-name">远程源
-        <select id="source-name" name="source_name" required>
-          {% for name, source in remote_sources.items() %}<option value="{{ name }}">{{ name }}</option>{% endfor %}
+      <label for="source-name">数据来源
+        <select id="source-name" name="source_name" required data-source-selector>
+          {% if local_sources %}<optgroup label="本机目录">
+            {% for name, source in local_sources.items() %}<option value="{{ name }}" data-kind="local">{{ name }}</option>{% endfor %}
+          </optgroup>{% endif %}
+          {% if remote_sources %}<optgroup label="远程 SSH">
+            {% for name, source in remote_sources.items() %}<option value="{{ name }}" data-kind="remote">{{ name }}</option>{% endfor %}
+          </optgroup>{% endif %}
         </select>
       </label>
       <label for="remote-root">根目录
-        <select id="remote-root" name="root" required>
-          {% for name, source in remote_sources.items() %}{% for root in source.roots %}<option value="{{ root }}">{{ root }}</option>{% endfor %}{% endfor %}
+        <select id="remote-root" name="root" required data-root-selector>
+          {% for name, source in local_sources.items() %}{% for root in source.roots %}<option data-source="{{ name }}" value="{{ root }}">{{ root }}</option>{% endfor %}{% endfor %}
+          {% for name, source in remote_sources.items() %}{% for root in source.roots %}<option data-source="{{ name }}" value="{{ root }}">{{ root }}</option>{% endfor %}{% endfor %}
         </select>
       </label>
       <label for="relative-path">相对路径<input id="relative-path" name="relative_path" required></label>
       <label for="target-name">数据集名称<input id="target-name" name="target_name" required maxlength="255"></label>
       <div class="commands"><button type="submit">开始导入</button><a href="/imports">取消</a></div>
     </form>
+    <script>
+      (() => {
+        const source = document.querySelector("[data-source-selector]");
+        const roots = document.querySelector("[data-root-selector]");
+        if (!source || !roots) return;
+        const synchronizeRoots = () => {
+          let first = null;
+          for (const option of roots.options) {
+            const active = option.dataset.source === source.value;
+            option.hidden = !active;
+            option.disabled = !active;
+            if (active && !first) first = option;
+          }
+          if (!roots.selectedOptions.length || roots.selectedOptions[0].disabled) {
+            if (first) first.selected = true;
+          }
+        };
+        source.addEventListener("change", synchronizeRoots);
+        synchronizeRoots();
+      })();
+    </script>
   </section>
 {% endblock %}

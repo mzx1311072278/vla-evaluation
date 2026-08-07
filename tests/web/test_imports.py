@@ -46,6 +46,65 @@ def test_import_rejects_unconfigured_source_without_database_or_queue_side_effec
         assert session.scalars(select(ImportJob)).all() == []
 
 
+def test_import_page_groups_local_and_remote_sources(auth_client, app):
+    response = auth_client.get("/imports/new")
+
+    assert response.status_code == 200
+    assert '<label for="source-name">数据来源' in response.text
+    assert '<optgroup label="本机目录">' in response.text
+    assert '<option value="this-host" data-kind="local">this-host</option>' in response.text
+    assert '<optgroup label="远程 SSH">' in response.text
+    assert '<option value="lab-a" data-kind="remote">lab-a</option>' in response.text
+    local_root = str(app.state.config.local_sources["this-host"].roots[0])
+    assert f'data-source="this-host" value="{local_root}"' in response.text
+
+
+def test_valid_local_import_commits_job_then_enqueues_worker(
+    auth_client, app, db_engine, fake_queues
+):
+    local_root = str(app.state.config.local_sources["this-host"].roots[0])
+    response = auth_client.post(
+        "/imports",
+        data=_import_form(
+            auth_client.csrf,
+            source_name="this-host",
+            root=local_root,
+            relative_path="run-01",
+            target_name="local run-01",
+        ),
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    job_id = response.headers["location"].removeprefix("/imports/")
+    with session_scope(db_engine) as session:
+        job = session.get_one(ImportJob, job_id)
+        assert job.source_name == "this-host"
+        assert job.remote_root == local_root
+        assert job.remote_path == "run-01"
+        assert job.target_name == "local run-01"
+        assert job.state == "QUEUED"
+    assert fake_queues.transfer.count == 1
+
+
+def test_local_import_rejects_root_from_another_source_before_enqueue(
+    auth_client, db_engine, fake_queues
+):
+    response = auth_client.post(
+        "/imports",
+        data=_import_form(
+            auth_client.csrf,
+            source_name="this-host",
+            root="/srv/datasets",
+        ),
+    )
+
+    assert response.status_code == 422
+    assert fake_queues.transfer.count == 0
+    with session_scope(db_engine) as session:
+        assert session.scalars(select(ImportJob)).all() == []
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

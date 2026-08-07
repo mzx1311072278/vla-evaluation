@@ -12,7 +12,7 @@ from sqlalchemy import select
 import vla_eval.import_jobs as import_jobs_module
 import vla_eval.tasks as tasks_module
 from tests.conftest import reload_job
-from vla_eval.config import AppConfig, RemoteSource
+from vla_eval.config import AppConfig, LocalSource, RemoteSource
 from vla_eval.datasets import DatasetInspection, DatasetKind
 from vla_eval.db import create_engine_for_url, init_db, session_scope
 from vla_eval.exceptions import EvaluationCancelled, ModelLoadError
@@ -66,6 +66,7 @@ def _runtime(
     data_root: Path,
     *,
     remote_roots: tuple[str, ...] = ("/data/rollouts",),
+    local_root: Path | None = None,
 ) -> TaskRuntime:
     credentials_root = data_root / "credentials"
     source = RemoteSource(
@@ -85,7 +86,16 @@ def _runtime(
             redis_url="redis://unused",
             session_secret="test-secret",
             remote_sources={source.name: source},
-            local_sources={},
+            local_sources=(
+                {
+                    "this-host": LocalSource(
+                        name="this-host",
+                        roots=(local_root,),
+                    )
+                }
+                if local_root is not None
+                else {}
+            ),
         ),
         profiles_root=Path("config/profiles"),
         credentials_root=credentials_root,
@@ -733,11 +743,12 @@ def _create_import_job(
     db_engine,
     *,
     cancel_requested: bool = False,
+    source_name: str = "lab-a",
     remote_root: str = "/data/rollouts",
 ) -> ImportJob:
     with session_scope(db_engine) as session:
         job = ImportJob(
-            source_name="lab-a",
+            source_name=source_name,
             remote_root=remote_root,
             remote_path="run-1",
             target_name="run-1",
@@ -746,6 +757,46 @@ def _create_import_job(
         session.add(job)
         session.flush()
         return job
+
+
+def test_import_task_dispatches_configured_local_source_without_ssh_credentials(
+    db_engine, data_root, monkeypatch
+):
+    local_root = data_root / "local-source"
+    (local_root / "run-1").mkdir(parents=True)
+    import_job = _create_import_job(
+        db_engine,
+        source_name="this-host",
+        remote_root=str(local_root),
+    )
+    inspection = DatasetInspection(DatasetKind.LEROBOT, True, "f" * 64, 12, 2, ())
+    received = {}
+    monkeypatch.setattr(
+        tasks_module,
+        "inspect_dataset",
+        lambda _path, *, allowed_root: inspection,
+    )
+
+    def execute(spec, *, inspector, callbacks):
+        received["spec"] = spec
+        callbacks.on_state("PREFLIGHT")
+        inspector(spec.staging_path)
+        callbacks.on_state("READY")
+        return ImportResult(spec.target_path, inspection)
+
+    monkeypatch.setattr(tasks_module, "execute_import", execute)
+
+    run_import_task(
+        import_job.id,
+        runtime=_runtime(db_engine, data_root, local_root=local_root),
+    )
+
+    spec = received["spec"]
+    assert spec.source is None
+    assert spec.local_source == LocalSource(name="this-host", roots=(local_root,))
+    assert spec.trusted_credentials_root is None
+    assert spec.remote_root == str(local_root)
+    assert spec.remote_relative_path == "run-1"
 
 
 def test_import_task_commits_callbacks_and_persists_ready_dataset(
