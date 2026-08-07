@@ -186,6 +186,7 @@ def test_report_styles_expose_report_layout_and_mobile_rules(client: TestClient)
     )
     assert ".page-heading .button { width: 100%; }" in response.text
     assert ".report-page .page-heading .commands { width: 100%; }" in response.text
+    assert ".report-overview { grid-template-columns: minmax(0, 1fr); }" in response.text
 
 
 def test_report_page_shows_artifact_metadata_and_smoothness_preview(

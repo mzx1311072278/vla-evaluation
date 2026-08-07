@@ -184,7 +184,7 @@ dd { margin: .35rem 0 0; font-weight: 650; overflow-wrap: anywhere; }
   .report-headline { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .report-headline > div:nth-child(odd) { border-left: 0; }
   .report-headline > div:nth-child(even) { border-left: 1px solid #d6dcda; }
-  .report-overview { grid-template-columns: 1fr; }
+  .report-overview { grid-template-columns: minmax(0, 1fr); }
   .report-filter-form { flex-direction: column; align-items: stretch; }
   .report-filter-form label, .report-filter-form button { width: 100%; flex-basis: auto; }
   .attachment-form { grid-template-columns: 1fr; }

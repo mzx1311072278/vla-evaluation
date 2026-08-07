@@ -13,6 +13,7 @@ without the browser installed.
 
 from __future__ import annotations
 
+import json
 import socket
 import ssl
 import subprocess
@@ -24,6 +25,8 @@ from pathlib import Path
 import pytest
 import uvicorn
 
+from vla_eval.db import session_scope
+from vla_eval.models import EvaluationJob
 from vla_eval.web.app import create_app
 
 _VIEWPORTS = [
@@ -143,6 +146,53 @@ def login(page, live_server: str) -> None:
     page.wait_for_url("**/datasets")
 
 
+@pytest.fixture
+def report_job(db_engine, ready_dataset, user, tmp_path):
+    output_dir = tmp_path / "report-output"
+    output_dir.mkdir()
+    (output_dir / "metrics_core.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "session_id": "ready-dataset",
+                "n_episodes": 1,
+                "n_success": 1,
+                "n_failure": 0,
+                "gsr": 1.0,
+                "mean_tts_success_s": 1.0,
+                "smoothness": {
+                    "space": "joint",
+                    "left": {"mean": 0.0, "n_episodes": 1},
+                    "right": {"mean": None, "n_episodes": 0},
+                    "n_episodes": 1,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    with session_scope(db_engine) as session:
+        job = EvaluationJob(
+            dataset_id=ready_dataset.id,
+            profile_name="genie02-full",
+            profile_version="1.0.0",
+            state="SUCCEEDED",
+            stage="REPORT",
+            progress=100.0,
+            output_dir=str(output_dir),
+            provenance_json={
+                "vlm_model_path": "vlm-model",
+                "prompt_version": "prompt-v1",
+                "app_version": "app-v1",
+                "git_sha": "0123456789abcdef0123456789abcdef01234567",
+            },
+            created_by=user.id,
+        )
+        session.add(job)
+        session.flush()
+        return job
+
+
 # A page "has no horizontal overflow" when its viewport-width chrome fits the
 # viewport. The literal ``document.documentElement.scrollWidth`` check is the
 # primary signal, but ``/imports`` and ``/datasets`` render their rows in a
@@ -194,6 +244,7 @@ def test_core_pages_have_no_horizontal_overflow(
     page,
     live_server,
     ready_dataset,
+    report_job,
     viewport,
 ):
     page.set_viewport_size(viewport)
@@ -203,10 +254,13 @@ def test_core_pages_have_no_horizontal_overflow(
         "/imports",
         "/datasets",
         f"/evaluations/new?dataset_id={ready_dataset.id}",
+        f"/reports/{report_job.id}",
     ]
     for path in pages:
         page.goto(f"{live_server}{path}")
         page.wait_for_load_state("networkidle")
+        if path.startswith("/reports/"):
+            assert page.locator(".report-headline").is_visible()
         chrome_overflow = page.evaluate(_NO_CHROME_OVERFLOW_JS)
         assert chrome_overflow is False, (
             f"page-chrome horizontal overflow at viewport {page.viewport_size} on {path}"
