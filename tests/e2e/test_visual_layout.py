@@ -436,3 +436,96 @@ def test_report_sections_and_formulas_are_contained(
         }
         """
     )
+
+
+def test_smoothness_ticks_do_not_overlap_and_follow_the_selected_window(
+    page,
+    live_server,
+    report_job,
+    ready_dataset,
+):
+    episode_count = 199
+    session_path = Path(ready_dataset.path) / "session.json"
+    session_data = json.loads(session_path.read_text(encoding="utf-8"))
+    session_data["num_episodes_target"] = episode_count
+    session_path.write_text(json.dumps(session_data), encoding="utf-8")
+
+    def expand_csv(path, update_row):
+        with path.open(encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = reader.fieldnames
+            template = next(reader)
+        assert fieldnames is not None
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(update_row(dict(template), index) for index in range(199))
+
+    expand_csv(
+        Path(ready_dataset.path) / "episodes.csv",
+        lambda row, index: {
+            **row,
+            "episode_index": str(index),
+            "trajectory_path": f"trajectories/episode_{index:03d}.npz",
+        },
+    )
+    output_dir = Path(report_job.output_dir)
+    expand_csv(
+        output_dir / "episode_metrics.csv",
+        lambda row, index: {
+            **row,
+            "episode_index": str(index),
+            "smoothness": str(4.5 + index % 20 / 40),
+            "left_smoothness": str(4.5 + index % 20 / 40),
+        },
+    )
+    metrics_path = output_dir / "metrics_core.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics.update(
+        n_episodes=episode_count,
+        n_success=episode_count,
+        n_failure=0,
+    )
+    metrics["smoothness"]["n_episodes"] = episode_count
+    metrics["smoothness"]["left"]["n_episodes"] = episode_count
+    metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
+
+    report_url = f"{live_server}/reports/{report_job.id}"
+    page.set_viewport_size({"width": 1440, "height": 1000})
+    login(page, live_server)
+    page.goto(report_url)
+    page.wait_for_load_state("networkidle")
+
+    page.locator("[data-chart-window]").select_option("50")
+    tick_labels = page.locator("[data-smoothness-chart] .chart-axis-label").filter(
+        has_text="Ep "
+    )
+    assert tick_labels.all_text_contents()[0] == "Ep 0"
+    assert tick_labels.all_text_contents()[-1] == "Ep 49"
+
+    page.locator("[data-chart-start]").evaluate(
+        """
+        (input) => {
+          input.value = "149";
+          input.dispatchEvent(new Event("input", {bubbles: true}));
+        }
+        """
+    )
+    assert page.locator("[data-chart-range-label]").text_content() == (
+        "Episode 149–198 / 199"
+    )
+    assert tick_labels.all_text_contents()[0] == "Ep 149"
+    assert tick_labels.all_text_contents()[-1] == "Ep 198"
+
+    boxes = tick_labels.evaluate_all(
+        """
+        (labels) => labels.map((label) => {
+          const box = label.getBoundingClientRect();
+          return {left: box.left, right: box.right};
+        })
+        """
+    )
+    assert all(
+        boxes[index]["right"] + 4 <= boxes[index + 1]["left"]
+        for index in range(len(boxes) - 1)
+    ), boxes

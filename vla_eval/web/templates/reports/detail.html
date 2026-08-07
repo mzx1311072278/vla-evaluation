@@ -343,11 +343,10 @@
         const hideTooltip = () => { tooltip.hidden = true; };
         const tickIndices = (count, limit = 10) => {
           if (count <= limit) return Array.from({ length: count }, (_, index) => index);
-          const step = Math.ceil((count - 1) / (limit - 1));
-          const ticks = [];
-          for (let index = 0; index < count; index += step) ticks.push(index);
-          if (ticks.at(-1) !== count - 1) ticks.push(count - 1);
-          return ticks;
+          return Array.from(
+            { length: limit },
+            (_, index) => Math.round(index * (count - 1) / (limit - 1)),
+          );
         };
         const render = () => {
           const requested = windowSelect?.value || "all";
