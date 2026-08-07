@@ -19,9 +19,11 @@ from fastapi.responses import FileResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import Engine
 
+from Genie02_report.genie02_eval_common import EvaluationError
 from vla_eval.db import session_scope
 from vla_eval.models import Dataset, EvaluationJob, User
 from vla_eval.security import require_html_user
+from vla_eval.web.report_view import build_report_view
 
 router = APIRouter()
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
@@ -318,12 +320,15 @@ def report_detail(
     if not (output_dir / "metrics_core.json").is_file():
         raise HTTPException(status_code=404, detail="Report is not available")
     dataset = _load_dataset(request.app.state.engine, job.dataset_id)
-    metrics = _load_core_metrics(output_dir)
-    rows = _load_episode_rows(output_dir)
-    attempts = _load_attempt_summary(output_dir)
-    has_vlm = bool(attempts)
+    try:
+        view = build_report_view(job=job, dataset=dataset, output_dir=output_dir)
+    except (EvaluationError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise HTTPException(
+            status_code=404, detail="Report is not available"
+        ) from error
+    has_vlm = view["has_vlm"]
     outcome_filter, review_filter = _parse_report_filters(request)
-    episodes = _build_episodes(rows, attempts)
+    episodes = list(view["episodes"])
     total_episodes = len(episodes)
     if outcome_filter != "all":
         episodes = [
@@ -333,20 +338,8 @@ def report_detail(
     if has_vlm and review_filter != "all":
         episodes = _apply_review_filter(episodes, review_filter)
     shown_episodes = len(episodes)
-    pending_review = sum(
-        1
-        for attempt in attempts.values()
-        if attempt.get("needs_manual_review") is True
-    )
+    pending_review = view["pending_review"]
     provenance = job.provenance_json or {}
-    headline = {
-        "gsr": _format_percent(metrics.get("gsr")),
-        "n_success": metrics.get("n_success", "—"),
-        "n_failure": metrics.get("n_failure", "—"),
-        "tts": _format_float(metrics.get("mean_tts_success_s"), suffix=" s"),
-        "smoothness": _smoothness_summary(metrics.get("smoothness")),
-        "pending_review": pending_review,
-    }
     provenance_view = {
         "profile_name": job.profile_name,
         "profile_version": job.profile_version,
@@ -364,25 +357,28 @@ def report_detail(
         ),
         None,
     )
+    context = {
+        **view,
+        "job": job,
+        "dataset": dataset,
+        "episodes": episodes,
+        "has_vlm": has_vlm,
+        "pending_review": pending_review,
+        "provenance": provenance_view,
+        "downloads": downloads,
+        "smoothness_preview_url": smoothness_preview_url,
+        "total_episodes": total_episodes,
+        "shown_episodes": shown_episodes,
+        "filter_outcome": outcome_filter,
+        "filter_review": review_filter,
+    }
     return templates.TemplateResponse(
         request=request,
         name="reports/detail.html",
         context=_template_context(
             request,
             current_user,
-            job=job,
-            dataset=dataset,
-            headline=headline,
-            episodes=episodes,
-            has_vlm=has_vlm,
-            pending_review=pending_review,
-            provenance=provenance_view,
-            downloads=downloads,
-            smoothness_preview_url=smoothness_preview_url,
-            total_episodes=total_episodes,
-            shown_episodes=shown_episodes,
-            filter_outcome=outcome_filter,
-            filter_review=review_filter,
+            **context,
         ),
     )
 

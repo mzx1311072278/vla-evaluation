@@ -84,6 +84,43 @@ def _make_succeeded_job(
             }
         ],
     )
+    if episode_rows is not None:
+        source_path = Path(dataset.path) / "episodes.csv"
+        with source_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=(
+                    "session_id",
+                    "episode_index",
+                    "episode_path",
+                    "trajectory_path",
+                    "t_start",
+                    "t_end",
+                    "duration_s",
+                    "outcome",
+                    "operator_intervened",
+                    "notes",
+                ),
+            )
+            writer.writeheader()
+            for row in episode_rows:
+                duration = row.get("duration_s", "")
+                writer.writerow(
+                    {
+                        "session_id": row.get("session_id", "ready-dataset"),
+                        "episode_index": row["episode_index"],
+                        "episode_path": "",
+                        "trajectory_path": (
+                            f"trajectories/episode_{int(row['episode_index']):03d}.npz"
+                        ),
+                        "t_start": "0",
+                        "t_end": duration,
+                        "duration_s": duration,
+                        "outcome": row["outcome"],
+                        "operator_intervened": "false",
+                        "notes": "",
+                    }
+                )
     with session_scope(db_engine) as session:
         job = EvaluationJob(
             dataset_id=dataset.id,
@@ -122,6 +159,51 @@ def _attempt_row(episode_index: int, **overrides) -> dict:
     }
     row.update(overrides)
     return row
+
+
+def test_report_view_uses_current_persisted_evidence(successful_job, ready_dataset):
+    from vla_eval.web.report_view import build_report_view
+
+    view = build_report_view(
+        job=successful_job,
+        dataset=ready_dataset,
+        output_dir=Path(successful_job.output_dir),
+    )
+
+    configuration = {row["label"]: row for row in view["configuration_rows"]}
+    assert configuration["任务"]["value"] == "fixture"
+    assert configuration["FPS"]["value"] == "10"
+    assert configuration["数据后端"]["value"] == "native"
+    assert configuration["数据指纹"]["value"] == ready_dataset.fingerprint
+    assert view["headline"]["gsr"] == "100.0%"
+    assert view["headline"]["n_success"] == 1
+    assert view["headline"]["n_failure"] == 0
+    assert view["summary_facts"]["episode_count"] == 1
+    assert view["summary_facts"]["smoothness_coverage"] == 1
+    assert view["summary_facts"]["vlm_executed"] is False
+    assert view["episodes"] == [
+        {
+            "index": 0,
+            "outcome": "success",
+            "duration": "1.000",
+            "smoothness": "0.000000",
+            "left_smoothness": "0.000000",
+            "right_smoothness": "—",
+            "smoothness_space": "joint",
+            "smoothness_frames": 4,
+            "smoothness_skipped_reason": "",
+            "operator_intervened": False,
+            "notes": "",
+            "vlm": None,
+            "evidence_path": None,
+            "evidence_range": None,
+        }
+    ]
+    assert view["release_decision"] == "未配置自动发版判定"
+    rendered = json.dumps(view, ensure_ascii=False, default=str)
+    assert "30.8%" not in rendered
+    assert "Ep 9" not in rendered
+    assert "dc67326" not in rendered
 
 
 @pytest.mark.parametrize(
@@ -257,6 +339,19 @@ def test_report_page_404_when_metrics_core_missing(
     )
     (output_dir / "metrics_core.json").unlink()
     response = auth_client.get(f"/reports/{job.id}")
+    assert response.status_code == 404
+
+
+def test_report_page_404_when_dataset_and_metrics_sessions_do_not_match(
+    auth_client, successful_job, ready_dataset
+):
+    session_path = Path(ready_dataset.path) / "session.json"
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    session["session_id"] = "different-session"
+    session_path.write_text(json.dumps(session), encoding="utf-8")
+
+    response = auth_client.get(f"/reports/{successful_job.id}")
+
     assert response.status_code == 404
 
 
@@ -740,28 +835,13 @@ def test_report_review_filter_manual_review_mode(
     assert "暂无 Episode 指标" in response.text
 
 
-def test_report_page_tolerates_pathological_episode_csv(
-    auth_client, successful_job, monkeypatch
-):
-    """A pathological episode_metrics.csv that raises csv.Error must degrade
-    gracefully (200, empty episode table) rather than 500 — headline metrics
-    are still rendered from metrics_core.json.
-    """
-    import csv as _csv
+def test_report_page_rejects_invalid_required_episode_csv(auth_client, successful_job):
+    output_dir = Path(successful_job.output_dir)
+    (output_dir / "episode_metrics.csv").write_text(
+        "unexpected,column\ninvalid,row\n", encoding="utf-8"
+    )
 
-    from vla_eval.web import routes_reports
-
-    class _ExplodingDictReader:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def __iter__(self):
-            raise _csv.Error("simulated pathological CSV")
-
-    monkeypatch.setattr(routes_reports.csv, "DictReader", _ExplodingDictReader)
     response = auth_client.get(f"/reports/{successful_job.id}")
-    assert response.status_code == 200
-    # Headline metrics still rendered from metrics_core.json.
-    assert "100.0%" in response.text
-    # Episode table degrades to the empty state instead of a 500.
-    assert "暂无 Episode 指标" in response.text
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Report is not available"

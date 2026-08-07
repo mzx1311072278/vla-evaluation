@@ -150,6 +150,16 @@ def _synthesize_lerobot_session(session_dir: Path) -> dict[str, Any]:
         "dataset_backend": "lerobot",
         "dataset_root": str(session_dir),
         "single_arm": _lerobot_single_arm(info),
+        "codebase_version": str(info.get("codebase_version", "")),
+        "robot_type": str(info.get("robot_type", "")),
+        "total_frames": int(info.get("total_frames", 0)),
+        "total_tasks": int(info.get("total_tasks", 0)),
+        "features": info.get("features", {})
+        if isinstance(info.get("features"), dict)
+        else {},
+        "splits": info.get("splits", {})
+        if isinstance(info.get("splits"), dict)
+        else {},
     }
     return session
 

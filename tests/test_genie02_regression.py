@@ -37,6 +37,37 @@ def test_metric_definitions_match_implemented_formulas():
     )
 
 
+def test_lerobot_session_preserves_recorded_info_metadata(tmp_path):
+    from Genie02_report.genie02_eval_common import _synthesize_lerobot_session
+
+    dataset = tmp_path / "lerobot"
+    (dataset / "meta").mkdir(parents=True)
+    (dataset / "data").mkdir()
+    (dataset / "meta" / "info.json").write_text(
+        json.dumps(
+            {
+                "codebase_version": "v3.0",
+                "robot_type": "genie02",
+                "total_episodes": 2,
+                "total_frames": 120,
+                "total_tasks": 1,
+                "fps": 30,
+                "features": {"action": {"shape": [10], "names": ["right_ee.x"]}},
+                "splits": {"train": "0:2"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    session = _synthesize_lerobot_session(dataset)
+
+    assert session["codebase_version"] == "v3.0"
+    assert session["robot_type"] == "genie02"
+    assert session["total_frames"] == 120
+    assert session["total_tasks"] == 1
+    assert session["features"]["action"]["shape"] == [10]
+    assert session["splits"] == {"train": "0:2"}
+
 @pytest.fixture
 def minimal_native_session(tmp_path):
     session_dir = tmp_path / "native_session"
