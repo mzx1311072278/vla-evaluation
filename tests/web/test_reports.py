@@ -184,6 +184,8 @@ def test_report_styles_expose_report_layout_and_mobile_rules(client: TestClient)
         r"@media \(max-width: 720px\) \{[\s\S]*?\.report-headline",
         response.text,
     )
+    assert ".page-heading .button { width: 100%; }" in response.text
+    assert ".report-page .page-heading .commands { width: 100%; }" in response.text
 
 
 def test_report_page_shows_artifact_metadata_and_smoothness_preview(
