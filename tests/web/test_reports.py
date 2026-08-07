@@ -338,6 +338,8 @@ def test_report_routes_require_login(client: TestClient, path: str):
 def test_report_page_shows_core_metrics(auth_client, successful_job):
     response = auth_client.get(f"/reports/{successful_job.id}")
     assert response.status_code == 200
+    assert "本次评测数据与产物状态" in response.text
+    assert "本次证据状态" not in response.text
     assert 'class="report-page"' in response.text
     assert 'class="report-headline"' in response.text
     assert 'class="metric-success"' in response.text
