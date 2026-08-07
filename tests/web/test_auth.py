@@ -72,6 +72,7 @@ def test_create_app_records_injected_dependencies(data_root, db_engine, fake_que
         redis_url="redis://unused.invalid/0",
         session_secret="test-session-secret",
         remote_sources={},
+        local_sources={},
     )
 
     app = create_app(config, db_engine, fake_queues)
@@ -91,6 +92,7 @@ def test_create_app_rejects_missing_session_secret(data_root, db_engine, fake_qu
         redis_url="redis://unused.invalid/0",
         session_secret=" ",
         remote_sources={},
+        local_sources={},
     )
 
     with pytest.raises(ValueError, match="session_secret"):

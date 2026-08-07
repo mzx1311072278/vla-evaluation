@@ -257,6 +257,7 @@ def app_config(data_root: Path, credentials: Path) -> AppConfig:
                 roots=(REMOTE_ROOT,),
             )
         },
+        local_sources={},
     )
 
 

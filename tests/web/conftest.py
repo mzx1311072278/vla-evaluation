@@ -56,6 +56,7 @@ def app_config(data_root: Path) -> AppConfig:
                 roots=("/srv/datasets", "/srv/archive"),
             )
         },
+        local_sources={},
     )
 
 

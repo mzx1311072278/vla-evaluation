@@ -62,6 +62,73 @@ def test_load_config_parses_remote_source(tmp_path: Path):
     assert config.remote_sources["lab-a"].roots == ("/data/rollouts",)
 
 
+def test_load_config_parses_local_source(tmp_path: Path):
+    local_root = tmp_path / "datasets"
+    raw = _valid_config(tmp_path)
+    raw["local_sources"] = {"this-host": {"roots": [str(local_root)]}}
+
+    config = load_config(_write_config(tmp_path, raw))
+
+    assert config.local_sources["this-host"].name == "this-host"
+    assert config.local_sources["this-host"].roots == (local_root.resolve(),)
+
+
+@pytest.mark.parametrize("local_sources", [[], "this-host", 1])
+def test_load_config_rejects_non_mapping_local_sources(
+    tmp_path: Path, local_sources: Any
+):
+    raw = _valid_config(tmp_path)
+    raw["local_sources"] = local_sources
+
+    with pytest.raises(TypeError, match="local_sources.*mapping"):
+        load_config(_write_config(tmp_path, raw))
+
+
+@pytest.mark.parametrize("roots", ["/data/rollouts", [], [""], [None], [7]])
+def test_load_config_rejects_invalid_local_source_roots(tmp_path: Path, roots: Any):
+    raw = _valid_config(tmp_path)
+    raw["local_sources"] = {"this-host": {"roots": roots}}
+
+    with pytest.raises(ValueError, match="local_sources.this-host.roots"):
+        load_config(_write_config(tmp_path, raw))
+
+
+@pytest.mark.parametrize(
+    "root",
+    [
+        "data/rollouts",
+        "/data/../secret",
+        "/data/\nrollouts",
+        "/data/\x7frollouts",
+        "/data/\x85rollouts",
+        "/data//rollouts",
+        "/data/./rollouts",
+        "/data/rollouts/",
+        "//data/rollouts",
+        "/data/rollouts ",
+        "/",
+    ],
+)
+def test_load_config_rejects_unsafe_or_non_normalized_local_root(
+    tmp_path: Path, root: str
+):
+    raw = _valid_config(tmp_path)
+    raw["local_sources"] = {"this-host": {"roots": [root]}}
+
+    with pytest.raises(ValueError, match="local_sources.this-host.roots"):
+        load_config(_write_config(tmp_path, raw))
+
+
+def test_load_config_rejects_source_name_collision_across_transports(tmp_path: Path):
+    raw = _valid_config(tmp_path)
+    raw["local_sources"] = {
+        "lab-a": {"roots": [str((tmp_path / "datasets").resolve())]}
+    }
+
+    with pytest.raises(ValueError, match="source name.*both"):
+        load_config(_write_config(tmp_path, raw))
+
+
 @pytest.mark.parametrize("configured", ["", "${VLA_EVAL_SESSION_SECRET}"])
 def test_load_config_uses_environment_secret_for_empty_or_placeholder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, configured: str

@@ -27,6 +27,7 @@ def health_app(tmp_path: Path):
         redis_url="redis://unused",
         session_secret="hush-secret-value",
         remote_sources={},
+        local_sources={},
     )
     app = create_app(config, engine, queues)
     return {

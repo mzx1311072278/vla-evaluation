@@ -24,15 +24,23 @@ class RemoteSource:
 
 
 @dataclass(frozen=True)
+class LocalSource:
+    name: str
+    roots: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
 class AppConfig:
     data_root: Path
     database_url: str
     redis_url: str
     session_secret: str = field(repr=False)
     remote_sources: Mapping[str, RemoteSource]
+    local_sources: Mapping[str, LocalSource]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "remote_sources", MappingProxyType(dict(self.remote_sources)))
+        object.__setattr__(self, "local_sources", MappingProxyType(dict(self.local_sources)))
 
 
 def _nonempty_string(value: Any, field_name: str) -> str:
@@ -109,6 +117,51 @@ def _load_remote_sources(value: Any) -> dict[str, RemoteSource]:
     return sources
 
 
+def _local_root(value: Any, field_name: str) -> Path:
+    root = _nonempty_string(value, field_name)
+    if root != value:
+        raise ValueError(f"{field_name} must not have leading or trailing whitespace")
+    if any(unicodedata.category(character) == "Cc" for character in root):
+        raise ValueError(f"{field_name} must not contain control characters")
+
+    path = Path(root)
+    if (
+        not path.is_absolute()
+        or root.startswith("//")
+        or ".." in path.parts
+        or path == Path(path.anchor)
+        or str(path) != root
+    ):
+        raise ValueError(f"{field_name} must be a normalized absolute path below filesystem root")
+    return path.resolve(strict=False)
+
+
+def _load_local_sources(value: Any) -> dict[str, LocalSource]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise TypeError("local_sources must be a mapping")
+
+    sources: dict[str, LocalSource] = {}
+    for name, item in value.items():
+        source_name = _nonempty_string(name, "local source name")
+        if source_name in sources:
+            raise ValueError(f"local source name collision after normalization: {source_name!r}")
+        if source_name != name:
+            raise ValueError("local source name must not have leading or trailing whitespace")
+        field_prefix = f"local_sources.{source_name}"
+        if not isinstance(item, Mapping):
+            raise TypeError(f"{field_prefix} must be a mapping")
+        roots = item.get("roots")
+        if not isinstance(roots, list) or not roots:
+            raise ValueError(f"{field_prefix}.roots must be a nonempty list of strings")
+        normalized_roots = tuple(_local_root(root, f"{field_prefix}.roots") for root in roots)
+        if len(set(normalized_roots)) != len(normalized_roots):
+            raise ValueError(f"{field_prefix}.roots contains duplicate normalized paths")
+        sources[source_name] = LocalSource(name=source_name, roots=normalized_roots)
+    return sources
+
+
 def load_config(path: Path) -> AppConfig:
     loaded: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
     if loaded is None:
@@ -130,12 +183,21 @@ def load_config(path: Path) -> AppConfig:
     if environment_secret and configured_secret in ("", SESSION_SECRET_PLACEHOLDER):
         configured_secret = environment_secret
     default_database_url = f"sqlite:///{data_root / 'db/app.sqlite3'}"
+    remote_sources = _load_remote_sources(raw.get("remote_sources"))
+    local_sources = _load_local_sources(raw.get("local_sources"))
+    collisions = sorted(set(remote_sources) & set(local_sources))
+    if collisions:
+        raise ValueError(
+            "source name cannot be configured as both local and remote: "
+            + ", ".join(collisions)
+        )
     return AppConfig(
         data_root=data_root,
         database_url=_optional_string(raw, "database_url", default_database_url),
         redis_url=_optional_string(raw, "redis_url", "redis://redis:6379/0"),
         session_secret=configured_secret,
-        remote_sources=_load_remote_sources(raw.get("remote_sources")),
+        remote_sources=remote_sources,
+        local_sources=local_sources,
     )
 
 
