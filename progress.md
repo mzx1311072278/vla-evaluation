@@ -60,3 +60,19 @@
 - 来源、目标和数据库持久化指纹一致：`d1db953119b7edd15335f34573e66b327808290fb449566b4232363d6f59d912`，证明复制结果完整且来源保持不变。
 - 聚焦回归覆盖配置、路径安全、共享导入、Web 和 Worker 调度，全部通过。
 - 最终执行 `.venv/bin/pytest -q`：全量通过，1 个既有跳过项；执行 `.venv/bin/ruff check Genie02_report vla_eval tests`、`git diff --check` 和 Compose YAML/挂载断言：均通过。
+
+## 2026-08-07：数据集与评测任务列表管理
+
+- 功能继续在 `feature/vla-eval-web-vlm-api-backend` 实施，`main` 未修改，无关未跟踪 `uv.lock` 未纳入提交。
+- 实施提交：`37d333f` 列表参数契约、`73ac002` 归档持久化表、`707797d` 数据集归档/恢复、`d72f2cc` 评测任务归档/恢复、`de92af4` 搜索排序与组合筛选、`2dd1153` 响应式工具栏与页面操作；设计/计划提交为 `48d142f` 和 `4569316`。
+- 数据集归档复用 `Dataset.status = ARCHIVED`，并保存 `previous_status`/`archived_at`/`archived_by`；恢复仅接受完整且原状态为 `READY` 或 `PREFLIGHT_FAILED` 的快照。
+- 新增 `evaluation_job_archives` 表：`evaluation_job_id` 主键并对任务 `ON DELETE CASCADE`，`archived_at` 为 UTC，`archived_by` 对用户 `ON DELETE SET NULL`；任务原始状态、参数、来源和输出目录不变。
+- 两个列表默认排除已归档记录，`archived=1` 同时显示活动和已归档记录；支持不区分大小写的包含搜索、`newest`/`oldest`/`name_asc`/`name_desc` 稳定排序，评测页的原状态和数据集筛选可与新条件组合。
+- 列表与详情页已增加 Lucide 归档/恢复图标、归档标记、原生确认框和窄屏堆叠工具栏；活动任务不渲染归档提交按钮。
+- 重启真实 Web 和两个 RQ worker 后，`https://127.0.0.1:8443/health` 返回 `{"status":"ok"}`；`transfers` 和 `evaluations` worker 均为 `idle`，Redis 原进程未重启。
+- SQLite 启动初始化已创建新表，真实元数据检查确认 3 列、主键与两条设计外键均存在。
+- 真实数据集 `a43a792b-10a5-48da-ada2-3de5f812dc03` 可逆验收通过：归档后默认搜索消失、开启已归档后出现，恢复后状态回到 `READY`；29 个文件的大小/mtime 清单和指纹 `d1db953119b7edd15335f34573e66b327808290fb449566b4232363d6f59d912` 前后一致。
+- 真实成功任务 `d9338238-e7b7-4559-870a-7b33153b9823` 可逆验收通过：归档前后报告 HTML 和当时页面列出的 4 个下载响应字节/`Content-Disposition` 一致，恢复后归档记录已删除。
+- 真实 HTTPS 验收对数据集和评测列表都执行了部分关键词搜索和四种排序；自动化 Chromium 在 1440x1000 和 390x844 视口确认工具栏、控件、操作区无页面级横向溢出或内容越界。
+- 最终只运行一次全量验证：`.venv/bin/pytest -q` 100% 通过，1 个既有跳过项；`.venv/bin/ruff check Genie02_report vla_eval tests` 输出 `All checks passed!`；`git diff --check` 退出 0。
+- 既有依赖仍输出 `StarletteDeprecationWarning`（FastAPI TestClient 的 httpx 兼容过渡），本次功能无新增警告或失败。
