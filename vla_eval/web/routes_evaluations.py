@@ -8,7 +8,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 import vla_eval
@@ -18,7 +18,12 @@ from vla_eval.models import Dataset, EvaluationJob, EvaluationJobArchive, User
 from vla_eval.profiles import Profile, load_profile
 from vla_eval.security import require_csrf, require_html_user
 from vla_eval.tasks import run_evaluation_task
-from vla_eval.web.list_management import validate_return_to
+from vla_eval.web.list_management import (
+    ListControls,
+    literal_contains_pattern,
+    parse_list_controls,
+    validate_return_to,
+)
 
 router = APIRouter()
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
@@ -84,6 +89,31 @@ async def _archive_form_target(request: Request, job_id: str) -> str:
         ),
         fallback="/evaluations",
     )
+
+
+def _evaluation_order(controls: ListControls):
+    if controls.sort == "oldest":
+        return (EvaluationJob.created_at.asc(), EvaluationJob.id.asc())
+    if controls.sort == "name_asc":
+        return (
+            func.lower(Dataset.name).asc(),
+            Dataset.name.asc(),
+            EvaluationJob.created_at.desc(),
+            EvaluationJob.id.asc(),
+        )
+    if controls.sort == "name_desc":
+        return (
+            func.lower(Dataset.name).desc(),
+            Dataset.name.desc(),
+            EvaluationJob.created_at.desc(),
+            EvaluationJob.id.desc(),
+        )
+    return (EvaluationJob.created_at.desc(), EvaluationJob.id.desc())
+
+
+def _current_local_url(request: Request) -> str:
+    query = request.url.query
+    return request.url.path + (f"?{query}" if query else "")
 
 
 def _profiles_root() -> Path:
@@ -236,6 +266,10 @@ def evaluation_list(
     request: Request,
     current_user: Annotated[User, Depends(require_html_user)],
 ):
+    controls = parse_list_controls(
+        request,
+        allowed_extra=frozenset({"state", "dataset_id"}),
+    )
     state_values = request.query_params.getlist("state")
     dataset_id_values = request.query_params.getlist("dataset_id")
     if len(state_values) > 1 or len(dataset_id_values) > 1:
@@ -247,15 +281,28 @@ def evaluation_list(
     if dataset_id:
         _load_dataset(request, dataset_id)
 
-    query = (
-        select(EvaluationJob, Dataset)
-        .join(Dataset, EvaluationJob.dataset_id == Dataset.id)
-        .order_by(EvaluationJob.created_at.desc())
+    query = select(EvaluationJob, Dataset).join(
+        Dataset, EvaluationJob.dataset_id == Dataset.id
+    ).outerjoin(
+        EvaluationJobArchive,
+        EvaluationJobArchive.evaluation_job_id == EvaluationJob.id,
     )
+    if not controls.include_archived:
+        query = query.where(EvaluationJobArchive.evaluation_job_id.is_(None))
+    if controls.q:
+        pattern = literal_contains_pattern(controls.q)
+        query = query.where(
+            or_(
+                Dataset.name.ilike(pattern, escape="\\"),
+                EvaluationJob.profile_name.ilike(pattern, escape="\\"),
+                EvaluationJob.id.ilike(pattern, escape="\\"),
+            )
+        )
     if selected_state:
         query = query.where(EvaluationJob.state == selected_state)
     if dataset_id:
         query = query.where(EvaluationJob.dataset_id == dataset_id)
+    query = query.order_by(*_evaluation_order(controls))
     with session_scope(request.app.state.engine) as session:
         jobs = session.execute(query).all()
     return templates.TemplateResponse(
@@ -268,6 +315,8 @@ def evaluation_list(
             job_states=_JOB_STATES,
             selected_state=selected_state,
             dataset_id=dataset_id,
+            controls=controls,
+            current_url=_current_local_url(request),
         ),
     )
 @router.post("/evaluations")

@@ -13,7 +13,7 @@ from typing import Annotated, BinaryIO
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
@@ -21,7 +21,12 @@ from starlette.formparsers import MultiPartException, MultiPartParser
 from vla_eval.db import session_scope
 from vla_eval.models import Dataset, EvaluationJob, User
 from vla_eval.security import require_csrf, require_html_user
-from vla_eval.web.list_management import validate_return_to
+from vla_eval.web.list_management import (
+    ListControls,
+    literal_contains_pattern,
+    parse_list_controls,
+    validate_return_to,
+)
 
 router = APIRouter()
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
@@ -132,6 +137,31 @@ def _valid_archive_snapshot(value: object) -> bool:
     except ValueError:
         return False
     return parsed_archived_at.tzinfo is not None
+
+
+def _dataset_order(controls: ListControls):
+    if controls.sort == "oldest":
+        return (Dataset.created_at.asc(), Dataset.id.asc())
+    if controls.sort == "name_asc":
+        return (
+            func.lower(Dataset.name).asc(),
+            Dataset.name.asc(),
+            Dataset.created_at.desc(),
+            Dataset.id.asc(),
+        )
+    if controls.sort == "name_desc":
+        return (
+            func.lower(Dataset.name).desc(),
+            Dataset.name.desc(),
+            Dataset.created_at.desc(),
+            Dataset.id.desc(),
+        )
+    return (Dataset.created_at.desc(), Dataset.id.desc())
+
+
+def _current_local_url(request: Request) -> str:
+    query = request.url.query
+    return request.url.path + (f"?{query}" if query else "")
 
 
 def _validate_attachment_name(raw_name: str | None) -> str:
@@ -321,12 +351,31 @@ def dataset_list(
     request: Request,
     current_user: Annotated[User, Depends(require_html_user)],
 ):
+    controls = parse_list_controls(request)
+    query = select(Dataset)
+    if not controls.include_archived:
+        query = query.where(Dataset.status != "ARCHIVED")
+    if controls.q:
+        pattern = literal_contains_pattern(controls.q)
+        query = query.where(
+            or_(
+                Dataset.name.ilike(pattern, escape="\\"),
+                Dataset.path.ilike(pattern, escape="\\"),
+            )
+        )
+    query = query.order_by(*_dataset_order(controls))
     with session_scope(request.app.state.engine) as session:
-        datasets = session.scalars(select(Dataset).order_by(Dataset.created_at.desc())).all()
+        datasets = session.scalars(query).all()
     return templates.TemplateResponse(
         request=request,
         name="datasets/index.html",
-        context=_template_context(request, current_user, datasets=datasets),
+        context=_template_context(
+            request,
+            current_user,
+            datasets=datasets,
+            controls=controls,
+            current_url=_current_local_url(request),
+        ),
     )
 
 

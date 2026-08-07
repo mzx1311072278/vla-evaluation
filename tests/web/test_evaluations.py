@@ -1,4 +1,5 @@
 import json
+import re
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,6 +13,11 @@ from tests.conftest import reload_job
 from vla_eval.db import session_scope
 from vla_eval.models import Dataset, EvaluationJob, EvaluationJobArchive
 from vla_eval.tasks import run_evaluation_task
+
+
+def _listed_evaluation_ids(html: str) -> list[str]:
+    matches = re.findall(r'href="/evaluations/([^"/?]+)"', html)
+    return list(dict.fromkeys(matches))
 
 
 def _evaluation_form(csrf: str, dataset_id: str, **overrides: str) -> dict[str, str]:
@@ -102,6 +108,171 @@ def test_evaluation_list_filters_state_and_rejects_invalid_values(
     assert "hidden-profile" not in filtered.text
     assert auth_client.get("/evaluations?state=UNKNOWN").status_code == 422
     assert auth_client.get("/evaluations?state=FAILED&state=FAILED").status_code == 422
+
+
+def test_evaluation_list_searches_dataset_profile_and_partial_id(
+    auth_client, db_engine: Engine
+):
+    with session_scope(db_engine) as session:
+        robot_dataset = Dataset(
+            id="10000000-0000-0000-0000-000000000001",
+            name="Robot Lab",
+            path="/srv/robot",
+            kind="fixture",
+            status="READY",
+        )
+        vision_dataset = Dataset(
+            id="10000000-0000-0000-0000-000000000002",
+            name="Vision Lab",
+            path="/srv/vision",
+            kind="fixture",
+            status="READY",
+        )
+        session.add_all([robot_dataset, vision_dataset])
+        session.flush()
+        jobs = [
+            EvaluationJob(
+                id="20000000-0000-0000-0000-000000000001",
+                dataset_id=robot_dataset.id,
+                profile_name="plain-profile",
+                state="FAILED",
+            ),
+            EvaluationJob(
+                id="20000000-0000-0000-0000-000000000002",
+                dataset_id=vision_dataset.id,
+                profile_name="ROBOT-policy",
+                state="FAILED",
+            ),
+            EvaluationJob(
+                id="c0ffee00-0000-0000-0000-000000000003",
+                dataset_id=vision_dataset.id,
+                profile_name="plain-profile",
+                state="FAILED",
+            ),
+        ]
+        session.add_all(jobs)
+
+    robot = auth_client.get("/evaluations?q=robot")
+    partial_id = auth_client.get("/evaluations?q=C0FFEE")
+
+    assert set(_listed_evaluation_ids(robot.text)) == {jobs[0].id, jobs[1].id}
+    assert _listed_evaluation_ids(partial_id.text) == [jobs[2].id]
+
+
+def test_evaluation_list_combines_filters_and_archive_visibility(
+    auth_client, db_engine: Engine
+):
+    base = datetime(2026, 8, 7, 10, 0, tzinfo=UTC)
+    with session_scope(db_engine) as session:
+        target = Dataset(
+            id="30000000-0000-0000-0000-000000000001",
+            name="Target Dataset",
+            path="/srv/target",
+            kind="fixture",
+            status="READY",
+        )
+        other = Dataset(
+            id="30000000-0000-0000-0000-000000000002",
+            name="Other Dataset",
+            path="/srv/other",
+            kind="fixture",
+            status="READY",
+        )
+        session.add_all([target, other])
+        session.flush()
+        visible = EvaluationJob(
+            id="40000000-0000-0000-0000-000000000001",
+            dataset_id=target.id,
+            profile_name="needle-visible",
+            state="FAILED",
+            created_at=base,
+        )
+        archived = EvaluationJob(
+            id="40000000-0000-0000-0000-000000000002",
+            dataset_id=target.id,
+            profile_name="needle-archived",
+            state="FAILED",
+            created_at=base + timedelta(hours=1),
+        )
+        wrong_state = EvaluationJob(
+            id="40000000-0000-0000-0000-000000000003",
+            dataset_id=target.id,
+            profile_name="needle-success",
+            state="SUCCEEDED",
+            created_at=base + timedelta(hours=2),
+        )
+        wrong_dataset = EvaluationJob(
+            id="40000000-0000-0000-0000-000000000004",
+            dataset_id=other.id,
+            profile_name="needle-other",
+            state="FAILED",
+            created_at=base + timedelta(hours=3),
+        )
+        session.add_all([visible, archived, wrong_state, wrong_dataset])
+        session.flush()
+        session.add(EvaluationJobArchive(evaluation_job_id=archived.id))
+
+    query = f"q=needle&sort=name_asc&state=FAILED&dataset_id={target.id}"
+    default = auth_client.get(f"/evaluations?{query}")
+    with_archived = auth_client.get(f"/evaluations?{query}&archived=1")
+
+    assert _listed_evaluation_ids(default.text) == [visible.id]
+    assert _listed_evaluation_ids(with_archived.text) == [archived.id, visible.id]
+
+
+def test_evaluation_list_supports_four_stable_sorts(auth_client, db_engine: Engine):
+    base = datetime(2026, 8, 7, 11, 0, tzinfo=UTC)
+    with session_scope(db_engine) as session:
+        alpha = Dataset(
+            id="50000000-0000-0000-0000-000000000001",
+            name="Alpha",
+            path="/srv/alpha",
+            kind="fixture",
+            status="READY",
+        )
+        bravo = Dataset(
+            id="50000000-0000-0000-0000-000000000002",
+            name="bravo",
+            path="/srv/bravo",
+            kind="fixture",
+            status="READY",
+        )
+        session.add_all([alpha, bravo])
+        session.flush()
+        jobs = [
+            EvaluationJob(
+                id=f"60000000-0000-0000-0000-00000000000{index}",
+                dataset_id=dataset_id,
+                profile_name="profile",
+                state="FAILED",
+                created_at=created_at,
+            )
+            for index, dataset_id, created_at in (
+                (1, alpha.id, base),
+                (2, bravo.id, base + timedelta(hours=1)),
+                (3, alpha.id, base + timedelta(hours=2)),
+                (4, alpha.id, base + timedelta(hours=2)),
+            )
+        ]
+        session.add_all(jobs)
+
+    expected = {
+        "newest": [jobs[3].id, jobs[2].id, jobs[1].id, jobs[0].id],
+        "oldest": [jobs[0].id, jobs[1].id, jobs[2].id, jobs[3].id],
+        "name_asc": [jobs[2].id, jobs[3].id, jobs[0].id, jobs[1].id],
+        "name_desc": [jobs[1].id, jobs[3].id, jobs[2].id, jobs[0].id],
+    }
+    for sort, ids in expected.items():
+        response = auth_client.get(f"/evaluations?sort={sort}")
+        assert response.status_code == 200
+        assert _listed_evaluation_ids(response.text) == ids
+
+
+@pytest.mark.parametrize("query", ["unknown=1", "q=one&q=two", "sort=invalid"])
+def test_evaluation_list_rejects_invalid_duplicate_or_unknown_controls(
+    auth_client, query: str
+):
+    assert auth_client.get(f"/evaluations?{query}").status_code == 422
 
 
 @pytest.mark.parametrize(

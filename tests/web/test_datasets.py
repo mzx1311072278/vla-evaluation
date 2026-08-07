@@ -1,5 +1,6 @@
+import re
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -9,6 +10,11 @@ from sqlalchemy import Engine
 
 from vla_eval.db import session_scope
 from vla_eval.models import Dataset, EvaluationJob
+
+
+def _listed_dataset_ids(html: str) -> list[str]:
+    matches = re.findall(r'href="/datasets/([^"/?]+)"', html)
+    return list(dict.fromkeys(matches))
 
 
 @pytest.mark.parametrize("path", ["/datasets", "/datasets/missing"])
@@ -30,6 +36,109 @@ def test_dataset_list_and_ready_detail_show_evaluation_entry(auth_client, ready_
     assert str(ready_dataset.size_bytes) in detail.text
     assert f"/evaluations/new?dataset_id={ready_dataset.id}" in detail.text
     assert 'aria-disabled="true"' not in detail.text
+
+
+def test_dataset_list_archive_visibility_and_literal_contains_search(
+    auth_client, db_engine: Engine
+):
+    created_at = datetime(2026, 8, 7, 8, 0, tzinfo=UTC)
+    datasets = [
+        Dataset(
+            id="00000000-0000-0000-0000-000000000011",
+            name="RobotArm",
+            path="/srv/alpha",
+            kind="fixture",
+            status="READY",
+            created_at=created_at,
+        ),
+        Dataset(
+            id="00000000-0000-0000-0000-000000000012",
+            name="Vision",
+            path="/srv/ROBOT-path",
+            kind="fixture",
+            status="READY",
+            created_at=created_at + timedelta(minutes=1),
+        ),
+        Dataset(
+            id="00000000-0000-0000-0000-000000000013",
+            name="100%_literal",
+            path="/srv/literal",
+            kind="fixture",
+            status="READY",
+            created_at=created_at + timedelta(minutes=2),
+        ),
+        Dataset(
+            id="00000000-0000-0000-0000-000000000014",
+            name="1000Xliteral",
+            path="/srv/wildcard-decoy",
+            kind="fixture",
+            status="READY",
+            created_at=created_at + timedelta(minutes=3),
+        ),
+        Dataset(
+            id="00000000-0000-0000-0000-000000000015",
+            name="Archived Robot",
+            path="/srv/archived",
+            kind="fixture",
+            status="ARCHIVED",
+            created_at=created_at + timedelta(minutes=4),
+        ),
+    ]
+    with session_scope(db_engine) as session:
+        session.add_all(datasets)
+
+    default = auth_client.get("/datasets")
+    robots = auth_client.get("/datasets?q=robot")
+    literal = auth_client.get("/datasets?q=100%25_")
+    include_archived = auth_client.get("/datasets?q=robot&archived=1")
+
+    assert datasets[4].id not in _listed_dataset_ids(default.text)
+    assert _listed_dataset_ids(robots.text) == [datasets[1].id, datasets[0].id]
+    assert _listed_dataset_ids(literal.text) == [datasets[2].id]
+    assert _listed_dataset_ids(include_archived.text) == [
+        datasets[4].id,
+        datasets[1].id,
+        datasets[0].id,
+    ]
+
+
+def test_dataset_list_supports_four_stable_sorts(auth_client, db_engine: Engine):
+    base = datetime(2026, 8, 7, 9, 0, tzinfo=UTC)
+    datasets = [
+        Dataset(
+            id=f"00000000-0000-0000-0000-00000000000{index}",
+            name=name,
+            path=f"/srv/{index}",
+            kind="fixture",
+            status="READY",
+            created_at=created_at,
+        )
+        for index, name, created_at in (
+            (1, "Alpha", base),
+            (2, "bravo", base + timedelta(hours=1)),
+            (3, "Alpha", base + timedelta(hours=2)),
+            (4, "Alpha", base + timedelta(hours=2)),
+        )
+    ]
+    with session_scope(db_engine) as session:
+        session.add_all(datasets)
+
+    expected = {
+        "newest": [datasets[3].id, datasets[2].id, datasets[1].id, datasets[0].id],
+        "oldest": [datasets[0].id, datasets[1].id, datasets[2].id, datasets[3].id],
+        "name_asc": [datasets[2].id, datasets[3].id, datasets[0].id, datasets[1].id],
+        "name_desc": [datasets[1].id, datasets[3].id, datasets[2].id, datasets[0].id],
+    }
+
+    for sort, ids in expected.items():
+        response = auth_client.get(f"/datasets?sort={sort}")
+        assert response.status_code == 200
+        assert _listed_dataset_ids(response.text) == ids
+
+
+@pytest.mark.parametrize("query", ["unknown=1", "q=one&q=two", "sort=invalid"])
+def test_dataset_list_rejects_invalid_duplicate_or_unknown_controls(auth_client, query: str):
+    assert auth_client.get(f"/datasets?{query}").status_code == 422
 
 
 def test_dataset_detail_shows_only_five_most_recent_evaluations(
