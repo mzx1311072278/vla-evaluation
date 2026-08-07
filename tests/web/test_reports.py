@@ -249,14 +249,64 @@ def test_report_page_shows_core_metrics(auth_client, successful_job):
     assert "1.0.0" in response.text
 
 
+def test_report_page_sections_follow_evidence_priority(auth_client, successful_job):
+    response = auth_client.get(f"/reports/{successful_job.id}")
+
+    assert response.status_code == 200
+    section_ids = [
+        "report-summary",
+        "report-configuration",
+        "report-sources",
+        "report-quality",
+        "report-metrics",
+        "report-episodes",
+        "report-components",
+        "report-gaps",
+        "report-downloads",
+    ]
+    positions = [response.text.index(f'id="{value}"') for value in section_ids]
+    assert positions == sorted(positions)
+    for table_class in (
+        "configuration-table",
+        "source-table",
+        "quality-table",
+        "metric-definition-table",
+        "episode-table",
+        "component-table",
+        "evidence-gap-table",
+        "report-files-table",
+    ):
+        assert f'class="{table_class}"' in response.text
+
+
+def test_report_page_renders_shared_formulas_and_no_fake_release_decision(
+    auth_client, successful_job
+):
+    response = auth_client.get(f"/reports/{successful_job.id}")
+
+    assert response.status_code == 200
+    assert 'class="formula-fraction"' in response.text
+    assert "<sub>success</sub>" in response.text
+    assert "<sub>total</sub>" in response.text
+    assert "<sup>2</sup>" in response.text
+    assert "<sup>3</sup>" in response.text
+    assert "未配置自动发版判定" in response.text
+    assert "建议暂缓生产发版" not in response.text
+    assert "30.8%" not in response.text
+
+
 def test_report_styles_expose_report_layout_and_mobile_rules(client: TestClient):
     response = client.get("/static/app.css")
 
     assert response.status_code == 200
     for selector in (
         ".report-headline",
+        ".report-section",
+        ".release-decision",
         ".report-overview",
         ".smoothness-preview img",
+        ".metric-definition-table",
+        ".formula-fraction",
         ".report-files-table",
         ".report-filter-form",
         ".table-action",
