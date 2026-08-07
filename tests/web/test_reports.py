@@ -139,6 +139,17 @@ def test_report_routes_require_login(client: TestClient, path: str):
 def test_report_page_shows_core_metrics(auth_client, successful_job):
     response = auth_client.get(f"/reports/{successful_job.id}")
     assert response.status_code == 200
+    assert 'class="report-page"' in response.text
+    assert 'class="report-headline"' in response.text
+    assert 'class="metric-success"' in response.text
+    assert 'class="metric-failure"' in response.text
+    assert 'class="detail-band report-overview"' in response.text
+    assert 'class="key-value-table provenance-table"' in response.text
+    assert 'class="report-filter-form"' in response.text
+    assert 'class="button secondary-button"' in response.text
+    assert 'class="section-heading"' in response.text
+    assert "2 个文件" in response.text
+    assert 'data-lucide="download"' in response.text
     assert "GSR" in response.text
     # successful_job fixture has gsr=1.0 -> rendered as 100.0% (one decimal).
     assert "100.0%" in response.text
