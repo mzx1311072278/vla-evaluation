@@ -46,3 +46,17 @@
 - 页面列出的 5 个下载入口均返回 200、`Content-Disposition: attachment`，响应字节与落盘文件一致。
 - `tests/e2e/test_visual_layout.py` 在 1440x1000 和 390x844 视口通过，覆盖章节可见性、公式容器和页面横向溢出。
 - 最终执行 `.venv/bin/pytest -q`：全量通过，1 个既有跳过项；执行 `.venv/bin/ruff check Genie02_report vla_eval tests` 与 `git diff --check`：均通过。
+
+## 2026-08-07：受控本机数据集导入
+
+- 功能在 `feature/vla-eval-web-vlm-api-backend` 实现，`main` 未修改。
+- 增加白名单 `LocalSource` 配置、本机路径安全解析、rsync 本机传输、共享发布流程、Web 表单和 Worker 调度；现有 SSH 导入保持兼容。
+- Docker transfer Worker 容器内新增 `/mnt/vla-datasets:/mnt/vla-datasets:ro`，部署文档说明了 Worker 主机路径、SMB/NAS 挂载和复制进 inbox 后评测的语义。
+- 本机运行配置新增来源 `this-mac`，根目录为 `/Users/xueyg/Downloads/fangdianlang_data`；现有 session secret 和 `remote_sources` 未改变。
+- 安装并校验 GNU rsync 3.4.4；数据盘可用空间 656 GiB，Redis 健康，Web、transfers Worker、evaluations Worker 均从当前 worktree 重启。
+- 通过真实 HTTPS 登录和导入表单提交来源 `this-mac`、相对路径 `fangdianlang_good_only_ee`。原目标名已存在，为避免覆盖，验收目标使用 `fangdianlang_good_only_ee_local`。
+- 导入任务 ID：`d0ab02ee-ad2e-4ec6-a196-0e1b59d51cd1`；生成数据集 ID：`a43a792b-10a5-48da-ada2-3de5f812dc03`。
+- 任务最终状态 READY、进度 100%；数据集 kind 为 `lerobot`，Episode 数 199，大小 3,762,623,032 字节。
+- 来源、目标和数据库持久化指纹一致：`d1db953119b7edd15335f34573e66b327808290fb449566b4232363d6f59d912`，证明复制结果完整且来源保持不变。
+- 聚焦回归覆盖配置、路径安全、共享导入、Web 和 Worker 调度，全部通过。
+- 最终执行 `.venv/bin/pytest -q`：全量通过，1 个既有跳过项；执行 `.venv/bin/ruff check Genie02_report vla_eval tests`、`git diff --check` 和 Compose YAML/挂载断言：均通过。
