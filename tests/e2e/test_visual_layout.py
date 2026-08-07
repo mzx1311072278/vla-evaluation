@@ -13,6 +13,7 @@ without the browser installed.
 
 from __future__ import annotations
 
+import csv
 import json
 import socket
 import ssl
@@ -162,8 +163,20 @@ def report_job(db_engine, ready_dataset, user, tmp_path):
                 "mean_tts_success_s": 1.0,
                 "smoothness": {
                     "space": "joint",
-                    "left": {"mean": 0.0, "n_episodes": 1},
-                    "right": {"mean": None, "n_episodes": 0},
+                    "left": {
+                        "mean": 0.0,
+                        "std": 0.0,
+                        "min": 0.0,
+                        "max": 0.0,
+                        "n_episodes": 1,
+                    },
+                    "right": {
+                        "mean": None,
+                        "std": None,
+                        "min": None,
+                        "max": None,
+                        "n_episodes": 0,
+                    },
                     "n_episodes": 1,
                 },
             },
@@ -171,6 +184,39 @@ def report_job(db_engine, ready_dataset, user, tmp_path):
         ),
         encoding="utf-8",
     )
+    with (output_dir / "episode_metrics.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=(
+                "session_id",
+                "episode_index",
+                "outcome",
+                "duration_s",
+                "smoothness",
+                "left_smoothness",
+                "right_smoothness",
+                "smoothness_space",
+                "smoothness_frames",
+                "smoothness_skipped_reason",
+            ),
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "session_id": "ready-dataset",
+                "episode_index": 0,
+                "outcome": "success",
+                "duration_s": "1.000",
+                "smoothness": "0",
+                "left_smoothness": "0",
+                "right_smoothness": "",
+                "smoothness_space": "joint",
+                "smoothness_frames": 4,
+                "smoothness_skipped_reason": "",
+            }
+        )
     with session_scope(db_engine) as session:
         job = EvaluationJob(
             dataset_id=ready_dataset.id,
@@ -265,3 +311,75 @@ def test_core_pages_have_no_horizontal_overflow(
         assert chrome_overflow is False, (
             f"page-chrome horizontal overflow at viewport {page.viewport_size} on {path}"
         )
+
+
+@pytest.mark.parametrize("viewport", _VIEWPORTS)
+def test_report_sections_and_formulas_are_contained(
+    page,
+    live_server,
+    report_job,
+    viewport,
+):
+    page.set_viewport_size(viewport)
+    login(page, live_server)
+    page.goto(f"{live_server}/reports/{report_job.id}")
+    page.wait_for_load_state("networkidle")
+
+    section_ids = (
+        "report-summary",
+        "report-configuration",
+        "report-sources",
+        "report-quality",
+        "report-metrics",
+        "report-episodes",
+        "report-components",
+        "report-gaps",
+        "report-downloads",
+    )
+    for section_id in section_ids:
+        section = page.locator(f"#{section_id}")
+        assert section.count() == 1
+        section.scroll_into_view_if_needed()
+        assert section.is_visible()
+
+    assert page.evaluate(_NO_CHROME_OVERFLOW_JS) is False
+    formula_measurements = page.evaluate(
+        """
+        () => Array.from(document.querySelectorAll('.formula-row')).map((row) => {
+          const container = row.closest('.table-scroll');
+          const rowRect = row.getBoundingClientRect();
+          const containerRect = container?.getBoundingClientRect();
+          return {
+            rowRight: rowRect.right,
+            rowClientWidth: row.clientWidth,
+            rowScrollWidth: row.scrollWidth,
+            containerLeft: containerRect?.left,
+            containerClientWidth: container?.clientWidth,
+            containerScrollWidth: container?.scrollWidth,
+          };
+        })
+        """
+    )
+    assert all(
+        item["rowRight"]
+        <= item["containerLeft"] + item["containerScrollWidth"] + 1
+        and item["rowScrollWidth"] <= item["rowClientWidth"] + 1
+        for item in formula_measurements
+    ), formula_measurements
+    assert page.evaluate(
+        """
+        () => {
+          const controls = Array.from(
+            document.querySelectorAll('.page-heading .button, .report-filter-form button')
+          ).filter((item) => item.getClientRects().length > 0);
+          return controls.every((item, index) => {
+            const a = item.getBoundingClientRect();
+            return controls.slice(index + 1).every((other) => {
+              const b = other.getBoundingClientRect();
+              return a.right <= b.left || b.right <= a.left ||
+                a.bottom <= b.top || b.bottom <= a.top;
+            });
+          });
+        }
+        """
+    )

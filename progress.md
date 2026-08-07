@@ -40,3 +40,9 @@
 - 已确认公式可用本地语义化 HTML 表达，不引入外部 CDN；下载接口需支持 profile 中真实的 `attempt_eval/` 嵌套路径。
 - 用户已确认采用“证据优先的完整报告”方案，内容架构设计阶段完成。
 - 已完成 `docs/superpowers/plans/2026-08-07-evidence-first-report.md`，按共享指标定义、真实来源视图、嵌套产物、页面渲染和真实验收五个任务拆分。
+- 已完成共享指标定义、严格持久化报告视图、嵌套产物下载契约和九章节 Web 报告实现。
+- 真实任务 `d9338238-e7b7-4559-870a-7b33153b9823` 浏览器验收通过：4 个 Episode、2 成功 / 2 失败、GSR 50.0%、成功 TTS 2.500 s、平滑度约 0.081，VLM 本次未启用且无执行产物。
+- 真实页面包含九个预期章节和 5 条结构化公式，未出现旧报告的 `30.8%`、`Ep 9` 或 `dc67326`。
+- 页面列出的 5 个下载入口均返回 200、`Content-Disposition: attachment`，响应字节与落盘文件一致。
+- `tests/e2e/test_visual_layout.py` 在 1440x1000 和 390x844 视口通过，覆盖章节可见性、公式容器和页面横向溢出。
+- 最终执行 `.venv/bin/pytest -q`：全量通过，1 个既有跳过项；执行 `.venv/bin/ruff check Genie02_report vla_eval tests` 与 `git diff --check`：均通过。
