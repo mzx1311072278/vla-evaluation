@@ -12,7 +12,7 @@ from typing import ClassVar
 import pytest
 
 from vla_eval import import_jobs
-from vla_eval.config import RemoteSource
+from vla_eval.config import LocalSource, RemoteSource
 from vla_eval.datasets import DatasetInspection, DatasetKind
 from vla_eval.import_jobs import (
     CONNECTING,
@@ -992,6 +992,83 @@ def production_spec(tmp_path: Path) -> ImportSpec:
         trusted_staging_root=staging_root,
         trusted_inbox_root=inbox_root,
     )
+
+
+def local_production_spec(tmp_path: Path) -> ImportSpec:
+    source_root = tmp_path / "local-source"
+    dataset = source_root / "run-1"
+    staging_root = tmp_path / "staging-local"
+    inbox_root = tmp_path / "inbox-local"
+    for directory in (dataset, staging_root, inbox_root):
+        directory.mkdir(parents=True, mode=0o700)
+        directory.chmod(0o700)
+    source = LocalSource(name="this-host", roots=(source_root,))
+    return ImportSpec(
+        job_id="job-local",
+        source_name="this-host",
+        remote_root=str(source_root),
+        remote_relative_path="run-1",
+        staging_path=staging_root / "job-local",
+        target_path=inbox_root / "run-1",
+        mode="production",
+        local_source=source,
+        trusted_staging_root=staging_root,
+        trusted_inbox_root=inbox_root,
+    )
+
+
+def test_production_local_source_reuses_preflight_and_atomic_publication(tmp_path):
+    spec = local_production_spec(tmp_path)
+    inspection = DatasetInspection(DatasetKind.LEROBOT, True, "e" * 64, 4, 1, ())
+    calls = []
+
+    def fake_run(argv, progress):
+        calls.append(argv)
+        (spec.staging_path / "received").write_text("ok", encoding="utf-8")
+        progress(100)
+
+    result = execute_import(spec, transfer=fake_run, inspector=lambda _path: inspection)
+
+    assert calls == [
+        [
+            "rsync",
+            "-a",
+            "--partial",
+            "--append-verify",
+            "--info=progress2",
+            "--out-format=%i|%l|%n",
+            "--",
+            f"{spec.local_source.roots[0] / 'run-1'}/",
+            f"{spec.staging_path}/",
+        ]
+    ]
+    assert result.dataset_path == spec.target_path
+    assert result.inspection is inspection
+    assert spec.target_path.is_dir()
+    assert not spec.staging_path.exists()
+
+
+def test_production_rejects_both_remote_and_local_sources(tmp_path):
+    remote = production_spec(tmp_path)
+    local = local_production_spec(tmp_path)
+    spec = replace(remote, local_source=local.local_source)
+
+    with pytest.raises(ValueError, match="exactly one"):
+        execute_import(spec, transfer=lambda _argv, _progress: None)
+
+
+def test_production_rejects_missing_transport_source(tmp_path):
+    spec = replace(production_spec(tmp_path), source=None)
+
+    with pytest.raises(ValueError, match="exactly one"):
+        execute_import(spec, transfer=lambda _argv, _progress: None)
+
+
+def test_production_rejects_mismatched_local_source_name(tmp_path):
+    spec = replace(local_production_spec(tmp_path), source_name="different")
+
+    with pytest.raises(ValueError, match="source name"):
+        execute_import(spec, transfer=lambda _argv, _progress: None)
 
 
 def test_production_mode_revalidates_task8_with_wrapped_runner(tmp_path, monkeypatch):

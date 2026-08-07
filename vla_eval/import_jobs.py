@@ -21,8 +21,9 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Final, Literal
 
-from vla_eval.config import RemoteSource
+from vla_eval.config import LocalSource, RemoteSource
 from vla_eval.datasets import DatasetInspection, inspect_dataset
+from vla_eval.local import build_local_rsync_argv, resolve_local_source_directory
 from vla_eval.remote import (
     build_rsync_argv,
     normalize_remote_relative_path,
@@ -118,6 +119,7 @@ class ImportSpec:
     target_path: Path
     mode: Literal["injected", "production"] = "injected"
     source: RemoteSource | None = None
+    local_source: LocalSource | None = None
     trusted_credentials_root: Path | None = None
     trusted_staging_root: Path | None = None
     trusted_inbox_root: Path | None = None
@@ -679,22 +681,28 @@ def _prepare_paths(spec: ImportSpec, staging: Path, target: Path, production: bo
 
 
 def _require_production_context(spec: ImportSpec) -> None:
-    values = (
-        spec.source,
-        spec.trusted_credentials_root,
-        spec.trusted_staging_root,
-        spec.trusted_inbox_root,
-    )
-    if any(value is None for value in values):
-        raise ValueError("default transfer requires complete production trust context")
-    assert spec.source is not None
-    if spec.source.name != spec.source_name:
-        raise ValueError("remote source does not match source name")
+    if spec.trusted_staging_root is None or spec.trusted_inbox_root is None:
+        raise ValueError("production trust context requires staging and inbox roots")
+    sources = (spec.source, spec.local_source)
+    if sum(source is not None for source in sources) != 1:
+        raise ValueError("production trust context requires exactly one transport source")
+    if spec.source is not None:
+        if spec.trusted_credentials_root is None:
+            raise ValueError("remote production trust context requires credentials root")
+        if spec.source.name != spec.source_name:
+            raise ValueError("remote source does not match source name")
+    else:
+        assert spec.local_source is not None
+        if spec.trusted_credentials_root is not None:
+            raise ValueError("local production trust context must not include credentials")
+        if spec.local_source.name != spec.source_name:
+            raise ValueError("local source does not match source name")
 
 
 def _is_production_mode(spec: ImportSpec, transfer: Transfer) -> bool:
     context = (
         spec.source,
+        spec.local_source,
         spec.trusted_credentials_root,
         spec.trusted_staging_root,
         spec.trusted_inbox_root,
@@ -719,6 +727,16 @@ def _ensure_target_available(target: Path) -> None:
 def _ensure_same_filesystem(staging: Path, target_parent: Path) -> None:
     if staging.stat().st_dev != target_parent.stat().st_dev:
         raise OSError("staging and target parent must be on the same filesystem")
+
+
+def _ensure_source_separate(source: Path, staging: Path, target: Path) -> None:
+    for destination in (staging, target):
+        if (
+            source == destination
+            or _is_contained(destination, source)
+            or _is_contained(source, destination)
+        ):
+            raise ValueError("local source, staging, and target paths must be separate")
 
 
 def _verify_staging(spec: ImportSpec, staging: Path, production: bool) -> None:
@@ -811,21 +829,31 @@ def execute_import(
 
         _emit_state(callbacks, TRANSFERRING)
         if production:
-            assert spec.source is not None
-            assert spec.trusted_credentials_root is not None
             assert spec.trusted_staging_root is not None
-            validate_remote_source_files(
-                spec.source,
-                trusted_credentials_root=spec.trusted_credentials_root,
-            )
-            validate_staging_path(staging, spec.trusted_staging_root)
-            argv = build_rsync_argv(
-                spec.source,
-                spec.remote_root,
-                spec.remote_relative_path,
-                staging,
-                trusted_staging_root=spec.trusted_staging_root,
-            )
+            if spec.source is not None:
+                assert spec.trusted_credentials_root is not None
+                validate_remote_source_files(
+                    spec.source,
+                    trusted_credentials_root=spec.trusted_credentials_root,
+                )
+                validate_staging_path(staging, spec.trusted_staging_root)
+                argv = build_rsync_argv(
+                    spec.source,
+                    spec.remote_root,
+                    spec.remote_relative_path,
+                    staging,
+                    trusted_staging_root=spec.trusted_staging_root,
+                )
+            else:
+                assert spec.local_source is not None
+                validate_staging_path(staging, spec.trusted_staging_root)
+                local_source_path = resolve_local_source_directory(
+                    spec.local_source,
+                    spec.remote_root,
+                    spec.remote_relative_path,
+                )
+                _ensure_source_separate(local_source_path, staging, target)
+                argv = build_local_rsync_argv(local_source_path, staging)
         else:
             argv = []
 
