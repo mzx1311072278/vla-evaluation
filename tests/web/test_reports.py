@@ -1,5 +1,6 @@
 import csv
 import json
+import re
 import uuid
 from pathlib import Path
 
@@ -166,6 +167,25 @@ def test_report_page_shows_core_metrics(auth_client, successful_job):
     assert "1.0.0" in response.text
 
 
+def test_report_styles_expose_report_layout_and_mobile_rules(client: TestClient):
+    response = client.get("/static/app.css")
+
+    assert response.status_code == 200
+    for selector in (
+        ".report-headline",
+        ".report-overview",
+        ".smoothness-preview img",
+        ".report-files-table",
+        ".report-filter-form",
+        ".table-action",
+    ):
+        assert selector in response.text
+    assert re.search(
+        r"@media \(max-width: 720px\) \{[\s\S]*?\.report-headline",
+        response.text,
+    )
+
+
 def test_report_page_shows_artifact_metadata_and_smoothness_preview(
     auth_client, successful_job
 ):
@@ -184,7 +204,11 @@ def test_report_page_shows_artifact_metadata_and_smoothness_preview(
     assert f'<img src="{svg_url}"' in response.text
     assert f'href="{svg_url}"' in response.text
     assert 'class="smoothness-preview"' in response.text
-    assert "<figcaption>" in response.text
+    assert re.search(
+        r'<figure class="smoothness-preview">\s*'
+        r'<figcaption class="section-heading">',
+        response.text,
+    )
     for filename in (
         "episode_metrics.csv",
         "metrics_core.json",

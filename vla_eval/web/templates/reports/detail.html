@@ -21,13 +21,13 @@
     <section class="detail-band report-overview">
       {% if smoothness_preview_url %}
         <figure class="smoothness-preview">
-          <div class="section-heading">
-            <figcaption>
+          <figcaption class="section-heading">
+            <div>
               <h2>平滑度曲线</h2>
               <p class="muted">{{ headline.smoothness }}</p>
-            </figcaption>
+            </div>
             <a class="icon-button" href="{{ smoothness_preview_url }}" title="下载平滑度矢量图" aria-label="下载平滑度矢量图"><i data-lucide="download"></i></a>
-          </div>
+          </figcaption>
           <img src="{{ smoothness_preview_url }}" alt="平滑度曲线图">
         </figure>
       {% else %}
