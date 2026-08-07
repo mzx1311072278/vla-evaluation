@@ -100,6 +100,8 @@ td small { display: block; margin-top: .35rem; }
 
 .status { display: inline-block; min-width: 6.5rem; font-size: .78rem; font-weight: 800; }
 .status-ready { color: #176b53; }
+.status-success { color: #176b53; }
+.status-failure { color: #a12b22; }
 .status-failed, .status-cancelled { color: #a12b22; }
 .status-queued, .status-pending { color: #755d16; }
 .summary-grid { margin: 0 0 1.5rem; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-block: 1px solid #d6dcda; }

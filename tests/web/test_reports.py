@@ -187,6 +187,8 @@ def test_report_styles_expose_report_layout_and_mobile_rules(client: TestClient)
     assert ".page-heading .button { width: 100%; }" in response.text
     assert ".report-page .page-heading .commands { width: 100%; }" in response.text
     assert ".report-overview { grid-template-columns: minmax(0, 1fr); }" in response.text
+    assert ".status-success { color: #176b53; }" in response.text
+    assert ".status-failure { color: #a12b22; }" in response.text
 
 
 def test_report_page_shows_artifact_metadata_and_smoothness_preview(
@@ -207,6 +209,7 @@ def test_report_page_shows_artifact_metadata_and_smoothness_preview(
     assert f'<img src="{svg_url}"' in response.text
     assert f'href="{svg_url}"' in response.text
     assert 'class="smoothness-preview"' in response.text
+    assert 'aria-label="下载 metrics_core.json"' in response.text
     assert re.search(
         r'<figure class="smoothness-preview">\s*'
         r'<figcaption class="section-heading">',
@@ -280,6 +283,23 @@ def test_download_serves_episode_metrics_csv(auth_client, successful_job):
     )
     assert response.text == expected
     assert "episode_metrics.csv" in response.headers["content-disposition"]
+
+
+def test_download_serves_smoothness_curve_svg(auth_client, successful_job):
+    svg = b'<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0"/></svg>'
+    (Path(successful_job.output_dir) / "smoothness_curve.svg").write_bytes(svg)
+
+    response = auth_client.get(
+        f"/reports/{successful_job.id}/files/smoothness_curve.svg"
+    )
+
+    assert response.status_code == 200
+    assert response.content == svg
+    assert response.headers["content-type"].startswith("image/svg+xml")
+    assert (
+        'attachment; filename="smoothness_curve.svg"'
+        in response.headers["content-disposition"]
+    )
 
 
 def test_download_serves_report_markdown_glob(
