@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from vla_eval.time_utils import beijing_now, format_beijing_time
+
 if __package__:
     from .genie02_eval_common import (
         EvaluationError,
@@ -206,11 +208,28 @@ def _validate_report_inputs(
         )
 
 
+def _session_created_at(session: dict[str, Any]) -> datetime:
+    value = session.get("created_at")
+    if not isinstance(value, str):
+        raise EvaluationError("session.json created_at must be an ISO 8601 timestamp")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise EvaluationError(
+            "session.json created_at must be an ISO 8601 timestamp"
+        ) from error
+    if parsed.tzinfo is None:
+        raise EvaluationError("session.json created_at must include a timezone")
+    return parsed
+
+
 def build_report(
     session: dict[str, Any],
     episodes: Sequence[dict[str, str]],
     episode_metrics: Sequence[dict[str, Any]],
     metrics: dict[str, Any],
+    *,
+    generated_at: datetime,
 ) -> str:
     """Build the five report sections prescribed by document section 6.7."""
     _validate_report_inputs(episodes, episode_metrics, metrics)
@@ -223,7 +242,8 @@ def build_report(
         "",
         "## 1. 评测配置",
         "",
-        f"- 日期：{_md_cell(session.get('date', datetime.now().astimezone().date().isoformat()))}",
+        f"- 数据记录时间：{format_beijing_time(_session_created_at(session))}",
+        f"- 报告生成时间：{format_beijing_time(generated_at)}",
         f"- 任务：{_md_cell(session['task'])}",
         f"- 数据：{session['session_id']}",
         f"- 配置：{_md_cell(session['rollout_config_path'])}",
@@ -323,9 +343,15 @@ def generate_markdown_report(
     episode_metrics = load_episode_metrics(output_root, session)
     metrics = load_metrics_core(output_root, session)
     _write_smoothness_chart(output_root, episodes, episode_metrics)
-    report = build_report(session, episodes, episode_metrics, metrics)
-    report_date = datetime.now().astimezone().date()
-    output = output_root / f"report_{report_date.strftime('%Y%m%d')}.md"
+    generated_at = beijing_now()
+    report = build_report(
+        session,
+        episodes,
+        episode_metrics,
+        metrics,
+        generated_at=generated_at,
+    )
+    output = output_root / f"report_{generated_at:%Y%m%d}.md"
     output.write_text(report, encoding="utf-8")
     return output
 

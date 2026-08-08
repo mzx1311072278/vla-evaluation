@@ -1,13 +1,16 @@
 import csv
 import json
+import os
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from Genie02_report.genie02_eval_report import generate_report
+from vla_eval.time_utils import BEIJING_TIMEZONE
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = Path(
@@ -58,6 +61,8 @@ def test_lerobot_session_preserves_recorded_info_metadata(tmp_path):
         ),
         encoding="utf-8",
     )
+    fixed = datetime(2026, 8, 8, 10, 35, 42, tzinfo=UTC).timestamp()
+    os.utime(dataset, (fixed, fixed))
 
     session = _synthesize_lerobot_session(dataset)
 
@@ -67,6 +72,7 @@ def test_lerobot_session_preserves_recorded_info_metadata(tmp_path):
     assert session["total_tasks"] == 1
     assert session["features"]["action"]["shape"] == [10]
     assert session["splits"] == {"train": "0:2"}
+    assert session["created_at"] == "2026-08-08T10:35:42+00:00"
 
 @pytest.fixture
 def minimal_native_session(tmp_path):
@@ -249,6 +255,29 @@ def test_markdown_report_uses_shared_metric_wording(
     report_path = next(output_dir.glob("report_*.md"))
 
     assert "shared-definition" in report_path.read_text(encoding="utf-8")
+
+
+def test_markdown_report_uses_beijing_record_and_generation_times(
+    minimal_native_session, tmp_path, monkeypatch
+):
+    from Genie02_report import genie02_markdown_report
+
+    fixed_now = datetime(2026, 8, 8, 16, 30, 45, tzinfo=UTC)
+    monkeypatch.setattr(
+        genie02_markdown_report,
+        "beijing_now",
+        lambda: fixed_now.astimezone(BEIJING_TIMEZONE),
+        raising=False,
+    )
+    output_dir = tmp_path / "timestamp-report"
+
+    generate_report(minimal_native_session, output_dir)
+    report_path = output_dir / "report_20260809.md"
+
+    assert report_path.is_file()
+    report = report_path.read_text(encoding="utf-8")
+    assert "数据记录时间：2026-01-02 03:04:05（北京时间）" in report
+    assert "报告生成时间：2026-08-09 00:30:45（北京时间）" in report
 
 
 @pytest.mark.skipif(not SAMPLE.exists(), reason="large local sample is not installed")

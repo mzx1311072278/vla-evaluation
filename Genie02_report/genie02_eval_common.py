@@ -8,9 +8,11 @@ import json
 import logging
 import math
 from collections.abc import Iterable, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from vla_eval.time_utils import beijing_now
 
 SCHEMA_VERSION = "1.0"
 DEFAULT_OUTPUT_DIR = "report"
@@ -134,8 +136,8 @@ def _lerobot_single_arm(info: dict[str, Any]) -> str:
 def _synthesize_lerobot_session(session_dir: Path) -> dict[str, Any]:
     info = read_json(session_dir / "meta" / "info.json")
     created_at = datetime.fromtimestamp(
-        session_dir.stat().st_mtime
-    ).astimezone().isoformat(timespec="seconds")
+        session_dir.stat().st_mtime, tz=UTC
+    ).isoformat(timespec="seconds")
     session = {
         "schema_version": SCHEMA_VERSION,
         "session_id": session_dir.name,
@@ -239,7 +241,7 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
 
 def prepare_output_dir(output_dir: Path | None = None) -> Path:
     """解析并创建输出目录。"""
-    default_dir = f"{DEFAULT_OUTPUT_DIR}_{datetime.now().astimezone().strftime('%Y%m%d')}"
+    default_dir = f"{DEFAULT_OUTPUT_DIR}_{beijing_now():%Y%m%d}"
     root = (output_dir or Path.cwd() / default_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     return root
