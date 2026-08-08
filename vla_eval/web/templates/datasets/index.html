@@ -29,13 +29,13 @@
     </form>
     <div class="table-scroll">
       <table>
-        <thead><tr><th>名称</th><th>类型</th><th>状态</th><th>Episode</th><th>大小</th><th>导入系统时间</th><th><span class="sr-only">操作</span></th></tr></thead>
+        <thead><tr><th>名称</th><th>类型</th><th>状态</th><th>Episode</th><th>大小</th><th class="system-time">导入系统时间</th><th><span class="sr-only">操作</span></th></tr></thead>
         <tbody>
           {% for dataset in datasets %}
-            <tr><td><a href="/datasets/{{ dataset.id }}">{{ dataset.name }}</a><small class="path">{{ dataset.path }}</small></td>
+            <tr><td class="entity-cell"><a href="/datasets/{{ dataset.id }}">{{ dataset.name }}</a><small class="path">{{ dataset.path }}</small></td>
               <td>{{ dataset.kind }}</td><td><span class="status status-{{ dataset.status|lower }}">{{ dataset.status }}</span>{% if dataset.status == "ARCHIVED" %}<span class="archive-badge">已归档</span>{% endif %}</td>
               <td>{{ dataset.episode_count }}</td><td>{{ dataset.size_bytes }} B</td>
-              <td>{{ dataset.created_at|beijing_time }}</td>
+              <td class="system-time">{{ dataset.created_at|beijing_time }}</td>
               <td><div class="row-actions">
                 <a class="table-action" href="/datasets/{{ dataset.id }}"><i data-lucide="eye"></i><span>查看</span></a>
                 {% if dataset.status == "ARCHIVED" %}

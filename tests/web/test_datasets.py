@@ -682,6 +682,27 @@ def test_base_layout_loads_static_responsive_styles_and_keeps_login_usable(clien
     assert "@media (max-width: 720px)" in stylesheet.text
 
 
+def test_timestamp_table_columns_keep_names_and_times_readable(
+    auth_client, ready_dataset
+):
+    listing = auth_client.get("/datasets")
+    stylesheet = auth_client.get("/static/app.css")
+
+    assert listing.status_code == stylesheet.status_code == 200
+    assert 'class="entity-cell"' in listing.text
+    assert 'class="system-time">导入系统时间</th>' in listing.text
+    assert re.search(
+        r"\.entity-cell\s*\{[^}]*min-width:\s*13rem",
+        stylesheet.text,
+        re.DOTALL,
+    )
+    assert re.search(
+        r"\.system-time\s*\{[^}]*min-width:\s*15rem;[^}]*white-space:\s*nowrap",
+        stylesheet.text,
+        re.DOTALL,
+    )
+
+
 def test_authenticated_layout_has_dataset_import_and_evaluation_navigation(auth_client):
     response = auth_client.get("/datasets")
 

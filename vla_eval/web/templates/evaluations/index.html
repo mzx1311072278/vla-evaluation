@@ -35,15 +35,15 @@
     </form>
     <div class="table-scroll">
       <table>
-        <thead><tr><th>数据集</th><th>配置</th><th>VLM</th><th>状态</th><th>阶段</th><th>进度</th><th>创建时间</th><th><span class="sr-only">操作</span></th></tr></thead>
+        <thead><tr><th>数据集</th><th>配置</th><th>VLM</th><th>状态</th><th>阶段</th><th>进度</th><th class="system-time">创建时间</th><th><span class="sr-only">操作</span></th></tr></thead>
         <tbody>
           {% for job, dataset, job_archive in jobs %}
             <tr>
-              <td><a href="/evaluations/{{ job.id }}">{{ dataset.name }}</a></td>
+              <td class="entity-cell"><a href="/evaluations/{{ job.id }}">{{ dataset.name }}</a></td>
               <td>{{ job.profile_name }}</td><td>{{ "已启用" if job.vlm_enabled else "未启用" }}</td>
               <td><span class="status status-{{ job.state|lower }}">{{ job.state }}</span>{% if job_archive %}<span class="archive-badge">已归档</span>{% endif %}</td>
               <td>{{ job.stage }}</td><td>{{ "%.0f"|format(job.progress) }}%</td>
-              <td>{{ job.created_at|beijing_time }}</td>
+              <td class="system-time">{{ job.created_at|beijing_time }}</td>
               <td><div class="row-actions">
                 {% if job.state == "SUCCEEDED" %}<a class="table-action" href="/reports/{{ job.id }}"><i data-lucide="file-text"></i><span>报告</span></a>{% else %}<a class="table-action" href="/evaluations/{{ job.id }}"><i data-lucide="eye"></i><span>查看</span></a>{% endif %}
                 {% if job_archive %}
