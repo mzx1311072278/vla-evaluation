@@ -1,4 +1,5 @@
 import stat
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from urllib.parse import urlencode
 
@@ -218,6 +219,8 @@ def test_ambiguous_enqueue_failure_does_not_clobber_job_claimed_by_worker(
 
 
 def test_import_pages_and_status_api_render_persisted_jobs(auth_client, db_engine):
+    created = datetime(2026, 8, 8, 10, 35, 42, tzinfo=UTC)
+    updated = datetime(2026, 8, 8, 11, 6, 7, tzinfo=UTC)
     with session_scope(db_engine) as session:
         job = ImportJob(
             source_name="lab-a",
@@ -226,6 +229,8 @@ def test_import_pages_and_status_api_render_persisted_jobs(auth_client, db_engin
             target_name="run-01",
             state="TRANSFERRING",
             progress=42.5,
+            created_at=created,
+            updated_at=updated,
         )
         session.add(job)
         session.flush()
@@ -240,6 +245,9 @@ def test_import_pages_and_status_api_render_persisted_jobs(auth_client, db_engin
     assert job_id in listing.text
     assert "team/a/very/long/path/run-01" in detail.text
     assert "lab-a" in creation.text
+    assert "2026-08-08 18:35:42（北京时间）" in listing.text
+    assert "2026-08-08 18:35:42（北京时间）" in detail.text
+    assert "2026-08-08 19:06:07（北京时间）" in detail.text
     assert status.status_code == 200
     assert status.json() == {
         "id": job_id,

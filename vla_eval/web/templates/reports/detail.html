@@ -27,6 +27,8 @@
         <div><dt>成功 TTS</dt><dd>{{ headline.tts }}</dd></div>
         <div><dt>平滑度</dt><dd>{{ headline.smoothness }}</dd></div>
         <div><dt>待复核</dt><dd>{{ headline.pending_review }}</dd></div>
+        <div><dt>任务创建时间</dt><dd>{{ job.created_at|beijing_time }}</dd></div>
+        <div><dt>任务最后更新时间</dt><dd>{{ job.updated_at|beijing_time }}</dd></div>
       </dl>
       <div class="release-decision">
         <div>

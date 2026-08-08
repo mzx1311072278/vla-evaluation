@@ -38,6 +38,38 @@ def test_dataset_list_and_ready_detail_show_evaluation_entry(auth_client, ready_
     assert 'aria-disabled="true"' not in detail.text
 
 
+def test_dataset_pages_show_beijing_system_timestamps(auth_client, db_engine):
+    created = datetime(2026, 8, 8, 10, 35, 42, tzinfo=UTC)
+    updated = datetime(2026, 8, 8, 11, 6, 7, tzinfo=UTC)
+    dataset = Dataset(
+        name="Timestamp Dataset",
+        path="/srv/timestamp",
+        kind="fixture",
+        status="ARCHIVED",
+        created_at=created,
+        updated_at=updated,
+        inspection_json={
+            "_archive": {
+                "previous_status": "READY",
+                "archived_at": "2026-08-08T12:00:01+00:00",
+                "archived_by": "user-id",
+            }
+        },
+    )
+    with session_scope(db_engine) as session:
+        session.add(dataset)
+        session.flush()
+        dataset_id = dataset.id
+
+    listing = auth_client.get("/datasets?archived=1")
+    detail = auth_client.get(f"/datasets/{dataset_id}")
+
+    assert "2026-08-08 18:35:42（北京时间）" in listing.text
+    assert "2026-08-08 18:35:42（北京时间）" in detail.text
+    assert "2026-08-08 19:06:07（北京时间）" in detail.text
+    assert "2026-08-08 20:00:01（北京时间）" in detail.text
+
+
 def test_dataset_list_archive_visibility_and_literal_contains_search(
     auth_client, db_engine: Engine
 ):

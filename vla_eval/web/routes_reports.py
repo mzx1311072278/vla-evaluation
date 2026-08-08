@@ -15,7 +15,6 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy import Engine
 
 from Genie02_report.genie02_eval_common import EvaluationError
@@ -23,9 +22,9 @@ from vla_eval.db import session_scope
 from vla_eval.models import Dataset, EvaluationJob, User
 from vla_eval.security import require_html_user
 from vla_eval.web.report_view import build_report_view
+from vla_eval.web.templating import templates
 
 router = APIRouter()
-templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 
 _REPORT_GLOB = "report_*.md"
 _EXACT_ARTIFACTS = frozenset(

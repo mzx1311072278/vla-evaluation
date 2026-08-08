@@ -8,15 +8,15 @@
     </div>
     <div class="table-scroll">
       <table>
-        <thead><tr><th>目标</th><th>来源</th><th>状态</th><th>进度</th><th><span class="sr-only">操作</span></th></tr></thead>
+        <thead><tr><th>目标</th><th>来源</th><th>状态</th><th>进度</th><th>创建时间</th><th><span class="sr-only">操作</span></th></tr></thead>
         <tbody>
           {% for job in jobs %}
             <tr>
               <td><a href="/imports/{{ job.id }}">{{ job.target_name }}</a><small class="path">{{ job.remote_path }}</small></td>
               <td>{{ job.source_name }}</td><td><span class="status status-{{ job.state|lower }}">{{ job.state }}</span></td>
-              <td>{{ "%.0f"|format(job.progress) }}%</td><td><a href="/imports/{{ job.id }}">查看</a></td>
+              <td>{{ "%.0f"|format(job.progress) }}%</td><td>{{ job.created_at|beijing_time }}</td><td><a href="/imports/{{ job.id }}">查看</a></td>
             </tr>
-          {% else %}<tr><td colspan="5" class="empty">暂无导入任务</td></tr>{% endfor %}
+          {% else %}<tr><td colspan="6" class="empty">暂无导入任务</td></tr>{% endfor %}
         </tbody>
       </table>
     </div>

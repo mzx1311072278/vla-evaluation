@@ -8,6 +8,8 @@
       <div><dt>进度</dt><dd>{{ "%.0f"|format(job.progress) }}%</dd></div>
       <div><dt>远程源</dt><dd>{{ job.source_name }}</dd></div>
       <div><dt>根目录</dt><dd class="path">{{ job.remote_root }}</dd></div>
+      <div><dt>创建时间</dt><dd>{{ job.created_at|beijing_time }}</dd></div>
+      <div><dt>最后更新时间</dt><dd>{{ job.updated_at|beijing_time }}</dd></div>
     </dl>
     <div class="progress" role="progressbar" aria-label="导入进度" aria-valuenow="{{ job.progress }}" aria-valuemin="0" aria-valuemax="100"><span style="width: {{ job.progress }}%"></span></div>
     <ol class="phase-progress" aria-label="导入阶段">

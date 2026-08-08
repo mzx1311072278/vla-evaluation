@@ -43,7 +43,7 @@
               <td>{{ job.profile_name }}</td><td>{{ "已启用" if job.vlm_enabled else "未启用" }}</td>
               <td><span class="status status-{{ job.state|lower }}">{{ job.state }}</span>{% if job_archive %}<span class="archive-badge">已归档</span>{% endif %}</td>
               <td>{{ job.stage }}</td><td>{{ "%.0f"|format(job.progress) }}%</td>
-              <td>{{ job.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+              <td>{{ job.created_at|beijing_time }}</td>
               <td><div class="row-actions">
                 {% if job.state == "SUCCEEDED" %}<a class="table-action" href="/reports/{{ job.id }}"><i data-lucide="file-text"></i><span>报告</span></a>{% else %}<a class="table-action" href="/evaluations/{{ job.id }}"><i data-lucide="eye"></i><span>查看</span></a>{% endif %}
                 {% if job_archive %}

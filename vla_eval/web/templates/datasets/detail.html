@@ -27,6 +27,9 @@
       <div><dt>类型</dt><dd>{{ dataset.kind }}</dd></div>
       <div><dt>Episode</dt><dd>{{ dataset.episode_count }}</dd></div>
       <div><dt>大小</dt><dd>{{ dataset.size_bytes }} B</dd></div>
+      <div><dt>导入系统时间</dt><dd>{{ dataset.created_at|beijing_time }}</dd></div>
+      <div><dt>最后更新时间</dt><dd>{{ dataset.updated_at|beijing_time }}</dd></div>
+      {% if dataset_archived_at %}<div><dt>归档时间</dt><dd>{{ dataset_archived_at|beijing_time }}</dd></div>{% endif %}
     </dl>
     <section class="detail-band">
       <h2>存储路径</h2>
@@ -54,7 +57,7 @@
           <tbody>
             {% for job in recent_evaluations %}
               <tr>
-                <td><a href="/evaluations/{{ job.id }}">{{ job.profile_name }}</a><small>{{ job.created_at.strftime('%Y-%m-%d %H:%M') }}</small></td>
+                <td><a href="/evaluations/{{ job.id }}">{{ job.profile_name }}</a><small>{{ job.created_at|beijing_time }}</small></td>
                 <td><span class="status status-{{ job.state|lower }}">{{ job.state }}</span></td>
                 <td>{{ job.stage }}</td><td>{{ "%.0f"|format(job.progress) }}%</td>
                 <td><a href="/evaluations/{{ job.id }}">查看</a></td>

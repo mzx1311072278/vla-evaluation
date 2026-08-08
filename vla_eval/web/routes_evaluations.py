@@ -7,7 +7,6 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
@@ -24,9 +23,9 @@ from vla_eval.web.list_management import (
     parse_list_controls,
     validate_return_to,
 )
+from vla_eval.web.templating import templates
 
 router = APIRouter()
-templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 
 _TERMINAL_STATES = frozenset({"SUCCEEDED", "FAILED", "CANCELLED", "INTERRUPTED"})
 _ACTIVE_STATES = frozenset({"QUEUED", "PREFLIGHT", "METRICS", "VLM", "REPORT", "RUNNING"})

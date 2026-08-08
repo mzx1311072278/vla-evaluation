@@ -2,13 +2,12 @@ import os
 import stat
 import unicodedata
 from contextlib import suppress
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 from typing import Annotated
 
 import paramiko
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy import delete, select
 
 from vla_eval.db import session_scope
@@ -16,9 +15,9 @@ from vla_eval.models import ImportJob, User
 from vla_eval.remote import normalize_remote_relative_path
 from vla_eval.security import require_csrf, require_html_user
 from vla_eval.tasks import run_import_task
+from vla_eval.web.templating import templates
 
 router = APIRouter()
-templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 _TERMINAL_STATES = frozenset({"READY", "FAILED", "CANCELLED"})
 _IMPORT_FIELDS = frozenset({"csrf_token", "source_name", "root", "relative_path", "target_name"})
 _TARGET_PUNCTUATION = frozenset(" ._-")

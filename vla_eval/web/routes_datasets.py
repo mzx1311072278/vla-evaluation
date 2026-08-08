@@ -12,7 +12,6 @@ from typing import Annotated, BinaryIO
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
-from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, or_, select
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
@@ -27,9 +26,9 @@ from vla_eval.web.list_management import (
     parse_list_controls,
     validate_return_to,
 )
+from vla_eval.web.templating import templates
 
 router = APIRouter()
-templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 _ATTACHMENT_FIELDS = frozenset({"csrf_token", "file"})
 _ALLOWED_EXTENSIONS = frozenset({".json", ".yaml", ".yml", ".csv"})
 _MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
@@ -137,6 +136,13 @@ def _valid_archive_snapshot(value: object) -> bool:
     except ValueError:
         return False
     return parsed_archived_at.tzinfo is not None
+
+
+def _dataset_archived_at(dataset: Dataset) -> datetime | None:
+    snapshot = dataset.inspection_json.get(_ARCHIVE_KEY)
+    if dataset.status != "ARCHIVED" or not _valid_archive_snapshot(snapshot):
+        return None
+    return datetime.fromisoformat(snapshot["archived_at"])
 
 
 def _dataset_order(controls: ListControls):
@@ -400,6 +406,7 @@ def dataset_detail(
             request,
             current_user,
             dataset=dataset,
+            dataset_archived_at=_dataset_archived_at(dataset),
             recent_evaluations=recent_evaluations,
         ),
     )

@@ -1,8 +1,5 @@
-from pathlib import Path
-
 from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse
-from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 
 from vla_eval.security import (
@@ -11,9 +8,9 @@ from vla_eval.security import (
     new_csrf_token,
     require_csrf,
 )
+from vla_eval.web.templating import templates
 
 router = APIRouter()
-templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 _INVALID_CREDENTIALS = "用户名或密码无效"
 
 

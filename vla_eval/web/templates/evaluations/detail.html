@@ -8,6 +8,9 @@
       <div><dt>阶段</dt><dd>{{ job.stage }}</dd></div>
       <div><dt>进度</dt><dd>{{ "%.0f"|format(job.progress) }}%</dd></div>
       <div><dt>配置</dt><dd>{{ job.profile_name }}</dd></div>
+      <div><dt>创建时间</dt><dd>{{ job.created_at|beijing_time }}</dd></div>
+      <div><dt>最后更新时间</dt><dd>{{ job.updated_at|beijing_time }}</dd></div>
+      {% if job_archive %}<div><dt>归档时间</dt><dd>{{ job_archive.archived_at|beijing_time }}</dd></div>{% endif %}
     </dl>
     <div class="progress" role="progressbar" aria-label="评测进度" aria-valuenow="{{ job.progress }}" aria-valuemin="0" aria-valuemax="100"><span style="width: {{ job.progress }}%"></span></div>
     <ol class="phase-progress" aria-label="评测阶段">

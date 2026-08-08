@@ -2,6 +2,7 @@ import csv
 import json
 import re
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -159,6 +160,21 @@ def _attempt_row(episode_index: int, **overrides) -> dict:
     }
     row.update(overrides)
     return row
+
+
+def test_report_page_shows_beijing_task_timestamps(
+    auth_client, db_engine, successful_job
+):
+    with session_scope(db_engine) as session:
+        persisted = session.get_one(EvaluationJob, successful_job.id)
+        persisted.created_at = datetime(2026, 8, 8, 10, 35, 42, tzinfo=UTC)
+        persisted.updated_at = datetime(2026, 8, 8, 11, 6, 7, tzinfo=UTC)
+
+    response = auth_client.get(f"/reports/{successful_job.id}")
+
+    assert response.status_code == 200
+    assert "2026-08-08 18:35:42（北京时间）" in response.text
+    assert "2026-08-08 19:06:07（北京时间）" in response.text
 
 
 def test_report_view_uses_current_persisted_evidence(successful_job, ready_dataset):

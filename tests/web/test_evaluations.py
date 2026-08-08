@@ -77,9 +77,42 @@ def test_evaluation_list_shows_newest_jobs_and_report_links(
     for value in (ready_dataset.name, "genie02-api", "SUCCEEDED", "REPORT", "100%"):
         assert value in response.text
     assert "已启用" in response.text
+    assert "2026-08-06 17:30:00（北京时间）" in response.text
     assert f'href="/evaluations/{newer_id}"' in response.text
     assert f'href="/reports/{newer_id}"' in response.text
     assert f'href="/reports/{older_id}"' not in response.text
+
+
+def test_evaluation_detail_shows_beijing_system_and_archive_times(
+    auth_client, db_engine, ready_dataset
+):
+    created = datetime(2026, 8, 8, 10, 35, 42, tzinfo=UTC)
+    updated = datetime(2026, 8, 8, 11, 6, 7, tzinfo=UTC)
+    with session_scope(db_engine) as session:
+        job = EvaluationJob(
+            dataset_id=ready_dataset.id,
+            profile_name="timestamp-profile",
+            state="SUCCEEDED",
+            created_at=created,
+            updated_at=updated,
+        )
+        session.add(job)
+        session.flush()
+        job_id = job.id
+        session.add(
+            EvaluationJobArchive(
+                evaluation_job_id=job_id,
+                archived_at=datetime(2026, 8, 8, 12, 0, 1, tzinfo=UTC),
+            )
+        )
+
+    detail = auth_client.get(f"/evaluations/{job_id}")
+    status = auth_client.get(f"/api/evaluations/{job_id}")
+
+    assert "2026-08-08 18:35:42（北京时间）" in detail.text
+    assert "2026-08-08 19:06:07（北京时间）" in detail.text
+    assert "2026-08-08 20:00:01（北京时间）" in detail.text
+    assert status.json()["updated_at"] == "2026-08-08T11:06:07+00:00"
 
 
 def test_evaluation_list_filters_state_and_rejects_invalid_values(
