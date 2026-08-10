@@ -107,3 +107,18 @@
 - 新增根目录 `README.md`，以“本机开发”和“Ubuntu 4090 Docker Compose”两条路径介绍项目、环境、配置、启动、数据导入、评测、VLM 与部署验收。
 - 文档明确无默认账号、本地路径的 Worker 语义、共享数据范围、归档行为和密钥安全边界。
 - 已使用隔离的临时数据目录实际验证配置加载、建库、创建用户、Redis smoke、Uvicorn 启动、`/health` 和登录页；当前开发机无 Docker/4090，容器 GPU 验收命令保留给 Ubuntu 宿主机执行。
+
+## 2026-08-08：系统时间戳统一
+
+- 功能继续在 `feature/vla-eval-web-vlm-api-backend` 实施，`main` 未修改，无关未跟踪 `uv.lock` 未修改、未暂存。
+- 数据库和 API 继续使用带时区的 UTC；网页与 Markdown 报告统一转换为 `Asia/Shanghai`，使用 24 小时制并精确到秒，格式为 `YYYY-MM-DD HH:mm:ss（北京时间）`。
+- 新增共享时间工具与 Jinja 过滤器；数据集、导入任务、评测任务、归档记录和网页报告不再在模板中直接格式化 UTC。
+- 数据集页面的时间明确为网站记录的“导入系统时间”；未迁移、修改或回写数据集文件、内部 `created_at`、视频、Parquet、JSON 或附件。
+- Markdown 报告明确区分“数据记录时间”和“报告生成时间”，报告目录及 `report_YYYYMMDD.md` 文件名按北京时间日期生成；LeRobot 合成会话时间使用目录 mtime 对应的绝对 UTC，不依赖服务器本地时区。
+- Episode 的 `from_timestamp`、`to_timestamp`、`rough_start_time` 和 `rough_end_time` 仍为视频相对秒数，未进行时区转换，核心指标与报告证据未重新计算。
+- 窄屏验收首次发现新增时间列挤压名称列；已增加实体列和系统时间列的稳定最小宽度，时间不换行，390px 下由表格容器局部横向滚动，页面主体不溢出。
+- 聚焦回归覆盖时间工具、四个 Web 模块、评测生成链路、CLI 和 Markdown 报告，全部通过；固定 UTC 输入 `2026-08-08T10:35:42+00:00` 正确显示为 `2026-08-08 18:35:42（北京时间）`，已有 `+08:00` 输入未重复偏移。
+- 临时独立 SQLite 与合成记录的真实页面验收覆盖 `/datasets`、数据集详情、`/imports`、导入详情、`/evaluations`、任务详情和报告页；1440x900 与 390x844 共 14 个页面状态均有正确时间、无 AM/PM、无页面主体横向溢出。
+- 实际 HTTPS API `/api/evaluations/33333333-3333-3333-3333-333333333333` 返回 `updated_at = 2026-08-08T11:06:07+00:00`，确认页面转换未改变 API UTC 契约；临时验收目录与用户数据集完全隔离。
+- 最终执行 `.venv/bin/pytest -q`：收集 921 项，920 通过、1 个既有条件跳过项；`.venv/bin/ruff check Genie02_report vla_eval tests` 输出 `All checks passed!`；`git diff --check` 退出 0。
+- 既有依赖仍输出 `StarletteDeprecationWarning`（FastAPI TestClient 的 httpx 兼容过渡），本次功能无新增警告或失败。
