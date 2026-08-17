@@ -456,6 +456,75 @@ def test_evaluation_accepts_read_only_trusted_profile_root(
     assert reload_job(db_engine, evaluation_job.id).state == "SUCCEEDED"
 
 
+def test_evaluation_accepts_data_root_profile_under_writable_shared_parent(
+    db_engine, data_root, evaluation_job, monkeypatch
+):
+    profiles_root = data_root / "profiles"
+    profiles_root.mkdir(mode=0o700)
+    profile_path = profiles_root / "genie02-full.yaml"
+    profile_path.write_text(
+        Path("config/profiles/genie02-full.yaml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    profile_path.chmod(0o400)
+    shared_parent = data_root.parent
+    original_mode = shared_parent.stat().st_mode & 0o777
+    shared_parent.chmod(0o777)
+    runtime = replace(
+        _runtime(
+            db_engine,
+            data_root,
+            storage_trust_mode="data_root_boundary",
+        ),
+        profiles_root=profiles_root,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "run_evaluation",
+        lambda **kwargs: kwargs["callbacks"].on_stage("REPORT"),
+    )
+
+    try:
+        run_evaluation_task(evaluation_job.id, runtime=runtime)
+    finally:
+        shared_parent.chmod(original_mode)
+
+    assert reload_job(db_engine, evaluation_job.id).state == "SUCCEEDED"
+
+
+def test_evaluation_keeps_external_profile_root_strict_in_boundary_mode(
+    db_engine, data_root, evaluation_job, monkeypatch
+):
+    shared_parent = data_root.parent
+    profiles_root = shared_parent / "external-profiles"
+    profiles_root.mkdir(mode=0o700)
+    (profiles_root / "genie02-full.yaml").write_text(
+        Path("config/profiles/genie02-full.yaml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    original_mode = shared_parent.stat().st_mode & 0o777
+    shared_parent.chmod(0o777)
+    runtime = replace(
+        _runtime(
+            db_engine,
+            data_root,
+            storage_trust_mode="data_root_boundary",
+        ),
+        profiles_root=profiles_root,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "run_evaluation",
+        lambda **_kwargs: pytest.fail("untrusted profile must not reach evaluation core"),
+    )
+
+    try:
+        with pytest.raises(ValueError, match="profiles root.*group or other writable"):
+            run_evaluation_task(evaluation_job.id, runtime=runtime)
+    finally:
+        shared_parent.chmod(original_mode)
+
+
 @pytest.mark.parametrize("resume_stage", ["METRICS", "VLM", "REPORT"])
 def test_evaluation_dataset_changed_fails_before_any_resume_stage(
     db_engine, data_root, evaluation_job, monkeypatch, resume_stage
