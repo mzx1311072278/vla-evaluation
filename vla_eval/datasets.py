@@ -38,6 +38,7 @@ class DatasetInspection:
     size_bytes: int
     episode_count: int | None
     errors: tuple[str, ...]
+    camera_keys: tuple[str, ...] = ()
 
 
 _SESSION_FIELDS = (
@@ -506,7 +507,9 @@ def _validate_data_parquet(
             )
 
 
-def _inspect_lerobot(root: Path, manifest: _Manifest) -> tuple[int | None, list[str]]:
+def _inspect_lerobot(
+    root: Path, manifest: _Manifest
+) -> tuple[int | None, list[str], tuple[str, ...]]:
     errors: list[str] = []
     info_path = root / "meta/info.json"
     episodes_dir = root / "meta/episodes"
@@ -524,6 +527,7 @@ def _inspect_lerobot(root: Path, manifest: _Manifest) -> tuple[int | None, list[
         else None
     )
     expected_count: int | None = None
+    discovered_video_keys = _video_keys(info or {}, set())
     if info is not None:
         expected_count = _int_value(
             info.get("total_episodes"), "meta/info.json total_episodes", errors
@@ -542,7 +546,7 @@ def _inspect_lerobot(root: Path, manifest: _Manifest) -> tuple[int | None, list[
     )
     if not episode_paths:
         errors.append("no LeRobot episode parquet files found under meta/episodes")
-        return expected_count, errors
+        return expected_count, errors, tuple(sorted(discovered_video_keys))
 
     episode_indices: set[int] = set()
     data_references: dict[Path, dict[int, int]] = {}
@@ -570,6 +574,7 @@ def _inspect_lerobot(root: Path, manifest: _Manifest) -> tuple[int | None, list[
             errors.append(f"episode metadata parquet is empty: {logical_path}")
             continue
         video_keys = _video_keys(info or {}, set(frame.columns))
+        discovered_video_keys.update(video_keys)
         for row_number, row in frame.iterrows():
             prefix = f"{logical_path} row {row_number}"
             index = _int_value(row["episode_index"], f"{prefix} episode_index", errors)
@@ -627,7 +632,7 @@ def _inspect_lerobot(root: Path, manifest: _Manifest) -> tuple[int | None, list[
         errors.append(
             f"meta/info.json total_episodes is {expected_count}, but episode metadata contains {actual_count}"
         )
-    return actual_count, errors
+    return actual_count, errors, tuple(sorted(discovered_video_keys))
 
 
 def _find_native_trajectory(directory: Path, index: int) -> Path | None:
@@ -1337,11 +1342,12 @@ def inspect_dataset(path: Path, allowed_root: Path) -> DatasetInspection:
     scan_errors = _scan_dataset(resolved_root, resolved_root, manifest)
     kind, detection_error = _detect_kind(resolved_root)
     episode_count: int | None = None
+    camera_keys: tuple[str, ...] = ()
     validation_errors = _mark_adapter_metadata(kind, resolved_root, manifest)
     if detection_error:
         validation_errors.append(detection_error)
     elif kind is DatasetKind.LEROBOT:
-        episode_count, adapter_errors = _inspect_lerobot(resolved_root, manifest)
+        episode_count, adapter_errors, camera_keys = _inspect_lerobot(resolved_root, manifest)
         validation_errors.extend(adapter_errors)
     elif kind is DatasetKind.GENIE02_SESSION:
         episode_count, adapter_errors = _inspect_genie02(resolved_root, resolved_allowed, manifest)
@@ -1359,4 +1365,5 @@ def inspect_dataset(path: Path, allowed_root: Path) -> DatasetInspection:
         size_bytes=manifest.size_bytes,
         episode_count=episode_count,
         errors=errors,
+        camera_keys=camera_keys,
     )

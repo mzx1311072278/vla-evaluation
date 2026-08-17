@@ -227,6 +227,17 @@ curl -fsS http://127.0.0.1:8000/health
 
 不要把 Qwen3 纯文本模型配置为 VLM；必须使用 Qwen3-VL Instruct checkpoint。
 
+### 任务级摄像头选择与资源保护
+
+启用 VLM 后，新建评测页面会列出数据集检查阶段发现的摄像头。摄像头列表会随任务保存，任务开始后不会再次根据当前页面选择重新发现：
+
+- 不勾选时默认使用数据集的全部摄像头；单个任务最多 3 路。若数据集超过 3 路，必须明确勾选不超过 3 路后提交。
+- 同一个 Episode 的所选视角会合并到一次 VLM 请求中；每路仍独立使用当前抽帧上限（默认全局 8 帧 + dense 8 帧），所以 3 路最多会发送 48 张图片。
+- 本地后端在 Processor 完成后读取真实 `input_ids` 长度，并检查 `input_tokens + max_new_tokens <= context_limit`。超限的 Episode 会记录 `context_length_exceeded`，不会调用 `generate`。
+- 本地后端每个 Episode 记录 `cuda_peak_memory_allocated_bytes` 和 `cuda_peak_memory_reserved_bytes`；API 后端无法观测 Worker 显存，这四个资源字段按不可用处理。
+
+建议第一次在 RTX 4090 上用只包含 1 个 Episode 的测试数据集做三路 smoke test，确认 Evaluation Worker 日志、Episode JSON 中的 `sampled_frame_count_by_camera` 和显存峰值，再扩大任务范围。上下文 token 没有超限不代表显存一定足够，真实峰值仍以 Worker 记录为准。
+
 ### 方式 B：OpenAI 兼容 API
 
 修改私有副本，不要向 Git 提交公司内网地址或密钥：

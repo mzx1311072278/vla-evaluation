@@ -604,7 +604,10 @@ def _record_import_success(
             fingerprint=inspection.fingerprint,
             size_bytes=inspection.size_bytes,
             episode_count=inspection.episode_count or 0,
-            inspection_json={"errors": list(inspection.errors)},
+            inspection_json={
+                "errors": list(inspection.errors),
+                "camera_keys": list(inspection.camera_keys),
+            },
         )
         session.add(dataset)
         session.flush()
@@ -957,6 +960,7 @@ def run_evaluation_task(job_id: str, *, runtime: TaskRuntime | None = None):
         profile_name = job.profile_name
         profile_version = job.profile_version
         vlm_enabled = job.vlm_enabled
+        params_json = dict(job.params_json or {})
         persisted_output = job.output_dir
         resume_from = job.stage if job.stage in {"VLM", "REPORT"} else "METRICS"
         initial_progress = job.progress
@@ -991,12 +995,29 @@ def run_evaluation_task(job_id: str, *, runtime: TaskRuntime | None = None):
             raise ValueError("evaluation profile name changed after job submission")
         if profile.version != profile_version:
             raise ValueError("evaluation profile version changed after job submission")
+        if not vlm_enabled:
+            camera_keys: tuple[str, ...] = ()
+        else:
+            raw_camera_keys = params_json.get("camera_keys")
+            if raw_camera_keys is None:
+                camera_keys = (profile.image_key,)
+            elif (
+                not isinstance(raw_camera_keys, list)
+                or not raw_camera_keys
+                or len(raw_camera_keys) > 3
+                or any(not isinstance(value, str) or not value for value in raw_camera_keys)
+                or len(set(raw_camera_keys)) != len(raw_camera_keys)
+            ):
+                raise ValueError("evaluation camera snapshot is invalid")
+            else:
+                camera_keys = tuple(raw_camera_keys)
         result = run_evaluation(
             dataset_path=str(trusted_dataset),
             output_dir=str(output_dir),
             profile=profile,
             vlm_enabled=vlm_enabled,
             callbacks=callbacks,
+            camera_keys=camera_keys,
             resume_from=resume_from,
             initial_progress=initial_progress,
         )

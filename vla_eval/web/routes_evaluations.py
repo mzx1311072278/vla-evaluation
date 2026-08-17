@@ -31,9 +31,10 @@ _TERMINAL_STATES = frozenset({"SUCCEEDED", "FAILED", "CANCELLED", "INTERRUPTED"}
 _ACTIVE_STATES = frozenset({"QUEUED", "PREFLIGHT", "METRICS", "VLM", "REPORT", "RUNNING"})
 _JOB_STATES = tuple(sorted(_TERMINAL_STATES | _ACTIVE_STATES))
 _ARCHIVABLE_JOB_STATES = _TERMINAL_STATES
+_MAX_CAMERA_KEYS = 3
 _ARCHIVE_FORM_FIELDS = frozenset({"csrf_token", "return_to"})
 _ALLOWED_FIELDS = frozenset(
-    {"csrf_token", "dataset_id", "profile", "vlm_enabled", "force"}
+    {"csrf_token", "dataset_id", "profile", "vlm_enabled", "camera_keys", "force"}
 )
 _PROFILE_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
@@ -67,6 +68,57 @@ def _load_dataset(request: Request, dataset_id: str) -> Dataset:
     if dataset is None:
         raise HTTPException(status_code=404, detail="Dataset not found")
     return dataset
+
+
+def _stored_camera_keys(dataset: Dataset) -> tuple[str, ...] | None:
+    inspection = dataset.inspection_json
+    if not isinstance(inspection, dict) or "camera_keys" not in inspection:
+        return None
+    raw = inspection.get("camera_keys")
+    if not isinstance(raw, list):
+        return None
+    values = tuple(raw)
+    if any(not isinstance(value, str) or not value for value in values):
+        return None
+    return tuple(dict.fromkeys(values))
+
+
+def _camera_keys_for_dataset(request: Request, dataset: Dataset) -> tuple[str, ...]:
+    stored = _stored_camera_keys(dataset)
+    if stored is not None:
+        return stored
+    try:
+        inbox = (request.app.state.config.data_root / "inbox").resolve(strict=True)
+        raw_path = Path(dataset.path)
+        if not raw_path.is_absolute():
+            raise ValueError("dataset path must be absolute")
+        resolved_path = raw_path.resolve(strict=True)
+        if resolved_path == inbox or inbox not in resolved_path.parents or not resolved_path.is_dir():
+            raise ValueError("dataset path escaped the trusted inbox")
+        inspection = inspect_dataset(resolved_path, allowed_root=resolved_path)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise HTTPException(status_code=409, detail="Dataset cameras could not be inspected") from error
+    if not inspection.ready:
+        raise HTTPException(status_code=409, detail="Dataset cameras could not be inspected")
+    if dataset.fingerprint and inspection.fingerprint != dataset.fingerprint:
+        raise HTTPException(status_code=409, detail="Dataset contents changed after import")
+    return inspection.camera_keys
+
+
+def _normalize_camera_keys(
+    submitted: list[str], available: tuple[str, ...], *, vlm_enabled: bool
+) -> list[str]:
+    if not vlm_enabled:
+        return []
+    selected = set(submitted)
+    if any(not value for value in submitted) or not selected.issubset(available):
+        raise HTTPException(status_code=422, detail="Invalid evaluation cameras")
+    normalized = list(available if not submitted else (key for key in available if key in selected))
+    if not normalized:
+        raise HTTPException(status_code=422, detail="No cameras available for VLM evaluation")
+    if len(normalized) > _MAX_CAMERA_KEYS:
+        raise HTTPException(status_code=422, detail="At most three cameras may be selected")
+    return normalized
 
 
 async def _archive_form_target(request: Request, job_id: str) -> str:
@@ -247,6 +299,7 @@ def evaluation_new(
         if "genie02-full" in profile_names
         else (profile_names[0] if profile_names else "")
     )
+    camera_keys = _camera_keys_for_dataset(request, dataset)
     return templates.TemplateResponse(
         request=request,
         name="evaluations/new.html",
@@ -256,6 +309,8 @@ def evaluation_new(
             dataset=dataset,
             profiles=profile_names,
             profile_name=default_profile,
+            camera_keys=camera_keys,
+            max_camera_keys=_MAX_CAMERA_KEYS,
         ),
     )
 
@@ -333,6 +388,9 @@ async def create_evaluation(
     dataset_id = _single_form_value(form, "dataset_id")
     profile_selector = _single_form_value(form, "profile")
     vlm_enabled_raw = _single_form_value(form, "vlm_enabled")
+    camera_values = form.getlist("camera_keys")
+    if any(not isinstance(value, str) for value in camera_values):
+        raise HTTPException(status_code=422, detail="Invalid evaluation form")
     force_values = form.getlist("force")
     if len(force_values) > 1:
         raise HTTPException(status_code=422, detail="Invalid evaluation form")
@@ -346,8 +404,13 @@ async def create_evaluation(
     if dataset.status != "READY":
         raise HTTPException(status_code=422, detail="Dataset is not ready for evaluation")
     profile = _load_profile_for_submission(profile_selector)
+    camera_keys = _normalize_camera_keys(
+        camera_values,
+        _camera_keys_for_dataset(request, dataset),
+        vlm_enabled=vlm_enabled,
+    )
 
-    params = {"vlm_enabled": vlm_enabled}
+    params = {"vlm_enabled": vlm_enabled, "camera_keys": camera_keys}
     canonical_params_json = json.dumps(params, sort_keys=True, separators=(",", ":"))
     run_key = hashlib.sha256(
         (
@@ -401,6 +464,7 @@ async def create_evaluation(
         "app_version": vla_eval.__version__,
         "git_sha": os.environ.get("VLA_EVAL_GIT_SHA", ""),
         "image_key": profile.image_key,
+        "camera_keys": camera_keys,
         "adapter": profile.adapter,
         "plugin": profile.plugin,
         "vlm_backend": profile.vlm.backend,

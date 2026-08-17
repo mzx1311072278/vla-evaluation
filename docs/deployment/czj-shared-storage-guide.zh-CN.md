@@ -249,6 +249,25 @@ grep -nE 'model_family|model_path' \
   /czj/code/vla-evaluation/data/profiles/genie02-{full,qwen3-vl}.yaml
 ```
 
+### 任务级摄像头选择和 4090 冒烟测试
+
+新建评测时，页面会展示数据集导入检查得到的摄像头列表。选择会保存到任务快照中，Worker 执行时使用快照，不会因为页面刷新或数据集目录后来增加视角而改变任务含义。
+
+- 不选择时默认分析数据集全部摄像头，但单个任务最多允许 3 路；数据集超过 3 路时必须明确勾选不超过 3 路。
+- 同一 Episode 的多路图片在一次 VLM 请求中联合分析。每路独立按当前抽帧上限采样，默认最多 16 帧，因此三路最多 48 张图片。
+- 本地 VLM 在 Processor 后读取真实输入 token 数，并在 `input_tokens + max_new_tokens` 超过 checkpoint 的 context limit 时跳过生成；Episode 结果会标记 `context_length_exceeded`。
+- 本地后端记录每个 Episode 的 CUDA allocated/reserved 峰值；API 后端的 token 和 CUDA 观测字段为 `null`。
+
+先准备只包含 1 个 Episode 的测试数据集，勾选 3 路摄像头运行一次。检查：
+
+```bash
+docker compose logs --tail=200 evaluation-worker
+jq '{camera_keys, sampled_frame_count_by_camera, input_token_count, context_token_limit, cuda_peak_memory_allocated_bytes, cuda_peak_memory_reserved_bytes}' \
+  /czj/code/vla-evaluation/data/runs/<评测任务ID>/attempt_eval/episode_results/episode_000.json
+```
+
+确认三路都出现在 `camera_keys`，每路抽帧数量符合预期，且 CUDA 峰值字段为非负整数后，再去掉 `limit` 扩大评测范围。上下文预算通过只表示 token 数安全；显存还会受到视觉编码、Prefill 激活和 CUDA workspace 影响，必须以这次真实 smoke test 的峰值为准。
+
 查找服务器上的模型：
 
 ```bash

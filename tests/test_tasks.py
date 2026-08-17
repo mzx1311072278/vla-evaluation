@@ -659,6 +659,7 @@ def test_evaluation_task_commits_callbacks_and_records_success(
     assert received["output_dir"] == str(data_root / "runs" / evaluation_job.id)
     assert received["resume_from"] == "METRICS"
     assert received["initial_progress"] == 0.0
+    assert received["camera_keys"] == ()
     job = reload_job(db_engine, evaluation_job.id)
     assert (job.state, job.stage, job.progress) == ("SUCCEEDED", "REPORT", 100.0)
 
@@ -673,6 +674,10 @@ def test_evaluation_retry_resumes_from_persisted_failed_stage(
         job.stage = failed_stage
         job.progress = 63.0
         job.vlm_enabled = True
+        job.params_json = {
+            "vlm_enabled": True,
+            "camera_keys": ["observation.images.front", "observation.images.right_wrist"],
+        }
 
     received = {}
 
@@ -686,6 +691,46 @@ def test_evaluation_retry_resumes_from_persisted_failed_stage(
 
     assert received["resume_from"] == failed_stage
     assert received["initial_progress"] == 63.0
+    assert received["camera_keys"] == (
+        "observation.images.front",
+        "observation.images.right_wrist",
+    )
+
+
+def test_evaluation_task_legacy_vlm_job_falls_back_to_profile_image_key(
+    db_engine, data_root, evaluation_job, monkeypatch
+):
+    with session_scope(db_engine) as session:
+        job = session.get_one(EvaluationJob, evaluation_job.id)
+        job.vlm_enabled = True
+        job.params_json = {"vlm_enabled": True}
+    received = {}
+
+    def evaluate(**kwargs):
+        received.update(kwargs)
+        kwargs["callbacks"].on_stage("REPORT")
+
+    monkeypatch.setattr("vla_eval.tasks.run_evaluation", evaluate)
+
+    run_evaluation_task(evaluation_job.id, runtime=_runtime(db_engine, data_root))
+
+    assert received["camera_keys"] == ("observation.images.right_wrist",)
+
+
+def test_evaluation_task_rejects_empty_vlm_camera_snapshot(
+    db_engine, data_root, evaluation_job, monkeypatch
+):
+    with session_scope(db_engine) as session:
+        job = session.get_one(EvaluationJob, evaluation_job.id)
+        job.vlm_enabled = True
+        job.params_json = {"vlm_enabled": True, "camera_keys": []}
+    monkeypatch.setattr(
+        "vla_eval.tasks.run_evaluation",
+        lambda **_kwargs: pytest.fail("invalid camera snapshot reached evaluation"),
+    )
+
+    with pytest.raises(ValueError, match="camera snapshot"):
+        run_evaluation_task(evaluation_job.id, runtime=_runtime(db_engine, data_root))
 
 
 def test_evaluation_retry_uses_core_artifact_validation_before_skipping(
@@ -905,6 +950,7 @@ def test_import_task_commits_callbacks_and_persists_ready_dataset(
         size_bytes=123,
         episode_count=4,
         errors=(),
+        camera_keys=("observation.images.front",),
     )
     received = {}
     monkeypatch.setattr(
@@ -955,6 +1001,10 @@ def test_import_task_commits_callbacks_and_persists_ready_dataset(
         assert persisted_dataset.fingerprint == "a" * 64
         assert persisted_dataset.size_bytes == 123
         assert persisted_dataset.episode_count == 4
+        assert persisted_dataset.inspection_json == {
+            "errors": [],
+            "camera_keys": ["observation.images.front"],
+        }
 
 
 @pytest.mark.parametrize(

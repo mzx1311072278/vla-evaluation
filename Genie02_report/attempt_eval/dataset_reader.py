@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
+
+
+@dataclass(frozen=True)
+class CameraVideo:
+    camera_key: str
+    video_file: Path
+    video_file_rel: str
+    from_timestamp: float
+    to_timestamp: float
 
 
 @dataclass
@@ -16,6 +26,7 @@ class EpisodeMeta:
     video_file_rel: str
     from_timestamp: float
     to_timestamp: float
+    camera_videos: tuple[CameraVideo, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -97,7 +108,9 @@ def _video_path(dataset_root: Path, image_key: str, meta_chunk: str, file_index:
     return matches[0] if matches else candidates[0]
 
 
-def read_episode_metadata(dataset_root: Path, image_key: str) -> list[EpisodeMeta]:
+def read_episode_metadata(
+    dataset_root: Path, image_key: str | Sequence[str]
+) -> list[EpisodeMeta]:
     dataset_root = Path(dataset_root).expanduser().resolve()
     episodes_dir = dataset_root / "meta" / "episodes"
     if not episodes_dir.exists():
@@ -119,31 +132,54 @@ def read_episode_metadata(dataset_root: Path, image_key: str) -> list[EpisodeMet
     for column in columns:
         print(f"  - {column}")
 
-    video_columns = resolve_video_columns(columns, image_key)
+    image_keys = (image_key,) if isinstance(image_key, str) else tuple(image_key)
+    if not image_keys or any(not isinstance(key, str) or not key for key in image_keys):
+        raise ValueError("at least one non-empty image key is required")
+    video_columns = {
+        key: resolve_video_columns(columns, key)
+        for key in image_keys
+    }
     success_col = "episode_success" if "episode_success" in columns else None
 
     episodes = []
     for _, row in meta.iterrows():
-        file_index = _file_index(row[video_columns.file_index])
-        video_file = _video_path(dataset_root, image_key, str(row["__meta_chunk"]), file_index)
         success_value = (
             None if success_col is None else str(row[success_col]).strip().lower() == "success"
         )
+        videos: list[CameraVideo] = []
+        for key in image_keys:
+            columns_for_key = video_columns[key]
+            file_index = _file_index(row[columns_for_key.file_index])
+            video_file = _video_path(dataset_root, key, str(row["__meta_chunk"]), file_index)
+            videos.append(
+                CameraVideo(
+                    camera_key=key,
+                    video_file=video_file,
+                    video_file_rel=(
+                        video_file.relative_to(dataset_root).as_posix()
+                        if video_file.is_relative_to(dataset_root)
+                        else video_file.as_posix()
+                    ),
+                    from_timestamp=float(row[columns_for_key.from_timestamp]),
+                    to_timestamp=float(row[columns_for_key.to_timestamp]),
+                )
+            )
+        primary = videos[0]
+        primary_columns = video_columns[image_keys[0]]
         episodes.append(
             EpisodeMeta(
-                episode_index=int(row[video_columns.episode_index]),
+                episode_index=int(row[primary_columns.episode_index]),
                 length=(
-                    None if pd.isna(row[video_columns.length]) else int(row[video_columns.length])
+                    None
+                    if pd.isna(row[primary_columns.length])
+                    else int(row[primary_columns.length])
                 ),
                 episode_success=success_value,
-                video_file=video_file,
-                video_file_rel=(
-                    video_file.relative_to(dataset_root).as_posix()
-                    if video_file.is_relative_to(dataset_root)
-                    else video_file.as_posix()
-                ),
-                from_timestamp=float(row[video_columns.from_timestamp]),
-                to_timestamp=float(row[video_columns.to_timestamp]),
+                video_file=primary.video_file,
+                video_file_rel=primary.video_file_rel,
+                from_timestamp=primary.from_timestamp,
+                to_timestamp=primary.to_timestamp,
+                camera_videos=tuple(videos),
             )
         )
     return sorted(episodes, key=lambda item: item.episode_index)

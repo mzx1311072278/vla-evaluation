@@ -152,7 +152,10 @@ def _upsert_dataset(engine: Engine, entry: Path, inspection: DatasetInspection) 
         "fingerprint": inspection.fingerprint,
         "size_bytes": inspection.size_bytes,
         "episode_count": inspection.episode_count or 0,
-        "inspection_json": {"errors": list(inspection.errors)},
+        "inspection_json": {
+            "errors": list(inspection.errors),
+            "camera_keys": list(inspection.camera_keys),
+        },
     }
     with session_scope(engine) as session:
         existing = session.scalar(select(Dataset).where(Dataset.path == str(entry)))

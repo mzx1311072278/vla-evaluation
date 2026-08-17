@@ -21,7 +21,34 @@
           <option value="true">启用</option>
         </select>
       </label>
+      <fieldset data-camera-selector data-max-cameras="{{ max_camera_keys }}">
+        <legend>摄像头（可多选）</legend>
+        {% if camera_keys %}
+          <div class="checkbox-list">
+            {% for camera_key in camera_keys %}
+              <label><input type="checkbox" name="camera_keys" value="{{ camera_key }}"> <code>{{ camera_key }}</code></label>
+            {% endfor %}
+          </div>
+          <small>未选择时分析数据集全部摄像头；最多选择 {{ max_camera_keys }} 个。每个摄像头分别按当前抽帧上限处理，多选会增加耗时和显存占用。</small>
+        {% else %}
+          <p class="error">该数据集没有可用于 VLM 分析的摄像头。</p>
+        {% endif %}
+      </fieldset>
       <div class="commands"><button type="submit">开始评测</button><a href="/datasets/{{ dataset.id }}">取消</a></div>
     </form>
   </section>
+  <script>
+    document.addEventListener("DOMContentLoaded", () => {
+      const root = document.querySelector("[data-camera-selector]");
+      if (!root) return;
+      const boxes = [...root.querySelectorAll('input[name="camera_keys"]')];
+      const maximum = Number(root.dataset.maxCameras);
+      const update = () => {
+        const selected = boxes.filter((box) => box.checked).length;
+        boxes.forEach((box) => { box.disabled = !box.checked && selected >= maximum; });
+      };
+      boxes.forEach((box) => box.addEventListener("change", update));
+      update();
+    });
+  </script>
 {% endblock %}

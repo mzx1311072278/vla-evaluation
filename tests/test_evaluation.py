@@ -556,6 +556,18 @@ def test_run_evaluation_calls_optional_vlm_between_metrics_and_report(
     assert result.vlm_summary_path == tmp_path / "run/attempt_eval/attempt_summary.json"
 
 
+def test_run_evaluation_rejects_empty_vlm_camera_snapshot(tmp_path: Path):
+    with pytest.raises(ValueError, match="camera_keys"):
+        run_evaluation(
+            tmp_path,
+            tmp_path / "run",
+            load_profile(PROFILE_PATH),
+            True,
+            _callbacks(),
+            camera_keys=(),
+        )
+
+
 def test_run_evaluation_does_not_import_optional_vlm_when_disabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -594,6 +606,7 @@ def test_run_profile_vlm_maps_profile_and_callbacks_to_task7_service(
         model_family: str
         prompt_version: str
         image_key: str
+        image_keys: tuple[str, ...]
         output_dir: Path
         max_image_size: int
         max_global_frames: int
@@ -625,6 +638,7 @@ def test_run_profile_vlm_maps_profile_and_callbacks_to_task7_service(
         output,
         profile,
         _callbacks(progress=progress_values, should_cancel=cancellation),
+        camera_keys=("observation.images.front", "observation.images.right_wrist"),
     )
 
     assert result == output / "attempt_summary.json"
@@ -635,6 +649,7 @@ def test_run_profile_vlm_maps_profile_and_callbacks_to_task7_service(
             model_family="qwen2_5_vl",
             prompt_version="genie02-attempt-v1",
             image_key="observation.images.right_wrist",
+            image_keys=("observation.images.front", "observation.images.right_wrist"),
             output_dir=output,
             max_image_size=336,
             max_global_frames=8,
