@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import re
 import stat
@@ -29,6 +30,8 @@ from vla_eval.import_jobs import (
 )
 from vla_eval.models import Dataset, EvaluationJob, ImportJob
 from vla_eval.profiles import load_profile
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -73,6 +76,12 @@ def configure_runtime(runtime: TaskRuntime) -> None:
         raise TypeError("runtime must be a TaskRuntime")
     global _configured_runtime
     _configured_runtime = runtime
+    if runtime.config.storage_trust_mode == "data_root_boundary":
+        logger.warning(
+            "storage_trust_mode=data_root_boundary: permission checks above data_root %s "
+            "are delegated to the storage platform",
+            runtime.config.data_root,
+        )
 
 
 def clear_runtime() -> None:
@@ -85,6 +94,12 @@ def _require_runtime(runtime: TaskRuntime | None) -> TaskRuntime:
     if resolved is None:
         raise RuntimeError("task runtime has not been configured")
     return resolved
+
+
+def _storage_trust_boundary(runtime: TaskRuntime) -> Path | None:
+    if runtime.config.storage_trust_mode == "data_root_boundary":
+        return runtime.config.data_root
+    return None
 
 
 def _claim_evaluation_execution(runtime: TaskRuntime, job_id: str, token: str) -> None:
@@ -332,7 +347,9 @@ def _verify_evaluation_dataset_identity(
 ) -> DatasetInspection:
     try:
         trusted_dataset = validate_published_target(
-            dataset_path, runtime.config.data_root / "inbox"
+            dataset_path,
+            runtime.config.data_root / "inbox",
+            minimum_checked_ancestor=_storage_trust_boundary(runtime),
         )
         inspection = inspect_dataset(trusted_dataset, allowed_root=trusted_dataset)
     except (OSError, RuntimeError, ValueError) as error:
@@ -354,14 +371,23 @@ def _trusted_evaluation_output(
     job_id: str,
     persisted_output: str | None,
 ) -> Path:
-    runs_root = validate_trusted_directory(runtime.config.data_root / "runs", "trusted runs root")
+    boundary = _storage_trust_boundary(runtime)
+    runs_root = validate_trusted_directory(
+        runtime.config.data_root / "runs",
+        "trusted runs root",
+        minimum_checked_ancestor=boundary,
+    )
     expected = runs_root / job_id
     if persisted_output is not None and persisted_output != str(expected):
         raise ValueError("evaluation output must match the canonical job output path")
     try:
         if not os.path.lexists(expected):
             expected.mkdir(mode=0o700)
-        return validate_published_target(expected, runs_root)
+        return validate_published_target(
+            expected,
+            runs_root,
+            minimum_checked_ancestor=boundary,
+        )
     except (OSError, RuntimeError, ValueError) as error:
         raise ValueError("evaluation output path failed trust validation") from error
 
@@ -669,9 +695,18 @@ def _record_import_integrity_failure(
             )
 
 
-def _inspect_trusted_published_target(target: Path, inbox_root: Path) -> DatasetInspection:
+def _inspect_trusted_published_target(
+    target: Path,
+    inbox_root: Path,
+    *,
+    minimum_checked_ancestor: Path | None = None,
+) -> DatasetInspection:
     try:
-        validated_target = validate_published_target(target, inbox_root)
+        validated_target = validate_published_target(
+            target,
+            inbox_root,
+            minimum_checked_ancestor=minimum_checked_ancestor,
+        )
     except (OSError, RuntimeError, ValueError) as error:
         raise ImportIntegrityError(str(error)) from error
     try:
@@ -692,6 +727,7 @@ def _load_completed_import(
     inspection = _inspect_trusted_published_target(
         target,
         runtime.config.data_root / "inbox",
+        minimum_checked_ancestor=_storage_trust_boundary(runtime),
     )
     with session_scope(runtime.engine) as session:
         dataset = session.get(Dataset, dataset_id)
@@ -732,6 +768,7 @@ def _reconcile_interrupted_import(
     inspection = _inspect_trusted_published_target(
         target,
         runtime.config.data_root / "inbox",
+        minimum_checked_ancestor=_storage_trust_boundary(runtime),
     )
     if not inspection.ready:
         raise ValueError("interrupted published target did not pass preflight")
@@ -877,6 +914,7 @@ def run_import_task(import_id: str, *, runtime: TaskRuntime | None = None) -> Im
             trusted_credentials_root=trusted_credentials_root,
             trusted_staging_root=resolved.config.data_root / "staging",
             trusted_inbox_root=resolved.config.data_root / "inbox",
+            storage_trust_boundary=_storage_trust_boundary(resolved),
         )
         result = execute_import(spec, inspector=inspect_and_capture, callbacks=callbacks)
     except BaseException as original:

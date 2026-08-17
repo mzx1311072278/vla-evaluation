@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 import paramiko
@@ -15,9 +16,17 @@ from vla_eval.web.routes_health import router as health_router
 from vla_eval.web.routes_imports import router as imports_router
 from vla_eval.web.routes_reports import router as reports_router
 
+logger = logging.getLogger(__name__)
+
 
 def create_app(config: AppConfig, engine: Engine, queues: QueueBundle) -> FastAPI:
     require_session_secret(config)
+    if config.storage_trust_mode == "data_root_boundary":
+        logger.warning(
+            "storage_trust_mode=data_root_boundary: permission checks above data_root %s "
+            "are delegated to the storage platform",
+            config.data_root,
+        )
     app = FastAPI(title="VLA Evaluation")
     app.add_middleware(
         SessionMiddleware,

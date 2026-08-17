@@ -1,5 +1,6 @@
 """Tests for the public `/health` endpoint."""
 
+import logging
 import os
 from pathlib import Path
 
@@ -50,6 +51,27 @@ def test_health_ok(health_app):
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
     assert "hush-secret-value" not in response.text
+
+
+def test_create_app_warns_when_shared_storage_boundary_is_active(
+    health_app, caplog
+):
+    config = health_app["config"]
+    boundary_config = AppConfig(
+        data_root=config.data_root,
+        database_url=config.database_url,
+        redis_url=config.redis_url,
+        session_secret=config.session_secret,
+        remote_sources=config.remote_sources,
+        local_sources=config.local_sources,
+        storage_trust_mode="data_root_boundary",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="vla_eval.web.app"):
+        create_app(boundary_config, health_app["engine"], health_app["app"].state.queues)
+
+    assert "storage_trust_mode=data_root_boundary" in caplog.text
+    assert str(config.data_root) in caplog.text
 
 
 def test_health_redis_failure(health_app, monkeypatch):

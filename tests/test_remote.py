@@ -811,6 +811,90 @@ def test_validate_staging_path_rejects_writable_outer_ancestor(tmp_path):
         validate_staging_path(destination, trusted_root)
 
 
+def test_validate_staging_path_accepts_writable_ancestor_above_boundary(tmp_path):
+    shared = tmp_path / "shared"
+    data_root = shared / "data"
+    trusted_root = data_root / "staging"
+    destination = trusted_root / "attempt-1"
+    destination.mkdir(parents=True, mode=0o700)
+    for directory in (data_root, trusted_root, destination):
+        directory.chmod(0o700)
+    shared.chmod(0o777)
+
+    assert validate_staging_path(
+        destination,
+        trusted_root,
+        minimum_checked_ancestor=data_root,
+    ) == destination.resolve()
+
+
+def test_validate_staging_path_rejects_writable_boundary(tmp_path):
+    data_root = tmp_path / "data"
+    trusted_root = data_root / "staging"
+    destination = trusted_root / "attempt-1"
+    destination.mkdir(parents=True, mode=0o700)
+    trusted_root.chmod(0o700)
+    destination.chmod(0o700)
+    data_root.chmod(0o770)
+
+    with pytest.raises(ValueError, match="group or other writable"):
+        validate_staging_path(
+            destination,
+            trusted_root,
+            minimum_checked_ancestor=data_root,
+        )
+
+
+def test_validate_staging_path_rejects_boundary_above_destination(tmp_path):
+    trusted_root = tmp_path / "staging"
+    destination = trusted_root / "attempt-1"
+    destination.mkdir(parents=True, mode=0o700)
+
+    with pytest.raises(ValueError, match="storage trust boundary"):
+        validate_staging_path(
+            destination,
+            trusted_root,
+            minimum_checked_ancestor=tmp_path / "other-data",
+        )
+
+
+def test_validate_staging_path_rejects_symlinked_boundary(tmp_path):
+    actual_data_root = tmp_path / "actual-data"
+    trusted_root = actual_data_root / "staging"
+    destination = trusted_root / "attempt-1"
+    destination.mkdir(parents=True, mode=0o700)
+    linked_data_root = tmp_path / "data"
+    linked_data_root.symlink_to(actual_data_root, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        validate_staging_path(
+            linked_data_root / "staging" / "attempt-1",
+            linked_data_root / "staging",
+            minimum_checked_ancestor=linked_data_root,
+        )
+
+
+def test_validate_staging_path_ignores_symlink_above_boundary(tmp_path):
+    actual_shared = tmp_path / "actual-shared"
+    data_root = actual_shared / "data"
+    trusted_root = data_root / "staging"
+    destination = trusted_root / "attempt-1"
+    destination.mkdir(parents=True, mode=0o700)
+    for directory in (data_root, trusted_root, destination):
+        directory.chmod(0o700)
+    linked_shared = tmp_path / "shared"
+    linked_shared.symlink_to(actual_shared, target_is_directory=True)
+    lexical_data_root = linked_shared / "data"
+    lexical_root = lexical_data_root / "staging"
+    lexical_destination = lexical_root / "attempt-1"
+
+    assert validate_staging_path(
+        lexical_destination,
+        lexical_root,
+        minimum_checked_ancestor=lexical_data_root,
+    ) == destination.resolve()
+
+
 @pytest.mark.parametrize("unsafe_component", ["root", "intermediate", "parent", "destination"])
 def test_validate_staging_path_rejects_writable_directories(tmp_path, unsafe_component):
     trusted_root = tmp_path / "staging"
