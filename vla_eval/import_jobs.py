@@ -612,8 +612,7 @@ def _create_under_root(
     )
 
 
-def _raise_rename_error(destination: Path) -> None:
-    error_number = ctypes.get_errno()
+def _raise_rename_error(error_number: int, destination: Path) -> None:
     if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
         raise FileExistsError(
             error_number,
@@ -629,35 +628,61 @@ def _raise_rename_error(destination: Path) -> None:
     raise OSError(error_number, os.strerror(error_number), destination)
 
 
+def _linux_renameat2_no_replace(source: Path, destination: Path) -> int | None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        return errno.ENOSYS
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        _AT_FDCWD,
+        os.fsencode(source),
+        _AT_FDCWD,
+        os.fsencode(destination),
+        _RENAME_NOREPLACE,
+    )
+    return None if result == 0 else ctypes.get_errno()
+
+
+def _rename_via_reserved_destination(source: Path, destination: Path) -> None:
+    try:
+        destination.mkdir(mode=0o700)
+    except FileExistsError as error:
+        raise FileExistsError(
+            errno.EEXIST,
+            "import target already exists",
+            destination,
+        ) from error
+    try:
+        os.rename(source, destination)
+    except BaseException:
+        try:
+            destination.rmdir()
+        except OSError:
+            pass
+        raise
+
+
 def _rename_no_replace(source: Path, destination: Path) -> None:
     """Atomically rename without replacing an existing destination."""
-    libc = ctypes.CDLL(None, use_errno=True)
-    encoded_source = os.fsencode(source)
-    encoded_destination = os.fsencode(destination)
     if sys.platform.startswith("linux"):
-        renameat2 = getattr(libc, "renameat2", None)
-        if renameat2 is None:
-            raise OSError(
-                errno.ENOTSUP,
-                "atomic no-replace rename requires Linux renameat2",
-                destination,
-            )
-        renameat2.argtypes = [
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        renameat2.restype = ctypes.c_int
-        result = renameat2(
-            _AT_FDCWD,
-            encoded_source,
-            _AT_FDCWD,
-            encoded_destination,
-            _RENAME_NOREPLACE,
-        )
+        error_number = _linux_renameat2_no_replace(source, destination)
+        if error_number is None:
+            return
+        unsupported_errors = {errno.EINVAL, errno.ENOSYS, errno.ENOTSUP}
+        if error_number in unsupported_errors:
+            _rename_via_reserved_destination(source, destination)
+            return
+        _raise_rename_error(error_number, destination)
     elif sys.platform == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
         renamex_np = getattr(libc, "renamex_np", None)
         if renamex_np is None:
             raise OSError(
@@ -667,15 +692,15 @@ def _rename_no_replace(source: Path, destination: Path) -> None:
             )
         renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
         renamex_np.restype = ctypes.c_int
-        result = renamex_np(encoded_source, encoded_destination, _RENAME_EXCL)
+        result = renamex_np(os.fsencode(source), os.fsencode(destination), _RENAME_EXCL)
+        if result != 0:
+            _raise_rename_error(ctypes.get_errno(), destination)
     else:
         raise OSError(
             errno.ENOTSUP,
             "atomic no-replace rename is not supported on this platform",
             destination,
         )
-    if result != 0:
-        _raise_rename_error(destination)
 
 
 def _ensure_safe_injected_directory(path: Path, field_name: str) -> None:

@@ -1,8 +1,10 @@
+import errno
 import os
 import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from inspect import signature
 from pathlib import Path
@@ -1222,6 +1224,77 @@ def test_no_replace_publish_fails_closed_on_unsupported_platform(tmp_path, monke
 
     assert source.exists()
     assert not target.exists()
+
+
+def test_linux_no_replace_falls_back_when_filesystem_rejects_renameat2_flags(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    (source / "received").write_text("dataset", encoding="utf-8")
+    monkeypatch.setattr(import_jobs.sys, "platform", "linux")
+    monkeypatch.setattr(
+        import_jobs,
+        "_linux_renameat2_no_replace",
+        lambda _source, _destination: errno.EINVAL,
+    )
+
+    import_jobs._rename_no_replace(source, target)
+
+    assert not source.exists()
+    assert (target / "received").read_text(encoding="utf-8") == "dataset"
+
+
+def test_linux_no_replace_fallback_never_replaces_existing_target(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    (source / "received").write_text("new", encoding="utf-8")
+    (target / "owner").write_text("existing", encoding="utf-8")
+    monkeypatch.setattr(import_jobs.sys, "platform", "linux")
+    monkeypatch.setattr(
+        import_jobs,
+        "_linux_renameat2_no_replace",
+        lambda _source, _destination: errno.EINVAL,
+    )
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        import_jobs._rename_no_replace(source, target)
+
+    assert (source / "received").read_text(encoding="utf-8") == "new"
+    assert (target / "owner").read_text(encoding="utf-8") == "existing"
+
+
+def test_linux_no_replace_fallback_allows_only_one_concurrent_publisher(
+    tmp_path, monkeypatch
+):
+    sources = [tmp_path / "source-a", tmp_path / "source-b"]
+    target = tmp_path / "target"
+    for index, source in enumerate(sources):
+        source.mkdir()
+        (source / "owner").write_text(str(index), encoding="utf-8")
+    monkeypatch.setattr(import_jobs.sys, "platform", "linux")
+    monkeypatch.setattr(
+        import_jobs,
+        "_linux_renameat2_no_replace",
+        lambda _source, _destination: errno.EINVAL,
+    )
+
+    def publish(source):
+        try:
+            import_jobs._rename_no_replace(source, target)
+        except FileExistsError:
+            return "lost"
+        return "won"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(publish, sources))
+
+    assert sorted(outcomes) == ["lost", "won"]
+    assert (target / "owner").read_text(encoding="utf-8") in {"0", "1"}
+    assert sum(source.exists() for source in sources) == 1
 
 
 def test_post_publish_verification_failure_rolls_back_before_failed_state(tmp_path, monkeypatch):
