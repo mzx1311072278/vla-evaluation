@@ -87,6 +87,7 @@ Copy the example config and the `.env` file, then edit:
 ```bash
 sudo tee /srv/vla-eval/config/app.yaml >/dev/null <<'YAML'
 data_root: /srv/vla-eval/data
+storage_trust_mode: strict
 database_url: sqlite:////srv/vla-eval/data/db/app.sqlite3
 redis_url: redis://redis:6379/0
 model_path: /srv/vla-eval/data/models/Qwen2.5-VL-7B-Instruct
@@ -110,6 +111,36 @@ cp .env.example .env
 # Edit .env: set VLA_EVAL_SESSION_SECRET (openssl rand -hex 32)
 sudo install -m 600 -o 1001 -g 1001 .env /srv/vla-eval/app/.env
 ```
+
+`storage_trust_mode` defaults to `strict`, which checks ownership, symlinks,
+and group/other write permissions from the filesystem root through every
+application data directory.
+
+For managed shared storage where only ancestors above the application data
+root are intentionally writable by multiple platform users, opt in explicitly:
+
+```yaml
+data_root: /czj/code/vla-evaluation/data
+storage_trust_mode: data_root_boundary
+```
+
+This mode delegates checks above `data_root` to the storage platform but still
+checks `data_root` and every application-controlled descendant. Do not change
+the shared `/czj` or `/czj/code` permissions for this application. Keep the
+private directories owned by the service account and not writable by group or
+others:
+
+```bash
+chmod 700 /czj/code/vla-evaluation/data \
+  /czj/code/vla-evaluation/data/staging \
+  /czj/code/vla-evaluation/data/inbox \
+  /czj/code/vla-evaluation/data/runs
+```
+
+Restart Web, transfer Worker, and evaluation Worker after changing the mode so
+all processes use the same boundary. Startup logs emit a warning while boundary
+mode is active. To roll back, remove the setting or set it to `strict`, then
+restart all three processes; no database migration is required.
 
 Place the app source under `/srv/vla-eval/app` (this repository). Place SSH
 credentials under `/srv/vla-eval/secrets/` (uid 1001 readable):

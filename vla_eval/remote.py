@@ -229,9 +229,45 @@ def _service_has_access(path: Path, mode: int) -> bool:
         return os.access(path, mode)
 
 
-def _validate_trust_anchor_chain(path: Path, field_name: str) -> None:
+def _trust_anchor_components(
+    path: Path,
+    field_name: str,
+    minimum_checked_ancestor: Path | None,
+) -> list[tuple[Path, os.stat_result]]:
+    if minimum_checked_ancestor is None:
+        return _lstat_components(path, field_name)
+    boundary = _absolute_lexical_path(
+        minimum_checked_ancestor,
+        "storage trust boundary",
+    )
+    if not _is_contained(path, boundary):
+        raise ValueError(f"{field_name} must be at or below storage trust boundary")
+    inspected: list[tuple[Path, os.stat_result]] = []
+    try:
+        for component in _directory_chain(boundary, path):
+            component_stat = os.lstat(component)
+            if stat.S_ISLNK(component_stat.st_mode):
+                raise ValueError(f"{field_name} must not contain symlink components")
+            inspected.append((component, component_stat))
+    except FileNotFoundError as error:
+        raise ValueError(f"{field_name} must exist") from error
+    except OSError as error:
+        raise ValueError(f"could not inspect {field_name}") from error
+    return inspected
+
+
+def _validate_trust_anchor_chain(
+    path: Path,
+    field_name: str,
+    *,
+    minimum_checked_ancestor: Path | None = None,
+) -> None:
     allowed_owners = {0, os.geteuid()}
-    for component, component_stat in _lstat_components(path, field_name):
+    for component, component_stat in _trust_anchor_components(
+        path,
+        field_name,
+        minimum_checked_ancestor,
+    ):
         if not stat.S_ISDIR(component_stat.st_mode):
             raise ValueError(f"{field_name} components must be existing directories")
         if component_stat.st_uid not in allowed_owners:
@@ -331,12 +367,24 @@ def _is_contained(candidate: Path, root: Path) -> bool:
     return candidate == root or root in candidate.parents
 
 
-def _validate_service_writable_directory(path: Path, field_name: str) -> None:
-    path_stat = _lstat_without_symlink_components(
-        path,
-        field_name,
-        missing_message=f"{field_name} must be an existing directory",
-    )
+def _validate_service_writable_directory(
+    path: Path,
+    field_name: str,
+    *,
+    minimum_checked_ancestor: Path | None = None,
+) -> None:
+    if minimum_checked_ancestor is None:
+        path_stat = _lstat_without_symlink_components(
+            path,
+            field_name,
+            missing_message=f"{field_name} must be an existing directory",
+        )
+    else:
+        path_stat = _trust_anchor_components(
+            path,
+            field_name,
+            minimum_checked_ancestor,
+        )[-1][1]
     if not stat.S_ISDIR(path_stat.st_mode):
         raise ValueError(f"{field_name} must be an existing directory")
     if path_stat.st_uid != os.geteuid():
@@ -350,7 +398,12 @@ def _validate_service_writable_directory(path: Path, field_name: str) -> None:
         raise ValueError(f"{field_name} must be writable and searchable by the service user")
 
 
-def validate_staging_path(staging: Path, trusted_staging_root: Path) -> Path:
+def validate_staging_path(
+    staging: Path,
+    trusted_staging_root: Path,
+    *,
+    minimum_checked_ancestor: Path | None = None,
+) -> Path:
     """Validate an existing staging directory inside a service-controlled root.
 
     Filesystem validation cannot eliminate a validate-to-use race. The execution layer must
@@ -364,10 +417,18 @@ def validate_staging_path(staging: Path, trusted_staging_root: Path) -> Path:
     if not _is_contained(lexical_staging, lexical_root):
         raise ValueError("staging destination must be within trusted staging root")
 
-    _validate_trust_anchor_chain(lexical_root, "trusted staging root")
+    _validate_trust_anchor_chain(
+        lexical_root,
+        "trusted staging root",
+        minimum_checked_ancestor=minimum_checked_ancestor,
+    )
     for directory in _directory_chain(lexical_root, lexical_staging):
         field_name = "staging destination" if directory == lexical_staging else "staging ancestor"
-        _validate_service_writable_directory(directory, field_name)
+        _validate_service_writable_directory(
+            directory,
+            field_name,
+            minimum_checked_ancestor=minimum_checked_ancestor,
+        )
 
     resolved_root = lexical_root.resolve(strict=True)
     resolved_staging = lexical_staging.resolve(strict=True)
@@ -383,6 +444,7 @@ def build_rsync_argv(
     staging: Path,
     *,
     trusted_staging_root: Path,
+    minimum_checked_ancestor: Path | None = None,
 ) -> list[str]:
     """Build an rrsync-compatible argv without executing rsync or a shell.
 
@@ -395,7 +457,11 @@ def build_rsync_argv(
     relative_path = normalize_remote_relative_path(remote_relative_path)
     username = _validate_username(source.username)
     host, is_ipv6 = _validated_host(source.host)
-    destination = validate_staging_path(staging, trusted_staging_root)
+    destination = validate_staging_path(
+        staging,
+        trusted_staging_root,
+        minimum_checked_ancestor=minimum_checked_ancestor,
+    )
 
     rendered_host = f"[{host}]" if is_ipv6 else host
     remote_spec = f"{username}@{rendered_host}:{relative_path}/"

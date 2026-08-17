@@ -1084,10 +1084,20 @@ def test_production_mode_revalidates_task8_with_wrapped_runner(tmp_path, monkeyp
     )
     monkeypatch.setattr(
         "vla_eval.import_jobs.validate_staging_path",
-        lambda staging, trusted_root: calls.append(("staging", staging, trusted_root)) or staging,
+        lambda staging, trusted_root, **_kwargs: (
+            calls.append(("staging", staging, trusted_root)) or staging
+        ),
     )
 
-    def fake_build(source, remote_root, relative, staging, *, trusted_staging_root):
+    def fake_build(
+        source,
+        remote_root,
+        relative,
+        staging,
+        *,
+        trusted_staging_root,
+        minimum_checked_ancestor=None,
+    ):
         calls.append(("build", source, remote_root, relative, staging, trusted_staging_root))
         return ["rsync", "--safe-argv"]
 
@@ -1384,3 +1394,60 @@ def test_production_rejects_writable_inbox_root(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="group or other writable"):
         execute_import(spec)
+
+
+def test_production_accepts_writable_ancestor_above_data_root(tmp_path):
+    shared = tmp_path / "shared"
+    data_root = shared / "data"
+    staging_root = data_root / "staging"
+    inbox_root = data_root / "inbox"
+    source_root = tmp_path / "source"
+    source_dataset = source_root / "run-1"
+    for directory in (staging_root, inbox_root, source_dataset):
+        directory.mkdir(parents=True, mode=0o700)
+        directory.chmod(0o700)
+    data_root.chmod(0o700)
+    shared.chmod(0o777)
+    spec = ImportSpec(
+        job_id="job-shared",
+        source_name="this-host",
+        remote_root=str(source_root),
+        remote_relative_path="run-1",
+        staging_path=staging_root / "job-shared",
+        target_path=inbox_root / "run-1",
+        mode="production",
+        local_source=LocalSource(name="this-host", roots=(source_root,)),
+        trusted_staging_root=staging_root,
+        trusted_inbox_root=inbox_root,
+        storage_trust_boundary=data_root,
+    )
+    inspection = DatasetInspection(DatasetKind.LEROBOT, True, "b" * 64, 2, 1, ())
+
+    def fake_transfer(_argv, _progress):
+        (spec.staging_path / "received").write_text("ok", encoding="utf-8")
+
+    result = execute_import(spec, transfer=fake_transfer, inspector=lambda _path: inspection)
+
+    assert result.dataset_path == spec.target_path
+
+
+def test_production_boundary_still_rejects_writable_data_root(tmp_path):
+    spec = local_production_spec(tmp_path)
+    data_root = tmp_path / "data"
+    spec.trusted_staging_root.rename(data_root)
+    staging_root = data_root / "staging"
+    inbox_root = data_root / "inbox"
+    staging_root.mkdir(mode=0o700)
+    inbox_root.mkdir(mode=0o700)
+    data_root.chmod(0o770)
+    spec = replace(
+        spec,
+        staging_path=staging_root / spec.job_id,
+        target_path=inbox_root / "run-1",
+        trusted_staging_root=staging_root,
+        trusted_inbox_root=inbox_root,
+        storage_trust_boundary=data_root,
+    )
+
+    with pytest.raises(ValueError, match="group or other writable"):
+        execute_import(spec, transfer=lambda _argv, _progress: None)

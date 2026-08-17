@@ -4,12 +4,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
 SESSION_SECRET_ENV_VAR = "VLA_EVAL_SESSION_SECRET"
 SESSION_SECRET_PLACEHOLDER = "${VLA_EVAL_SESSION_SECRET}"
+StorageTrustMode = Literal["strict", "data_root_boundary"]
+STORAGE_TRUST_MODES = frozenset({"strict", "data_root_boundary"})
 
 
 @dataclass(frozen=True)
@@ -37,10 +39,16 @@ class AppConfig:
     session_secret: str = field(repr=False)
     remote_sources: Mapping[str, RemoteSource]
     local_sources: Mapping[str, LocalSource]
+    storage_trust_mode: StorageTrustMode = "strict"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "remote_sources", MappingProxyType(dict(self.remote_sources)))
         object.__setattr__(self, "local_sources", MappingProxyType(dict(self.local_sources)))
+        object.__setattr__(
+            self,
+            "storage_trust_mode",
+            _storage_trust_mode(self.storage_trust_mode),
+        )
 
 
 def _nonempty_string(value: Any, field_name: str) -> str:
@@ -57,6 +65,18 @@ def _optional_string(raw: Mapping[str, Any], field_name: str, default: str) -> s
         raise TypeError(f"{field_name} must be a string or null")
     if not value.strip():
         raise ValueError(f"{field_name} must not be blank")
+    return value
+
+
+def _storage_trust_mode(value: Any) -> StorageTrustMode:
+    if not isinstance(value, str):
+        raise TypeError("storage_trust_mode must be a string")
+    if not value.strip():
+        raise ValueError("storage_trust_mode must not be blank")
+    if value not in STORAGE_TRUST_MODES:
+        raise ValueError(
+            "storage_trust_mode must be 'strict' or 'data_root_boundary'"
+        )
     return value
 
 
@@ -171,7 +191,27 @@ def load_config(path: Path) -> AppConfig:
     else:
         raise ValueError("configuration must be a top-level mapping")
 
-    data_root = Path(_nonempty_string(raw.get("data_root"), "data_root")).expanduser().resolve()
+    configured_data_root = Path(
+        _nonempty_string(raw.get("data_root"), "data_root")
+    ).expanduser()
+    storage_trust_mode = _storage_trust_mode(
+        raw.get("storage_trust_mode", "strict")
+    )
+    if storage_trust_mode == "data_root_boundary":
+        if not configured_data_root.is_absolute():
+            raise ValueError("data_root must be absolute in data_root_boundary mode")
+        try:
+            os.lstat(configured_data_root)
+        except OSError as error:
+            raise ValueError(
+                "data_root must be an existing directory in data_root_boundary mode"
+            ) from error
+        if not configured_data_root.is_dir() or os.path.islink(configured_data_root):
+            raise ValueError(
+                "data_root must be an existing non-symlink directory in "
+                "data_root_boundary mode"
+            )
+    data_root = configured_data_root.resolve()
     secret_value = raw.get("session_secret")
     if secret_value is None:
         configured_secret = ""
@@ -198,6 +238,7 @@ def load_config(path: Path) -> AppConfig:
         session_secret=configured_secret,
         remote_sources=remote_sources,
         local_sources=local_sources,
+        storage_trust_mode=storage_trust_mode,
     )
 
 

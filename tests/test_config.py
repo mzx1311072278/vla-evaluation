@@ -62,6 +62,44 @@ def test_load_config_parses_remote_source(tmp_path: Path):
     assert config.remote_sources["lab-a"].roots == ("/data/rollouts",)
 
 
+def test_load_config_defaults_to_strict_storage_trust(tmp_path: Path):
+    config = load_config(_write_config(tmp_path, _valid_config(tmp_path)))
+
+    assert config.storage_trust_mode == "strict"
+
+
+@pytest.mark.parametrize("mode", ["strict", "data_root_boundary"])
+def test_load_config_parses_storage_trust_mode(tmp_path: Path, mode: str):
+    raw = _valid_config(tmp_path)
+    raw["storage_trust_mode"] = mode
+    if mode == "data_root_boundary":
+        Path(raw["data_root"]).mkdir()
+
+    assert load_config(_write_config(tmp_path, raw)).storage_trust_mode == mode
+
+
+@pytest.mark.parametrize("mode", [None, "", "  ", "boundary", 7, True, [], {}])
+def test_load_config_rejects_invalid_storage_trust_mode(tmp_path: Path, mode: Any):
+    raw = _valid_config(tmp_path)
+    raw["storage_trust_mode"] = mode
+
+    with pytest.raises((TypeError, ValueError), match="storage_trust_mode"):
+        load_config(_write_config(tmp_path, raw))
+
+
+def test_load_config_rejects_symlinked_data_root_in_boundary_mode(tmp_path: Path):
+    actual = tmp_path / "actual-data"
+    actual.mkdir()
+    linked = tmp_path / "data"
+    linked.symlink_to(actual, target_is_directory=True)
+    raw = _valid_config(tmp_path)
+    raw["data_root"] = str(linked)
+    raw["storage_trust_mode"] = "data_root_boundary"
+
+    with pytest.raises(ValueError, match="non-symlink"):
+        load_config(_write_config(tmp_path, raw))
+
+
 def test_load_config_parses_local_source(tmp_path: Path):
     local_root = tmp_path / "datasets"
     raw = _valid_config(tmp_path)

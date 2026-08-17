@@ -123,6 +123,7 @@ class ImportSpec:
     trusted_credentials_root: Path | None = None
     trusted_staging_root: Path | None = None
     trusted_inbox_root: Path | None = None
+    storage_trust_boundary: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -481,9 +482,19 @@ def _validate_no_symlink_directory(path: Path, field_name: str) -> None:
 
 
 def _validate_protected_directory(
-    path: Path, field_name: str, *, required_access: int = os.W_OK | os.X_OK
+    path: Path,
+    field_name: str,
+    *,
+    required_access: int = os.W_OK | os.X_OK,
+    minimum_checked_ancestor: Path | None = None,
 ) -> None:
-    for component in _path_components(path):
+    components = _path_components(path)
+    if minimum_checked_ancestor is not None:
+        boundary = _absolute_path(minimum_checked_ancestor, "storage trust boundary")
+        if not _is_contained(path, boundary):
+            raise ValueError(f"{field_name} must be at or below storage trust boundary")
+        components = components[len(_path_components(boundary)) - 1 :]
+    for component in components:
         component_stat = os.lstat(component)
         if stat.S_ISLNK(component_stat.st_mode):
             raise ValueError(f"{field_name} must not contain symlink components")
@@ -497,28 +508,56 @@ def _validate_protected_directory(
         raise ValueError(f"{field_name} has insufficient service access")
 
 
-def validate_trusted_directory(path: Path, field_name: str) -> Path:
+def validate_trusted_directory(
+    path: Path,
+    field_name: str,
+    *,
+    minimum_checked_ancestor: Path | None = None,
+) -> Path:
     """Validate an existing service-owned directory and all of its ancestors."""
     candidate = _absolute_path(path, field_name)
-    _validate_protected_directory(candidate, field_name)
+    _validate_protected_directory(
+        candidate,
+        field_name,
+        minimum_checked_ancestor=minimum_checked_ancestor,
+    )
     return candidate
 
 
-def validate_trusted_readable_directory(path: Path, field_name: str) -> Path:
+def validate_trusted_readable_directory(
+    path: Path,
+    field_name: str,
+    *,
+    minimum_checked_ancestor: Path | None = None,
+) -> Path:
     """Validate a protected directory that only needs read/search access."""
     candidate = _absolute_path(path, field_name)
-    _validate_protected_directory(candidate, field_name, required_access=os.R_OK | os.X_OK)
+    _validate_protected_directory(
+        candidate,
+        field_name,
+        required_access=os.R_OK | os.X_OK,
+        minimum_checked_ancestor=minimum_checked_ancestor,
+    )
     return candidate
 
 
-def validate_published_target(target: Path, trusted_inbox_root: Path) -> Path:
+def validate_published_target(
+    target: Path,
+    trusted_inbox_root: Path,
+    *,
+    minimum_checked_ancestor: Path | None = None,
+) -> Path:
     """Validate a published dataset path without following untrusted ancestors."""
     root = _absolute_path(trusted_inbox_root, "trusted inbox root")
     candidate = _absolute_path(target, "published dataset target")
     if candidate == root or not _is_contained(candidate, root):
         raise ValueError("published dataset target must be within the trusted inbox root")
 
-    _validate_protected_directory(root, "trusted inbox root")
+    _validate_protected_directory(
+        root,
+        "trusted inbox root",
+        minimum_checked_ancestor=minimum_checked_ancestor,
+    )
     for component in _path_components(candidate)[len(_path_components(root)) :]:
         try:
             component_stat = os.lstat(component)
@@ -542,10 +581,20 @@ def validate_published_target(target: Path, trusted_inbox_root: Path) -> Path:
     return candidate
 
 
-def _create_under_root(destination: Path, root: Path, field_name: str) -> None:
+def _create_under_root(
+    destination: Path,
+    root: Path,
+    field_name: str,
+    *,
+    minimum_checked_ancestor: Path | None = None,
+) -> None:
     if not _is_contained(destination, root):
         raise ValueError(f"{field_name} must be within its trusted root")
-    _validate_protected_directory(root, f"trusted {field_name} root")
+    _validate_protected_directory(
+        root,
+        f"trusted {field_name} root",
+        minimum_checked_ancestor=minimum_checked_ancestor,
+    )
     current = root
     for part in destination.relative_to(root).parts:
         current /= part
@@ -556,7 +605,11 @@ def _create_under_root(destination: Path, root: Path, field_name: str) -> None:
         component_stat = os.lstat(current)
         if stat.S_ISLNK(component_stat.st_mode) or not stat.S_ISDIR(component_stat.st_mode):
             raise ValueError(f"{field_name} must contain only directories")
-    _validate_protected_directory(destination, field_name)
+    _validate_protected_directory(
+        destination,
+        field_name,
+        minimum_checked_ancestor=minimum_checked_ancestor,
+    )
 
 
 def _raise_rename_error(destination: Path) -> None:
@@ -671,8 +724,18 @@ def _prepare_paths(spec: ImportSpec, staging: Path, target: Path, production: bo
         inbox_root = _absolute_path(spec.trusted_inbox_root, "trusted inbox root")
         if staging == staging_root:
             raise ValueError("staging path must be a strict descendant of trusted staging root")
-        _create_under_root(staging, staging_root, "staging path")
-        _create_under_root(target.parent, inbox_root, "inbox path")
+        _create_under_root(
+            staging,
+            staging_root,
+            "staging path",
+            minimum_checked_ancestor=spec.storage_trust_boundary,
+        )
+        _create_under_root(
+            target.parent,
+            inbox_root,
+            "inbox path",
+            minimum_checked_ancestor=spec.storage_trust_boundary,
+        )
     else:
         _ensure_safe_injected_directory(staging.parent, "staging parent")
         _ensure_safe_injected_directory(target.parent, "target parent")
@@ -706,6 +769,7 @@ def _is_production_mode(spec: ImportSpec, transfer: Transfer) -> bool:
         spec.trusted_credentials_root,
         spec.trusted_staging_root,
         spec.trusted_inbox_root,
+        spec.storage_trust_boundary,
     )
     if spec.mode == "production":
         _require_production_context(spec)
@@ -742,7 +806,11 @@ def _ensure_source_separate(source: Path, staging: Path, target: Path) -> None:
 def _verify_staging(spec: ImportSpec, staging: Path, production: bool) -> None:
     if production:
         assert spec.trusted_staging_root is not None
-        validate_staging_path(staging, spec.trusted_staging_root)
+        validate_staging_path(
+            staging,
+            spec.trusted_staging_root,
+            minimum_checked_ancestor=spec.storage_trust_boundary,
+        )
     else:
         _validate_no_symlink_directory(staging, "staging path")
     if not any(staging.iterdir()):
@@ -756,7 +824,11 @@ def _verify_target_parent(spec: ImportSpec, target: Path, production: bool) -> N
         root = _absolute_path(spec.trusted_inbox_root, "trusted inbox root")
         if not _is_contained(target, root):
             raise ValueError("import target must be within trusted inbox root")
-        _validate_protected_directory(target.parent, "target parent")
+        _validate_protected_directory(
+            target.parent,
+            "target parent",
+            minimum_checked_ancestor=spec.storage_trust_boundary,
+        )
         resolved_root = root.resolve(strict=True)
         resolved_parent = target.parent.resolve(strict=True)
         if not _is_contained(resolved_parent, resolved_root):
@@ -776,7 +848,11 @@ def _verify_published_target(spec: ImportSpec, target: Path, production: bool) -
         raise OSError("published dataset target is missing")
     if production:
         assert spec.trusted_inbox_root is not None
-        validate_published_target(target, spec.trusted_inbox_root)
+        validate_published_target(
+            target,
+            spec.trusted_inbox_root,
+            minimum_checked_ancestor=spec.storage_trust_boundary,
+        )
 
 
 def _publish_and_report_ready(
@@ -836,17 +912,26 @@ def execute_import(
                     spec.source,
                     trusted_credentials_root=spec.trusted_credentials_root,
                 )
-                validate_staging_path(staging, spec.trusted_staging_root)
+                validate_staging_path(
+                    staging,
+                    spec.trusted_staging_root,
+                    minimum_checked_ancestor=spec.storage_trust_boundary,
+                )
                 argv = build_rsync_argv(
                     spec.source,
                     spec.remote_root,
                     spec.remote_relative_path,
                     staging,
                     trusted_staging_root=spec.trusted_staging_root,
+                    minimum_checked_ancestor=spec.storage_trust_boundary,
                 )
             else:
                 assert spec.local_source is not None
-                validate_staging_path(staging, spec.trusted_staging_root)
+                validate_staging_path(
+                    staging,
+                    spec.trusted_staging_root,
+                    minimum_checked_ancestor=spec.storage_trust_boundary,
+                )
                 local_source_path = resolve_local_source_directory(
                     spec.local_source,
                     spec.remote_root,

@@ -1,4 +1,5 @@
 import errno
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -61,12 +62,32 @@ def test_task_entry_uses_explicitly_configured_worker_runtime(
     assert reload_job(db_engine, evaluation_job.id).state == "SUCCEEDED"
 
 
+def test_configure_runtime_warns_when_shared_storage_boundary_is_active(
+    db_engine, data_root, caplog
+):
+    runtime = _runtime(
+        db_engine,
+        data_root,
+        storage_trust_mode="data_root_boundary",
+    )
+
+    with caplog.at_level(logging.WARNING, logger=tasks_module.__name__):
+        configure_runtime(runtime)
+    try:
+        assert "storage_trust_mode=data_root_boundary" in caplog.text
+        assert str(data_root) in caplog.text
+        assert "delegated to the storage platform" in caplog.text
+    finally:
+        clear_runtime()
+
+
 def _runtime(
     db_engine,
     data_root: Path,
     *,
     remote_roots: tuple[str, ...] = ("/data/rollouts",),
     local_root: Path | None = None,
+    storage_trust_mode: str = "strict",
 ) -> TaskRuntime:
     credentials_root = data_root / "credentials"
     source = RemoteSource(
@@ -96,6 +117,7 @@ def _runtime(
                 if local_root is not None
                 else {}
             ),
+            storage_trust_mode=storage_trust_mode,
         ),
         profiles_root=Path("config/profiles"),
         credentials_root=credentials_root,
@@ -866,6 +888,37 @@ def test_import_task_commits_callbacks_and_persists_ready_dataset(
         assert persisted_dataset.episode_count == 4
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected_boundary"),
+    [("strict", None), ("data_root_boundary", "data_root")],
+)
+def test_import_task_forwards_configured_storage_boundary(
+    db_engine, data_root, monkeypatch, mode, expected_boundary
+):
+    import_job = _create_import_job(db_engine)
+    inspection = DatasetInspection(DatasetKind.LEROBOT, True, "c" * 64, 1, 1, ())
+    received = {}
+    monkeypatch.setattr(tasks_module, "inspect_dataset", lambda *_args, **_kwargs: inspection)
+
+    def execute(spec, *, inspector, callbacks):
+        received["boundary"] = spec.storage_trust_boundary
+        callbacks.on_state("PREFLIGHT")
+        inspector(spec.staging_path)
+        callbacks.on_state("READY")
+        return ImportResult(spec.target_path, inspection)
+
+    monkeypatch.setattr(tasks_module, "execute_import", execute)
+
+    run_import_task(
+        import_job.id,
+        runtime=_runtime(db_engine, data_root, storage_trust_mode=mode),
+    )
+
+    assert received["boundary"] == (
+        data_root if expected_boundary == "data_root" else None
+    )
+
+
 def test_import_task_uses_persisted_second_remote_root(db_engine, data_root, monkeypatch):
     import_job = _create_import_job(db_engine, remote_root="/data/archive")
     inspection = DatasetInspection(DatasetKind.LEROBOT, True, "d" * 64, 8, 1, ())
@@ -1105,6 +1158,7 @@ def test_import_ready_persistence_failure_rolls_publication_back(db_engine, data
             trusted_credentials_root=None,
             trusted_staging_root=None,
             trusted_inbox_root=None,
+            storage_trust_boundary=None,
         )
         return import_jobs_module.execute_import(
             injected_spec,
@@ -1169,6 +1223,7 @@ def test_import_cancel_before_ready_cas_rolls_publication_back(db_engine, data_r
                 trusted_credentials_root=None,
                 trusted_staging_root=None,
                 trusted_inbox_root=None,
+                storage_trust_boundary=None,
             ),
             transfer=transfer,
             inspector=kwargs["inspector"],
@@ -1214,6 +1269,7 @@ def test_publish_fingerprint_failure_stops_before_rename(db_engine, data_root, m
                 trusted_credentials_root=None,
                 trusted_staging_root=None,
                 trusted_inbox_root=None,
+                storage_trust_boundary=None,
             ),
             transfer=transfer,
             inspector=kwargs["inspector"],
@@ -1267,6 +1323,7 @@ def test_import_ready_commits_only_with_dataset_link_and_published_target(
                 trusted_credentials_root=None,
                 trusted_staging_root=None,
                 trusted_inbox_root=None,
+                storage_trust_boundary=None,
             ),
             transfer=transfer,
             inspector=kwargs["inspector"],
@@ -1328,6 +1385,7 @@ def test_interrupted_import_reconciles_published_target_by_fingerprint(
                 trusted_credentials_root=None,
                 trusted_staging_root=None,
                 trusted_inbox_root=None,
+                storage_trust_boundary=None,
             ),
             transfer=transfer,
             inspector=kwargs["inspector"],
@@ -1560,6 +1618,78 @@ def test_ready_import_integrity_drift_marks_job_and_dataset_failed(
             == "Published dataset integrity check failed. Review or re-import the dataset."
         )
         assert persisted_dataset.status == "PREFLIGHT_FAILED"
+
+
+def test_ready_import_uses_data_root_boundary_under_writable_shared_parent(
+    db_engine, data_root, monkeypatch
+):
+    shared_parent = data_root.parent
+    original_mode = shared_parent.stat().st_mode & 0o777
+    shared_parent.chmod(0o777)
+    target = data_root / "inbox" / "run-1"
+    target.mkdir()
+    fingerprint = "d" * 64
+    with session_scope(db_engine) as session:
+        dataset = Dataset(
+            name="run-1",
+            path=str(target),
+            kind=DatasetKind.LEROBOT.value,
+            status="READY",
+            fingerprint=fingerprint,
+            size_bytes=8,
+            episode_count=1,
+        )
+        session.add(dataset)
+        session.flush()
+        job = ImportJob(
+            source_name="lab-a",
+            remote_root="/data/rollouts",
+            remote_path="run-1",
+            target_name="run-1",
+            state="READY",
+            progress=100.0,
+            publish_fingerprint=fingerprint,
+            dataset_id=dataset.id,
+        )
+        session.add(job)
+        session.flush()
+        import_id = job.id
+    inspection = DatasetInspection(DatasetKind.LEROBOT, True, fingerprint, 8, 1, ())
+    monkeypatch.setattr(tasks_module, "inspect_dataset", lambda *_args, **_kwargs: inspection)
+
+    try:
+        result = run_import_task(
+            import_id,
+            runtime=_runtime(
+                db_engine,
+                data_root,
+                storage_trust_mode="data_root_boundary",
+            ),
+        )
+    finally:
+        shared_parent.chmod(original_mode)
+
+    assert result.dataset_path == target
+
+
+def test_evaluation_output_uses_data_root_boundary_under_writable_shared_parent(
+    db_engine, data_root
+):
+    shared_parent = data_root.parent
+    original_mode = shared_parent.stat().st_mode & 0o777
+    shared_parent.chmod(0o777)
+    runtime = _runtime(
+        db_engine,
+        data_root,
+        storage_trust_mode="data_root_boundary",
+    )
+
+    try:
+        output = tasks_module._trusted_evaluation_output(runtime, "job-shared", None)
+    finally:
+        shared_parent.chmod(original_mode)
+
+    assert output == data_root / "runs" / "job-shared"
 
 
 @pytest.mark.parametrize("recorder_name", ["_record_import_failure", "_record_import_cancelled"])
