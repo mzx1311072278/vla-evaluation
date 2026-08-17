@@ -142,6 +142,22 @@ all processes use the same boundary. Startup logs emit a warning while boundary
 mode is active. To roll back, remove the setting or set it to `strict`, then
 restart all three processes; no database migration is required.
 
+Evaluation profiles on this layout must also live at or below `data_root` so
+they use the same trust boundary:
+
+```bash
+mkdir -p /czj/code/vla-evaluation/data/profiles
+cp /czj/code/vla-evaluation/app/config/profiles/*.yaml \
+  /czj/code/vla-evaluation/data/profiles/
+chmod 700 /czj/code/vla-evaluation/data/profiles
+chmod 600 /czj/code/vla-evaluation/data/profiles/*.yaml
+export VLA_EVAL_PROFILES_ROOT=/czj/code/vla-evaluation/data/profiles
+```
+
+Update each copied profile's local `vlm.model_path` to the model's actual
+location under `/czj`. Set `VLA_EVAL_PROFILES_ROOT` for the evaluation Worker;
+Web and the transfer Worker do not load evaluation profile files.
+
 Place the app source under `/srv/vla-eval/app` (this repository). Place SSH
 credentials under `/srv/vla-eval/secrets/` (uid 1001 readable):
 

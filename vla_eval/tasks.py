@@ -395,8 +395,16 @@ def _trusted_evaluation_output(
 def _trusted_profile_path(runtime: TaskRuntime, profile_name: str) -> Path:
     if not _PROFILE_NAME_PATTERN.fullmatch(profile_name):
         raise ValueError("evaluation profile selector must be a safe identifier")
+    profiles_root = Path(os.path.abspath(runtime.profiles_root))
+    boundary = _storage_trust_boundary(runtime)
+    if boundary is not None and not (
+        profiles_root == boundary or boundary in profiles_root.parents
+    ):
+        boundary = None
     root = validate_trusted_readable_directory(
-        Path(os.path.abspath(runtime.profiles_root)), "trusted profiles root"
+        profiles_root,
+        "trusted profiles root",
+        minimum_checked_ancestor=boundary,
     )
     candidate = root / f"{profile_name}.yaml"
     try:
