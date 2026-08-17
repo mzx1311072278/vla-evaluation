@@ -20,6 +20,7 @@ from vla_eval.profiles import load_profile
 
 PROFILE_PATH = Path("config/profiles/genie02-full.yaml")
 API_PROFILE_PATH = Path("config/profiles/genie02-api.yaml")
+QWEN3_PROFILE_PATH = Path("config/profiles/genie02-qwen3-vl.yaml")
 
 
 def test_smoothness_svg_keeps_large_episode_series_readable(tmp_path: Path):
@@ -228,6 +229,7 @@ def test_genie02_profile_matches_cli_contract_and_is_deeply_immutable():
     assert profile.vlm.max_image_size == 336
     assert profile.vlm.max_new_tokens == 256
     assert profile.vlm.backend == "local"
+    assert profile.vlm.model_family == "qwen2_5_vl"
     assert profile.vlm.api is None
     assert profile.vlm.model_path
     assert profile.review.confidence_threshold == 0.7
@@ -440,7 +442,44 @@ def test_backend_defaults_to_local_when_absent(tmp_path: Path):
     del raw["vlm"]["backend"]
     profile = load_profile(_write_profile(tmp_path, raw))
     assert profile.vlm.backend == "local"
+    assert profile.vlm.model_family == "qwen2_5_vl"
     assert profile.vlm.api is None
+
+
+def test_legacy_local_profile_defaults_model_family(tmp_path: Path):
+    raw = _profile_data()
+    raw["vlm"].pop("model_family", None)
+
+    profile = load_profile(_write_profile(tmp_path, raw))
+
+    assert profile.vlm.model_family == "qwen2_5_vl"
+
+
+def test_qwen3_profile_contract():
+    profile = load_profile(QWEN3_PROFILE_PATH)
+
+    assert profile.name == "genie02-qwen3-vl"
+    assert profile.version == "1.0.0"
+    assert profile.vlm.backend == "local"
+    assert profile.vlm.model_family == "qwen3_vl"
+    assert profile.vlm.model_path is not None
+    assert profile.vlm.model_path.endswith("Qwen3-VL-8B-Instruct")
+
+
+def test_load_profile_rejects_unsupported_local_model_family(tmp_path: Path):
+    raw = _profile_data()
+    raw["vlm"]["model_family"] = "internvl"
+
+    with pytest.raises(ValueError, match="vlm.model_family"):
+        load_profile(_write_profile(tmp_path, raw))
+
+
+def test_load_profile_rejects_model_family_for_api_backend(tmp_path: Path):
+    raw = _api_profile_data()
+    raw["vlm"]["model_family"] = "qwen3_vl"
+
+    with pytest.raises(ValueError, match="model_family.*backend=api"):
+        load_profile(_write_profile(tmp_path, raw))
 
 
 def test_genie02_api_profile_contract():
@@ -448,6 +487,7 @@ def test_genie02_api_profile_contract():
     assert profile.name == "genie02-api"
     assert profile.version == "1.0.0"
     assert profile.vlm.backend == "api"
+    assert profile.vlm.model_family is None
     assert profile.vlm.model_path is None
     assert profile.vlm.api is not None
     assert profile.vlm.api.base_url.startswith("http")
@@ -551,6 +591,7 @@ def test_run_profile_vlm_maps_profile_and_callbacks_to_task7_service(
     class FakeAttemptEvalConfig:
         dataset_root: Path
         model_path: Path
+        model_family: str
         prompt_version: str
         image_key: str
         output_dir: Path
@@ -591,6 +632,7 @@ def test_run_profile_vlm_maps_profile_and_callbacks_to_task7_service(
         FakeAttemptEvalConfig(
             dataset_root=tmp_path,
             model_path=Path(profile.vlm.model_path),
+            model_family="qwen2_5_vl",
             prompt_version="genie02-attempt-v1",
             image_key="observation.images.right_wrist",
             output_dir=output,
@@ -608,6 +650,38 @@ def test_run_profile_vlm_maps_profile_and_callbacks_to_task7_service(
         )
     ]
     assert progress_values == [45.0]
+
+
+def test_run_profile_vlm_maps_qwen3_model_family_to_attempt_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from vla_eval import evaluation
+
+    configs: list[Any] = []
+    fake_service = ModuleType("Genie02_report.attempt_eval.run_episode_attempt_eval")
+
+    class FakeAttemptEvalConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    def fake_run(config, *, progress, should_cancel):
+        configs.append(config)
+        config.output_dir.mkdir(parents=True)
+        (config.output_dir / "attempt_summary.json").write_text("[]", encoding="utf-8")
+
+    fake_service.AttemptEvalConfig = FakeAttemptEvalConfig
+    fake_service.run_attempt_evaluation = fake_run
+    monkeypatch.setitem(sys.modules, fake_service.__name__, fake_service)
+    output = tmp_path / "attempt_eval"
+
+    evaluation.run_profile_vlm(
+        tmp_path,
+        output,
+        load_profile(QWEN3_PROFILE_PATH),
+        _callbacks(),
+    )
+
+    assert configs[0].model_family == "qwen3_vl"
 
 
 @pytest.mark.parametrize("resume_from", ["", "metrics", "DONE", None])

@@ -195,9 +195,11 @@ use `remote_sources`; the Worker pulls it over the pinned SSH configuration.
 
 ### VLM backend: local GPU (default) or OpenAI-compatible API (optional)
 
-The evaluation's VLM phase judges grasp attempts on sampled frames. By default it
-runs **on the local 4090**, loading Qwen2.5-VL in-process (`config/profiles/
-genie02-full.yaml`, `vlm.backend: local`). A second backend calls an
+The evaluation's VLM phase judges grasp attempts on sampled frames. The local 4090
+can load Qwen2.5-VL (`genie02-full`) or Qwen3-VL-8B-Instruct
+(`genie02-qwen3-vl`) in-process. Each local profile declares a matching
+`vlm.model_family` and `vlm.model_path`; the worker rejects a checkpoint whose
+`config.json` reports a different model type. A second backend calls an
 OpenAI-compatible `/chat/completions` endpoint instead — a cloud VLM provider, or
 a self-hosted **vLLM** server (which can itself run on the 4090 and serve the
 model over HTTP so the worker imports neither torch nor transformers). The choice
@@ -297,7 +299,11 @@ docker compose run --rm evaluation-worker nvidia-smi
 
 # The VLM stack loads and CUDA is available.
 docker compose run --rm evaluation-worker python -c \
-  "import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"
+  "import torch, torchvision, transformers, qwen_vl_utils; assert torch.cuda.is_available(); print(transformers.__version__, torch.cuda.get_device_name(0))"
+
+# The selected local checkpoints are complete and match their profiles.
+docker compose run --rm evaluation-worker test -f \
+  /srv/vla-eval/data/models/Qwen3-VL-8B-Instruct/config.json
 ```
 
 ## 10. SSH host key and read-only rrsync / SFTP account (data ingress)

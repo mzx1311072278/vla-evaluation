@@ -30,6 +30,7 @@ else:
 class AttemptEvalConfig:
     dataset_root: Path
     model_path: Path
+    model_family: str = "qwen2_5_vl"
     image_key: str = "observation.images.right_wrist"
     output_dir: Path = Path("outputs/attempt_eval")
     max_image_size: int = 336
@@ -53,6 +54,8 @@ class AttemptEvalConfig:
                 raise TypeError(f"{name} must be a pathlib.Path")
         if not isinstance(self.image_key, str) or not self.image_key.strip():
             raise ValueError("image_key must be a non-empty string")
+        if self.model_family not in {"qwen2_5_vl", "qwen3_vl"}:
+            raise ValueError("model_family must be one of: qwen2_5_vl, qwen3_vl")
         if not isinstance(self.prompt_version, str):
             raise TypeError("prompt_version must be a string")
         if self.prompt_version not in SUPPORTED_PROMPT_VERSIONS:
@@ -214,6 +217,7 @@ def run_attempt_evaluation(
                     if vlm is None:
                         vlm = factory(
                             config.model_path,
+                            model_family=config.model_family,
                             max_new_tokens=config.max_new_tokens,
                             prompt_version=config.prompt_version,
                         )
@@ -355,6 +359,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model_path", required=True, type=Path, help="Local VLM model path.")
     parser.add_argument(
+        "--model_family",
+        choices=["qwen2_5_vl", "qwen3_vl"],
+        default="qwen2_5_vl",
+        help="Local VLM checkpoint architecture.",
+    )
+    parser.add_argument(
         "--image_key", default="observation.images.right_wrist", help="Video image key."
     )
     parser.add_argument(
@@ -426,6 +436,7 @@ def _config_from_args(args: argparse.Namespace) -> AttemptEvalConfig:
     return AttemptEvalConfig(
         dataset_root=args.dataset_root,
         model_path=args.model_path,
+        model_family=args.model_family,
         image_key=args.image_key,
         output_dir=args.output_dir,
         max_image_size=args.max_image_size,

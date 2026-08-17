@@ -213,12 +213,19 @@ curl -fsS http://127.0.0.1:8000/health
 
 ### 方式 A：4090 本地模型
 
-使用 `config/profiles/genie02-full.yaml`：
+本地后端提供两个独立 Profile：
+
+- `genie02-full`：Qwen2.5-VL-7B-Instruct，`model_family: qwen2_5_vl`。
+- `genie02-qwen3-vl`：Qwen3-VL-8B-Instruct，`model_family: qwen3_vl`。
+
+两者都要求：
 
 - `vlm.backend: local`。
 - `vlm.model_path` 必须是 Evaluation Worker 容器内可见的模型目录。
-- 创建评测时选择 `genie02-full` 并启用 VLM。
+- 创建评测时选择对应 Profile 并启用 VLM。
 - 运算在 Evaluation Worker 所在的 4090 上完成。
+
+不要把 Qwen3 纯文本模型配置为 VLM；必须使用 Qwen3-VL Instruct checkpoint。
 
 ### 方式 B：OpenAI 兼容 API
 
@@ -318,8 +325,9 @@ VLA_EVAL_GIT_SHA=<git rev-parse HEAD 的输出>
 
 - 把本机、SMB 或 NAS 数据挂载到宿主机 `/mnt/vla-datasets`。
 - Compose 会以只读方式把它挂载到 Transfer Worker。
-- 使用本地 VLM 时，把模型放到 `/srv/vla-eval/models/Qwen2.5-VL-7B-Instruct`。
-- Evaluation Worker 中的对应路径是 `/srv/vla-eval/data/models/Qwen2.5-VL-7B-Instruct`。
+- 使用 Qwen2.5-VL 时，把模型放到 `/srv/vla-eval/models/Qwen2.5-VL-7B-Instruct`。
+- 使用 Qwen3-VL 时，把模型放到 `/srv/vla-eval/models/Qwen3-VL-8B-Instruct`。
+- Evaluation Worker 中的对应路径统一位于 `/srv/vla-eval/data/models/`。
 
 系统不会直接在 `/mnt/vla-datasets` 上评测。它先复制到 staging，通过预检后发布到 `/srv/vla-eval/data/inbox`。
 
@@ -434,7 +442,7 @@ docker compose down
 
 - 确认创建任务时已启用 VLM。
 - 确认所选 Profile 的 `vlm.backend` 是 `local` 或 `api`。
-- 本地后端检查模型路径和 CUDA。
+- 本地后端检查模型族、模型路径、`config.json`、CUDA 和 GPU 依赖。
 - API 后端检查 `base_url`、模型 ID、`VLA_EVAL_VLM_API_KEY` 和 Evaluation Worker 是否已重启。
 - “VLM 已配置”不等于“VLM 本次启用”，也不等于“VLM 结果产物已生成”。
 

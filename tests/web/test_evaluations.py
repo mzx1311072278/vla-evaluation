@@ -602,6 +602,7 @@ def test_submit_evaluation_persists_provenance_and_enqueues_worker(
     assert job.provenance_json["git_sha"] == ""
     assert job.provenance_json["vlm_model_path"]
     assert job.provenance_json["vlm_backend"] == "local"
+    assert job.provenance_json["vlm_model_family"] == "qwen2_5_vl"
     assert "vlm_api_model" not in job.provenance_json
     assert job.provenance_json["prompt_version"]
     assert job.provenance_json["adapter"] == "genie02"
@@ -661,6 +662,7 @@ def test_submit_evaluation_records_api_backend_provenance(
     assert job.profile_name == "genie02-api"
     provenance = job.provenance_json
     assert provenance["vlm_backend"] == "api"
+    assert provenance["vlm_model_family"] is None
     assert provenance["vlm_model_path"] is None
     assert provenance["vlm_api_base_url"] == "http://vlm-api.example.internal/v1"
     assert provenance["vlm_api_model"] == "qwen2.5-vl-7b-instruct"
@@ -669,6 +671,29 @@ def test_submit_evaluation_records_api_backend_provenance(
     assert provenance["vlm_api_max_retries"] == 3
     assert fake_queues.evaluation.count == 1
     assert fake_queues.evaluation.enqueued[0].args == (job_id,)
+
+
+def test_submit_evaluation_records_qwen3_model_family_provenance(
+    auth_client, db_engine: Engine, fake_queues, ready_dataset
+):
+    response = auth_client.post(
+        "/evaluations",
+        data=_evaluation_form(
+            auth_client.csrf,
+            ready_dataset.id,
+            profile="genie02-qwen3-vl",
+            vlm_enabled="true",
+        ),
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    job_id = response.headers["location"].removeprefix("/evaluations/")
+    job = reload_job(db_engine, job_id)
+    assert job.profile_name == "genie02-qwen3-vl"
+    assert job.provenance_json["vlm_model_family"] == "qwen3_vl"
+    assert job.provenance_json["vlm_model_path"].endswith("Qwen3-VL-8B-Instruct")
+    assert fake_queues.evaluation.count == 1
 
 
 def test_duplicate_successful_run_redirects_to_existing_evaluation(

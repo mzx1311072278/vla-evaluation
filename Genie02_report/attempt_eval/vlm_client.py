@@ -193,6 +193,7 @@ class LocalVLMClient:
     def __init__(
         self,
         model_path: Path,
+        model_family: str = "qwen2_5_vl",
         max_new_tokens: int = 256,
         prompt_version: str = PROMPT_VERSION,
     ):
@@ -201,6 +202,17 @@ class LocalVLMClient:
             error = FileNotFoundError("local VLM model path does not exist")
             error.add_note(str(self.model_path))
             raise ModelLoadError("The configured model could not be loaded.") from error
+        try:
+            config = json.loads((self.model_path / "config.json").read_text(encoding="utf-8"))
+            model_type = config.get("model_type")
+            if model_type != model_family:
+                raise ValueError(
+                    f"configured model family {model_family} does not match checkpoint "
+                    f"model_type {model_type}"
+                )
+        except Exception as error:
+            raise ModelLoadError("The configured model could not be loaded.") from error
+        self.model_family = model_family
         self.max_new_tokens = max_new_tokens
         self.prompt = prompt_for_version(prompt_version)
 
@@ -210,26 +222,23 @@ class LocalVLMClient:
 
         try:
             import torch
-            from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+            from transformers import AutoModelForImageTextToText, AutoProcessor
 
             self.torch = torch
             if torch.cuda.is_available():
                 print("CUDA available: using GPU for VLM inference.")
-                device_map = "auto"
-                torch_dtype = "auto"
+                model_kwargs = {"dtype": "auto", "device_map": "auto"}
             else:
                 print("CUDA not available: using CPU. VLM inference will be very slow.")
-                device_map = None
-                torch_dtype = torch.float32
+                model_kwargs = {"dtype": torch.float32}
 
             self.processor = AutoProcessor.from_pretrained(self.model_path, local_files_only=True)
-            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            self.model = AutoModelForImageTextToText.from_pretrained(
                 self.model_path,
-                torch_dtype=torch_dtype,
-                device_map=device_map,
                 local_files_only=True,
+                **model_kwargs,
             )
-            if device_map is None:
+            if not torch.cuda.is_available():
                 self.model.to("cpu")
         except Exception as error:
             raise ModelLoadError("The configured model could not be loaded.") from error
@@ -263,22 +272,33 @@ class LocalVLMClient:
             messages, tokenize=False, add_generation_prompt=True
         )
         image_inputs = video_inputs = inputs = generated = None
-        image_inputs, video_inputs = process_vision_info(messages)
+        image_inputs, video_inputs = process_vision_info(
+            messages,
+            image_patch_size=self.processor.image_processor.patch_size,
+        )
         inputs = self.processor(
             text=[text],
             images=image_inputs,
             videos=video_inputs,
+            do_resize=False,
             padding=True,
             return_tensors="pt",
         )
-        if self.torch.cuda.is_available():
-            inputs = inputs.to("cuda")
+        inputs = inputs.to(self.model.device)
 
         try:
             with self.torch.inference_mode():
-                generated = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens)
+                generated = self.model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=False,
+                )
             generated = [out[len(inp) :] for inp, out in zip(inputs.input_ids, generated)]
-            raw = self.processor.batch_decode(generated, skip_special_tokens=True)[0].strip()
+            raw = self.processor.batch_decode(
+                generated,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )[0].strip()
         finally:
             image_inputs = video_inputs = inputs = generated = None
             if self.torch.cuda.is_available():

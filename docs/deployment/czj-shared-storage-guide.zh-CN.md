@@ -201,7 +201,8 @@ python -m vla_eval.cli scan-datasets
 1. 打开 Web 的“数据集”页面；
 2. 选择状态为 `READY` 的数据集；
 3. 创建评测任务；
-4. 选择 `genie02-full` 使用本地 GPU VLM，或选择已配置好的 API profile；
+4. 选择 `genie02-full` 使用 Qwen2.5-VL，选择 `genie02-qwen3-vl` 使用
+   Qwen3-VL-8B-Instruct，或选择已配置好的 API profile；
 5. 在 evaluation Worker 终端观察运行日志；
 6. 完成后从“评测任务”进入报告页面。
 
@@ -234,23 +235,27 @@ chmod 700 /czj/code/vla-evaluation/data/profiles
 chmod 600 /czj/code/vla-evaluation/data/profiles/*.yaml
 ```
 
-本地 VLM 的实际模型路径在以下文件中配置：
+本地 VLM 的实际模型路径分别在以下文件中配置：
 
 ```text
 /czj/code/vla-evaluation/data/profiles/genie02-full.yaml
+/czj/code/vla-evaluation/data/profiles/genie02-qwen3-vl.yaml
 ```
 
 查看当前配置：
 
 ```bash
-grep -n model_path \
-  /czj/code/vla-evaluation/data/profiles/genie02-full.yaml
+grep -nE 'model_family|model_path' \
+  /czj/code/vla-evaluation/data/profiles/genie02-{full,qwen3-vl}.yaml
 ```
 
 查找服务器上的模型：
 
 ```bash
-find /czj -type d -name 'Qwen2.5-VL-7B-Instruct' 2>/dev/null
+find /czj -type d \( \
+  -name 'Qwen2.5-VL-7B-Instruct' -o \
+  -name 'Qwen3-VL-8B-Instruct' \
+\) 2>/dev/null
 ```
 
 将 profile 中旧的 `/srv/vla-eval/...` 改成查到的实际 `/czj/...` 路径，然后重启
@@ -358,7 +363,10 @@ cp -a /czj/code/vla-evaluation/data/profiles \
 更新后重启三个服务器进程。通常不需要重新创建 Conda 环境；只有依赖变化时才执行：
 
 ```bash
-python -m pip install -e '.[dev,vlm-api]'
+python -m pip install -e '.[dev,gpu,vlm-api]'
+
+python -c "import torch, torchvision, transformers, qwen_vl_utils; \
+assert torch.cuda.is_available(); print(transformers.__version__, torch.cuda.get_device_name(0))"
 ```
 
 ## 10. 常见故障
@@ -426,11 +434,12 @@ git log --oneline --all --grep='GPFS'
 
 ```bash
 nvidia-smi
-grep -n model_path \
-  /czj/code/vla-evaluation/data/profiles/genie02-full.yaml
+grep -nE 'model_family|model_path' \
+  /czj/code/vla-evaluation/data/profiles/genie02-{full,qwen3-vl}.yaml
 ```
 
-确认 GPU 可用、模型目录存在、Conda 环境已安装所需 GPU 依赖。
+确认 GPU 可用、模型目录存在且包含 `config.json`、Profile 的 `model_family` 与模型
+`model_type` 一致，并且 Conda 环境已安装完整 GPU 依赖。
 
 ### `work-horse terminated unexpectedly`，任务约 3 分钟后失败
 

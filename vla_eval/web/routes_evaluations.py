@@ -404,6 +404,7 @@ async def create_evaluation(
         "adapter": profile.adapter,
         "plugin": profile.plugin,
         "vlm_backend": profile.vlm.backend,
+        "vlm_model_family": profile.vlm.model_family,
         "vlm_model_path": profile.vlm.model_path,
         "prompt_version": profile.vlm.prompt_version,
         "max_image_size": profile.vlm.max_image_size,

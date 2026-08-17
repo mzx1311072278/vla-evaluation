@@ -1,10 +1,11 @@
 import builtins
+import json
 import logging
 import subprocess
 import sys
 from dataclasses import FrozenInstanceError
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -356,6 +357,174 @@ def test_local_vlm_client_missing_path_raises_safe_model_load_error(tmp_path):
     assert isinstance(raised.value.__cause__, FileNotFoundError)
 
 
+def test_local_vlm_client_rejects_checkpoint_family_mismatch(tmp_path: Path):
+    from Genie02_report.attempt_eval.vlm_client import LocalVLMClient
+
+    model_dir = tmp_path / "private-model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": "qwen2_5_vl"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ModelLoadError, match="configured model could not be loaded") as raised:
+        LocalVLMClient(model_dir, model_family="qwen3_vl")
+
+    assert str(model_dir) not in str(raised.value)
+    assert isinstance(raised.value.__cause__, ValueError)
+    assert "qwen3_vl" in str(raised.value.__cause__)
+
+
+def test_local_vlm_client_uses_auto_image_text_model_for_qwen3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from Genie02_report.attempt_eval.vlm_client import LocalVLMClient
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_vl"}),
+        encoding="utf-8",
+    )
+    model_calls: list[tuple[Path, dict[str, Any]]] = []
+    processor_calls: list[tuple[Path, dict[str, Any]]] = []
+    fake_model = SimpleNamespace(device="cuda:0")
+    fake_processor = SimpleNamespace()
+    torch_module = ModuleType("torch")
+    torch_module.cuda = SimpleNamespace(is_available=lambda: True)
+    torch_module.float32 = object()
+    transformers_module = ModuleType("transformers")
+    transformers_module.AutoModelForImageTextToText = SimpleNamespace(
+        from_pretrained=lambda path, **kwargs: (
+            model_calls.append((Path(path), kwargs)) or fake_model
+        )
+    )
+    transformers_module.AutoProcessor = SimpleNamespace(
+        from_pretrained=lambda path, **kwargs: (
+            processor_calls.append((Path(path), kwargs)) or fake_processor
+        )
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch_module)
+    monkeypatch.setitem(sys.modules, "transformers", transformers_module)
+
+    client = LocalVLMClient(model_dir, model_family="qwen3_vl")
+
+    assert client.model is fake_model
+    assert client.processor is fake_processor
+    assert model_calls == [
+        (
+            model_dir,
+            {
+                "dtype": "auto",
+                "device_map": "auto",
+                "local_files_only": True,
+            },
+        )
+    ]
+    assert processor_calls == [(model_dir, {"local_files_only": True})]
+
+
+def test_local_vlm_client_uses_qwen3_preprocessing_and_deterministic_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from Genie02_report.attempt_eval.vlm_client import LocalVLMClient
+
+    vision_calls: list[dict[str, Any]] = []
+    processor_calls: list[dict[str, Any]] = []
+    generate_calls: list[dict[str, Any]] = []
+    decode_calls: list[dict[str, Any]] = []
+    input_targets: list[Any] = []
+
+    class FakeInputs(dict):
+        def __init__(self):
+            super().__init__()
+            self.input_ids = [[10, 11]]
+
+        def to(self, target):
+            input_targets.append(target)
+            return self
+
+    class FakeInferenceMode:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeProcessor:
+        image_processor = SimpleNamespace(patch_size=16)
+
+        def apply_chat_template(self, messages, **kwargs):
+            assert messages[0]["content"][0]["type"] == "image"
+            return "templated prompt"
+
+        def __call__(self, **kwargs):
+            processor_calls.append(kwargs)
+            return FakeInputs()
+
+        def batch_decode(self, generated, **kwargs):
+            decode_calls.append({"generated": generated, **kwargs})
+            return [
+                json.dumps(
+                    {
+                        "episode_success": True,
+                        "pre_success_failed_attempt_count": 0,
+                        "failed_attempts_before_success": [],
+                        "final_success_time": 3.5,
+                        "confidence": 0.9,
+                        "reason": "final grasp visible",
+                    }
+                )
+            ]
+
+    class FakeModel:
+        device = "cuda:0"
+
+        def generate(self, **kwargs):
+            generate_calls.append(kwargs)
+            return [[10, 11, 12]]
+
+    qwen_utils = ModuleType("qwen_vl_utils")
+
+    def process_vision_info(messages, **kwargs):
+        vision_calls.append({"messages": messages, **kwargs})
+        return ["image-input"], []
+
+    qwen_utils.process_vision_info = process_vision_info
+    monkeypatch.setitem(sys.modules, "qwen_vl_utils", qwen_utils)
+    client = LocalVLMClient.__new__(LocalVLMClient)
+    client.model = FakeModel()
+    client.processor = FakeProcessor()
+    client.max_new_tokens = 256
+    client.prompt = "prompt"
+    client.torch = SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: True, empty_cache=lambda: None),
+        inference_mode=FakeInferenceMode,
+    )
+    frame = tmp_path / "frame.jpg"
+
+    result, valid = client.analyze(
+        [frame],
+        [{"frame_type": "global", "frame": "frame.jpg", "episode_time": 1.0, "video_time": 2.0}],
+        4.0,
+    )
+
+    assert valid is True
+    assert result["pre_success_failed_attempt_count"] == 0
+    assert vision_calls[0]["image_patch_size"] == 16
+    assert processor_calls[0]["do_resize"] is False
+    assert input_targets == ["cuda:0"]
+    assert generate_calls[0]["do_sample"] is False
+    assert generate_calls[0]["max_new_tokens"] == 256
+    assert decode_calls == [
+        {
+            "generated": [[12]],
+            "skip_special_tokens": True,
+            "clean_up_tokenization_spaces": False,
+        }
+    ]
+
+
 def test_evaluation_cancelled_is_reexported_from_lightweight_module():
     assert EvaluationCancelled is LightweightEvaluationCancelled
 
@@ -364,6 +533,7 @@ def test_evaluation_cancelled_is_reexported_from_lightweight_module():
     ("overrides", "error"),
     [
         ({"prompt_version": "made-up-v99"}, "prompt_version"),
+        ({"model_family": "internvl"}, "model_family"),
         ({"prompt_version": []}, "prompt_version"),
         ({"dense_region": "middle"}, "dense_region"),
         ({"dense_region": []}, "dense_region"),
@@ -453,6 +623,7 @@ def test_run_attempt_evaluation_uses_injected_client_without_optional_imports(
         (
             (config.model_path,),
             {
+                "model_family": "qwen2_5_vl",
                 "max_new_tokens": 256,
                 "prompt_version": "genie02-attempt-v1",
             },
@@ -522,6 +693,8 @@ def test_cli_maps_deprecated_sampling_aliases_to_canonical_config(
             "1.25",
             "--prompt_version",
             "genie02-attempt-v1",
+            "--model_family",
+            "qwen3_vl",
         ],
     )
 
@@ -530,6 +703,7 @@ def test_cli_maps_deprecated_sampling_aliases_to_canonical_config(
     assert config.max_global_frames == 3
     assert config.global_sample_interval == 1.25
     assert config.prompt_version == "genie02-attempt-v1"
+    assert config.model_family == "qwen3_vl"
     assert not hasattr(config, "max_frames")
     assert not hasattr(config, "sample_interval")
 
@@ -1191,6 +1365,7 @@ def test_task6_profile_mapping_runs_real_service_and_writes_compatible_summary(
     assert [result["episode_index"] for result in summary] == [4, 9]
     assert client_calls == [
         {
+            "model_family": "qwen2_5_vl",
             "max_new_tokens": 256,
             "prompt_version": "genie02-attempt-v1",
         }
@@ -1217,7 +1392,7 @@ def test_api_backend_runs_service_with_injected_api_factory(
     factory_calls: list[dict[str, Any]] = []
 
     def fake_builder(api):
-        def factory(_model_path, *, max_new_tokens, prompt_version):
+        def factory(_model_path, *, model_family, max_new_tokens, prompt_version):
             factory_calls.append(
                 {
                     "base_url": api.base_url,
@@ -1225,6 +1400,7 @@ def test_api_backend_runs_service_with_injected_api_factory(
                     "api_key_env": api.api_key_env,
                     "timeout": api.timeout,
                     "max_retries": api.max_retries,
+                    "model_family": model_family,
                     "max_new_tokens": max_new_tokens,
                     "prompt_version": prompt_version,
                 }
@@ -1260,6 +1436,7 @@ def test_api_backend_runs_service_with_injected_api_factory(
             "api_key_env": "VLA_EVAL_VLM_API_KEY",
             "timeout": 60,
             "max_retries": 3,
+            "model_family": "qwen2_5_vl",
             "max_new_tokens": 256,
             "prompt_version": "genie02-attempt-v1",
         }
@@ -1333,10 +1510,11 @@ def test_build_api_client_factory_wires_profile_fields_into_client(
     api = load_profile(Path("config/profiles/genie02-api.yaml")).vlm.api
 
     factory = _build_api_client_factory(api)
-    # The vendored runner calls factory(config.model_path, max_new_tokens=...,
-    # prompt_version=...); the placeholder model_path is accepted and ignored.
+    # The vendored runner passes model identity plus generation settings; the
+    # placeholder model_path and local model_family are accepted and ignored.
     client = factory(
         tmp_path / "ignored-model-path-placeholder",
+        model_family="qwen2_5_vl",
         max_new_tokens=256,
         prompt_version="genie02-attempt-v1",
     )

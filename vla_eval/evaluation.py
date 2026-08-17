@@ -323,8 +323,8 @@ def _validate_attempt_indices(results: list[dict[str, Any]], expected: frozenset
 def _build_api_client_factory(api: VLMApiProfile) -> Callable[..., Any]:
     """Build a ``client_factory`` that constructs the API VLM client.
 
-    The vendored runner calls ``factory(config.model_path, max_new_tokens=...,
-    prompt_version=...)`` positionally. The API backend ignores that
+    The vendored runner calls ``factory(config.model_path, model_family=...,
+    max_new_tokens=..., prompt_version=...)``. The API backend ignores that
     ``model_path`` (it takes its model name from the profile's ``api`` block) and
     reads its connection details from ``api``. Lazy-importing ``ApiVLMClient``
     keeps httpx out of module load, matching this module's existing
@@ -334,7 +334,11 @@ def _build_api_client_factory(api: VLMApiProfile) -> Callable[..., Any]:
     from vla_eval.vlm_api import ApiVLMClient
 
     def factory(
-        _model_path: Any, *, max_new_tokens: int, prompt_version: str
+        _model_path: Any,
+        *,
+        model_family: str,
+        max_new_tokens: int,
+        prompt_version: str,
     ) -> ApiVLMClient:
         return ApiVLMClient(
             base_url=api.base_url,
@@ -375,6 +379,7 @@ def run_profile_vlm(
     config = AttemptEvalConfig(
         dataset_root=dataset_path,
         model_path=model_path,
+        model_family=profile.vlm.model_family or "qwen2_5_vl",
         prompt_version=profile.vlm.prompt_version,
         image_key=profile.image_key,
         output_dir=output_dir,
