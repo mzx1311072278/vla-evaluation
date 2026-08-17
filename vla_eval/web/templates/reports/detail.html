@@ -1,0 +1,423 @@
+{% extends "base.html" %}
+{% macro formula_fragments(fragments) -%}
+  {%- for fragment in fragments -%}
+    {{- fragment.text -}}
+    {%- if fragment.subscript %}<sub>{{ fragment.subscript }}</sub>{% endif -%}
+    {%- if fragment.superscript %}<sup>{{ fragment.superscript }}</sup>{% endif -%}
+  {%- endfor -%}
+{%- endmacro %}
+{% block title %}{{ dataset.name }} | 评测报告{% endblock %}
+{% block content %}
+  <article class="report-page">
+    <header class="page-heading">
+      <div>
+        <p class="eyebrow">评测报告</p>
+        <h1>{{ dataset.name }}</h1>
+      </div>
+      <div class="commands">
+        <a class="button secondary-button" href="/evaluations/{{ job.id }}">查看任务</a>
+        <a class="button secondary-button" href="/datasets/{{ dataset.id }}">查看数据集</a>
+      </div>
+    </header>
+
+    <section id="report-summary" class="report-section report-summary">
+      <dl class="report-headline">
+        <div><dt>GSR</dt><dd>{{ headline.gsr }}</dd></div>
+        <div><dt>成功数 / 失败数</dt><dd><span class="metric-success">{{ headline.n_success }}</span> / <span class="metric-failure">{{ headline.n_failure }}</span></dd></div>
+        <div><dt>成功 TTS</dt><dd>{{ headline.tts }}</dd></div>
+        <div><dt>平滑度</dt><dd>{{ headline.smoothness }}</dd></div>
+        <div><dt>待复核</dt><dd>{{ headline.pending_review }}</dd></div>
+        <div><dt>任务创建时间</dt><dd>{{ job.created_at|beijing_time }}</dd></div>
+        <div><dt>任务最后更新时间</dt><dd>{{ job.updated_at|beijing_time }}</dd></div>
+      </dl>
+      <div class="release-decision">
+        <div>
+          <span class="status-label">发版判断</span>
+          <strong>{{ release_decision }}</strong>
+        </div>
+        <p>本报告仅陈述当前任务已记录的评测事实，不替代发版审批。</p>
+      </div>
+      <section class="detail-band report-overview">
+        {% if smoothness_chart.points %}
+          <figure class="smoothness-preview">
+            <figcaption class="section-heading">
+              <div>
+                <h2>平滑度趋势</h2>
+                <p class="muted">覆盖 {{ summary_facts.smoothness_coverage }} / {{ summary_facts.episode_count }} 个 Episode</p>
+              </div>
+              {% if smoothness_preview_url %}<a class="icon-button" href="{{ smoothness_preview_url }}" title="下载平滑度矢量图" aria-label="下载平滑度矢量图"><i data-lucide="download"></i></a>{% endif %}
+            </figcaption>
+            <dl class="smoothness-stats">
+              <div><dt>中位数</dt><dd>{{ '%.3f'|format(smoothness_chart.median) }}</dd></div>
+              <div><dt>P90</dt><dd>{{ '%.3f'|format(smoothness_chart.p90) }}</dd></div>
+              <div><dt>最大值</dt><dd>{{ '%.3f'|format(smoothness_chart.maximum) }}</dd></div>
+              <div><dt>有效数据</dt><dd>{{ smoothness_chart.points|length }}</dd></div>
+            </dl>
+            <div class="smoothness-chart-shell table-scroll" data-smoothness-chart>
+              <svg viewBox="0 0 900 330" role="img" aria-label="Episode 平滑度趋势，数值越低越好"></svg>
+              <output class="smoothness-tooltip" data-chart-tooltip hidden></output>
+            </div>
+            <div class="smoothness-legend" aria-label="图例">
+              <span><i class="chart-key chart-key-success"></i>成功</span>
+              <span><i class="chart-key chart-key-failure"></i>失败</span>
+              <span><i class="chart-key chart-key-intervened"></i>遥操介入</span>
+              <span><i class="chart-key chart-key-reference"></i>统计参考线</span>
+            </div>
+            {% if smoothness_chart.points|length > 50 %}
+              <div class="smoothness-controls">
+                <label>显示范围
+                  <select data-chart-window>
+                    <option value="all">全部</option>
+                    <option value="100">100 个</option>
+                    <option value="50">50 个</option>
+                    <option value="25">25 个</option>
+                  </select>
+                </label>
+                <label class="chart-range-label">起始位置
+                  <input type="range" min="0" max="{{ smoothness_chart.points|length - 25 }}" value="0" step="1" data-chart-start disabled>
+                </label>
+                <output data-chart-range-label>全部 {{ smoothness_chart.points|length }} 个 Episode</output>
+              </div>
+            {% endif %}
+            <section class="smoothness-outliers" aria-labelledby="smoothness-outliers-title">
+              <div class="section-heading compact-heading">
+                <div><h3 id="smoothness-outliers-title">最不平滑的 10 个 Episode</h3><p class="muted">按平滑度 S 从高到低，数值越低越好</p></div>
+              </div>
+              <div class="table-scroll">
+                <table>
+                  <thead><tr><th>Episode</th><th>平滑度 S</th><th>结果</th><th>遥操介入</th></tr></thead>
+                  <tbody>
+                    {% for point in smoothness_chart.worst %}
+                      <tr><th scope="row">{{ point.episode }}</th><td>{{ '%.6f'|format(point.value) }}</td><td><span class="status status-{{ 'success' if point.outcome == 'success' else 'failure' }}">{{ point.outcome }}</span></td><td>{{ '是' if point.intervened else '否' }}</td></tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          </figure>
+        {% else %}
+          <div class="smoothness-summary">
+            <div class="section-heading">
+              <div>
+                <h2>平滑度曲线</h2>
+                <p class="muted">未产生平滑度 SVG；指标覆盖 {{ summary_facts.smoothness_coverage }} / {{ summary_facts.episode_count }} 个 Episode</p>
+              </div>
+            </div>
+          </div>
+        {% endif %}
+        <section>
+          <h2>本次评测数据与产物状态</h2>
+          <div class="table-scroll">
+            <table class="key-value-table provenance-table">
+              <tbody>
+                <tr><th scope="row">Episode</th><td>{{ summary_facts.episode_count }}</td></tr>
+                <tr><th scope="row">VLM 已配置</th><td>{{ '是' if summary_facts.vlm_configured else '否' }}</td></tr>
+                <tr><th scope="row">VLM 本次启用</th><td>{{ '是' if summary_facts.vlm_enabled else '否' }}</td></tr>
+                <tr><th scope="row">VLM 结果产物</th><td>{% if summary_facts.vlm_executed %}已产生{% elif summary_facts.vlm_artifact_status == 'invalid' %}格式无效{% else %}未产生{% endif %}</td></tr>
+                <tr><th scope="row">应用版本</th><td>{{ provenance.app_version }}</td></tr>
+                {% if provenance.git_sha %}<tr><th scope="row">Git SHA</th><td><code>{{ provenance.git_sha }}</code></td></tr>{% endif %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+    </section>
+
+    <section id="report-configuration" class="detail-band report-section">
+      <div class="section-heading">
+        <div><p class="section-index">01</p><h2>评测配置与任务边界</h2></div>
+        <p class="muted">数据库记录与数据集 session</p>
+      </div>
+      <div class="table-scroll">
+        <table class="configuration-table">
+          <thead><tr><th>项目</th><th>当前记录</th><th>真实来源</th></tr></thead>
+          <tbody>
+            {% for row in configuration_rows %}
+              <tr><th scope="row">{{ row.label }}</th><td>{{ row.value }}</td><td><code>{{ row.source }}</code></td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="report-sources" class="detail-band report-section">
+      <div class="section-heading">
+        <div><p class="section-index">02</p><h2>依据与数据来源</h2></div>
+        <p class="muted">仅列出当前任务接口和产物</p>
+      </div>
+      <div class="table-scroll">
+        <table class="source-table">
+          <thead><tr><th>来源</th><th>接口 / 路径</th><th>状态</th><th>用途</th></tr></thead>
+          <tbody>
+            {% for row in source_rows %}
+              <tr><th scope="row">{{ row.label }}</th><td><code>{{ row.source }}</code></td><td>{{ row.status }}</td><td>{{ row.purpose }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="report-quality" class="detail-band report-section">
+      <div class="section-heading">
+        <div><p class="section-index">03</p><h2>数据质量记录</h2></div>
+        <p class="muted">确定性检查，不生成风险评级</p>
+      </div>
+      <div class="table-scroll">
+        <table class="quality-table">
+          <thead><tr><th>检查项</th><th>结果</th><th>状态</th></tr></thead>
+          <tbody>
+            {% for row in quality_rows %}
+              <tr><th scope="row">{{ row.label }}</th><td>{{ row.value }}</td><td>{{ row.status }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="report-metrics" class="detail-band report-section">
+      <div class="section-heading">
+        <div><p class="section-index">04</p><h2>指标定义与评测公式</h2></div>
+        <p class="muted">定义与 Markdown 报告共享同一版本化来源</p>
+      </div>
+      <div class="table-scroll">
+        <table class="metric-definition-table">
+          <thead><tr><th>指标</th><th>定义</th><th>方向</th><th>公式与计算说明</th></tr></thead>
+          <tbody>
+            {% for metric in metric_definitions %}
+              <tr>
+                <th scope="row">{{ metric.label }}</th>
+                <td>{{ metric.definition }}</td>
+                <td>{{ metric.direction }}</td>
+                <td class="metric-formulas">
+                  {% for formula in metric.formulas %}
+                    <div class="formula-row">
+                      <span class="formula-lhs">{{ formula_fragments(formula.lhs) }}</span>
+                      <span class="formula-equals">=</span>
+                      {% if formula.rhs %}
+                        <span class="formula-rhs">{{ formula_fragments(formula.rhs) }}</span>
+                      {% else %}
+                        <span class="formula-fraction" aria-label="除以">
+                          <span class="formula-numerator">{{ formula_fragments(formula.numerator) }}</span>
+                          <span class="formula-denominator">{{ formula_fragments(formula.denominator) }}</span>
+                        </span>
+                      {% endif %}
+                    </div>
+                  {% endfor %}
+                  {% if metric.notes %}<ul class="formula-notes">{% for note in metric.notes %}<li>{{ note }}</li>{% endfor %}</ul>{% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="report-episodes" class="detail-band report-section">
+      <div class="section-heading">
+        <div><p class="section-index">05</p><h2>Episode 与失败明细</h2></div>
+        <p class="muted">显示 {{ shown_episodes }} / {{ total_episodes }} 个 episode</p>
+      </div>
+      <form class="report-filter-form" method="get" action="/reports/{{ job.id }}" aria-label="筛选 episode">
+        <label>结果
+          <select name="outcome">
+            <option value="all" {{ 'selected' if filter_outcome == 'all' else '' }}>全部</option>
+            <option value="success" {{ 'selected' if filter_outcome == 'success' else '' }}>成功</option>
+            <option value="failure" {{ 'selected' if filter_outcome == 'failure' else '' }}>失败</option>
+          </select>
+        </label>
+        <label>复核状态
+          <select name="review">
+            <option value="all" {{ 'selected' if filter_review == 'all' else '' }}>全部</option>
+            <option value="needs_review" {{ 'selected' if filter_review == 'needs_review' else '' }}>待复核</option>
+            <option value="reviewed" {{ 'selected' if filter_review == 'reviewed' else '' }}>人工复核</option>
+            <option value="ok" {{ 'selected' if filter_review == 'ok' else '' }}>自动通过</option>
+          </select>
+        </label>
+        <button type="submit">筛选</button>
+      </form>
+      {% if episodes %}
+        <div class="table-scroll">
+          <table class="episode-table">
+            <thead>
+              <tr>
+                <th>Episode</th><th>结果</th><th>时长</th><th>综合平滑度</th><th>左臂</th><th>右臂</th><th>空间</th><th>有效帧</th><th>操作员介入</th><th>备注 / 跳过原因</th>
+                {% if has_vlm %}<th>VLM 复核</th><th>VLM 原因</th><th>证据帧</th>{% endif %}
+              </tr>
+            </thead>
+            <tbody>
+              {% for episode in episodes %}
+                <tr>
+                  <th scope="row">{{ episode.index }}</th>
+                  <td><span class="status status-{{ 'success' if episode.outcome == 'success' else 'failure' }}">{{ episode.outcome }}</span>{% if episode.vlm and episode.vlm.get('vlm_valid') is false %}<small>VLM 解析失败</small>{% endif %}</td>
+                  <td>{{ episode.duration }}</td><td>{{ episode.smoothness }}</td><td>{{ episode.left_smoothness }}</td><td>{{ episode.right_smoothness }}</td><td>{{ episode.smoothness_space }}</td><td>{{ episode.smoothness_frames if episode.smoothness_frames is not none else '—' }}</td><td>{{ '是' if episode.operator_intervened else '否' }}</td>
+                  <td>{% if episode.notes %}{{ episode.notes }}{% elif episode.smoothness_skipped_reason %}{{ episode.smoothness_skipped_reason }}{% else %}—{% endif %}</td>
+                  {% if has_vlm %}
+                    <td>{% if episode.vlm %}{% if episode.vlm.get('needs_manual_review') is true %}待复核{% elif episode.vlm.get('review_mode') == 'manual_review' %}人工复核{% else %}自动通过{% endif %}{% if episode.vlm.get('confidence') is not none %}<small>置信度 {{ '%.2f'|format(episode.vlm.confidence) }}</small>{% endif %}{% else %}—{% endif %}</td>
+                    <td>{% if episode.vlm and episode.vlm.get('reason') %}{{ episode.vlm.reason }}{% else %}—{% endif %}</td>
+                    <td>{% if episode.outcome == 'failure' and episode.evidence_path %}<div class="path-row"><code class="path">{{ episode.evidence_path }}</code><button class="icon-button" type="button" data-copy="{{ episode.evidence_path }}" title="复制路径" aria-label="复制路径"><i data-lucide="copy"></i></button></div>{% if episode.evidence_range %}<small>{{ episode.evidence_range }}</small>{% endif %}{% else %}—{% endif %}</td>
+                  {% endif %}
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% if has_vlm %}<p class="muted">VLM 分析为辅助参考，不覆盖原始成功标签。</p>{% elif summary_facts.vlm_configured %}<p class="muted">本次任务存在 VLM 配置，但未产生有效 VLM 结果。</p>{% endif %}
+      {% else %}
+        <p class="empty">暂无 Episode 指标。</p>
+      {% endif %}
+    </section>
+
+    <section id="report-components" class="detail-band report-section">
+      <div class="section-heading">
+        <div><p class="section-index">06</p><h2>组件与数据接口</h2></div>
+        <p class="muted">不从策略名称推断模型结构</p>
+      </div>
+      <div class="table-scroll">
+        <table class="component-table">
+          <thead><tr><th>组件</th><th>当前记录</th><th>真实来源</th></tr></thead>
+          <tbody>{% for row in component_rows %}<tr><th scope="row">{{ row.component }}</th><td>{{ row.value }}</td><td><code>{{ row.source }}</code></td></tr>{% endfor %}</tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="report-gaps" class="detail-band report-section">
+      <div class="section-heading">
+        <div><p class="section-index">07</p><h2>证据缺口</h2></div>
+        <p class="muted">缺失字段不会使用旧报告或默认值填充</p>
+      </div>
+      <div class="table-scroll">
+        <table class="evidence-gap-table">
+          <thead><tr><th>缺失证据</th><th>对当前报告的影响</th><th>需要补充的接口</th></tr></thead>
+          <tbody>{% for row in evidence_gaps %}<tr><th scope="row">{{ row.item }}</th><td>{{ row.impact }}</td><td>{{ row.required_source }}</td></tr>{% endfor %}</tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="report-downloads" class="detail-band report-section">
+      <div class="section-heading">
+        <div><p class="section-index">08</p><h2>结果文件</h2></div>
+        <p class="muted">{{ downloads|length }} 个文件</p>
+      </div>
+      {% if job.output_dir %}<div class="path-row"><code class="path">{{ job.output_dir }}</code><button class="icon-button" type="button" data-copy="{{ job.output_dir }}" title="复制路径" aria-label="复制路径"><i data-lucide="copy"></i></button></div>{% endif %}
+      {% if downloads %}
+        <div class="table-scroll report-files">
+          <table class="report-files-table">
+            <thead><tr><th>文件</th><th>内容</th><th>格式</th><th><span class="sr-only">操作</span></th></tr></thead>
+            <tbody>{% for item in downloads %}<tr><td><code>{{ item.name }}</code></td><td>{{ item.description }}</td><td>{{ item.format }}</td><td><a class="table-action" href="{{ item.url }}" aria-label="下载 {{ item.name }}"><i data-lucide="download"></i>下载</a></td></tr>{% endfor %}</tbody>
+          </table>
+        </div>
+      {% else %}<p class="empty">暂无可下载结果文件。</p>{% endif %}
+    </section>
+  </article>
+  {% if smoothness_chart.points %}
+    <script id="smoothness-chart-data" type="application/json">{{ smoothness_chart|tojson }}</script>
+    <script>
+      document.addEventListener("DOMContentLoaded", () => {
+        const root = document.querySelector("[data-smoothness-chart]");
+        const payload = document.querySelector("#smoothness-chart-data");
+        if (!root || !payload) return;
+        const data = JSON.parse(payload.textContent);
+        const svg = root.querySelector("svg");
+        const tooltip = root.querySelector("[data-chart-tooltip]");
+        const windowSelect = document.querySelector("[data-chart-window]");
+        const startInput = document.querySelector("[data-chart-start]");
+        const rangeLabel = document.querySelector("[data-chart-range-label]");
+        const ns = "http://www.w3.org/2000/svg";
+        const width = 900;
+        const height = 330;
+        const pad = { left: 62, right: 26, top: 28, bottom: 48 };
+        const plotWidth = width - pad.left - pad.right;
+        const plotHeight = height - pad.top - pad.bottom;
+
+        const add = (name, attrs, text) => {
+          const node = document.createElementNS(ns, name);
+          Object.entries(attrs).forEach(([key, value]) => node.setAttribute(key, value));
+          if (text !== undefined) node.textContent = text;
+          svg.append(node);
+          return node;
+        };
+        const showTooltip = (point, x, y) => {
+          tooltip.textContent = `Episode ${point.episode} · S ${point.value.toFixed(6)} · ${point.outcome}${point.intervened ? " · 遥操介入" : ""}`;
+          tooltip.style.left = `${Math.min(86, Math.max(8, x / width * 100))}%`;
+          tooltip.style.top = `${Math.max(3, y / height * 100 - 3)}%`;
+          tooltip.hidden = false;
+        };
+        const hideTooltip = () => { tooltip.hidden = true; };
+        const tickIndices = (count, limit = 10) => {
+          if (count <= limit) return Array.from({ length: count }, (_, index) => index);
+          return Array.from(
+            { length: limit },
+            (_, index) => Math.round(index * (count - 1) / (limit - 1)),
+          );
+        };
+        const render = () => {
+          const requested = windowSelect?.value || "all";
+          const windowSize = requested === "all" ? data.points.length : Number(requested);
+          const maxStart = Math.max(0, data.points.length - windowSize);
+          if (startInput) {
+            startInput.disabled = requested === "all";
+            startInput.max = String(maxStart);
+            if (Number(startInput.value) > maxStart) startInput.value = String(maxStart);
+          }
+          const start = requested === "all" ? 0 : Number(startInput?.value || 0);
+          const points = data.points.slice(start, start + windowSize);
+          if (rangeLabel) {
+            rangeLabel.textContent = requested === "all"
+              ? `全部 ${data.points.length} 个 Episode`
+              : `Episode ${points[0].episode}–${points.at(-1).episode} / ${data.points.length}`;
+          }
+          svg.replaceChildren();
+          add("title", {}, "Episode 平滑度趋势，数值越低越好");
+          const valueSpan = data.maximum - data.minimum;
+          const yPadding = valueSpan ? valueSpan * 0.1 : Math.max(Math.abs(data.maximum) * 0.05, 0.1);
+          const yMin = Math.max(0, data.minimum - yPadding);
+          const yMax = data.maximum + yPadding;
+          const x = (index) => points.length === 1
+            ? pad.left + plotWidth / 2
+            : pad.left + index / (points.length - 1) * plotWidth;
+          const y = (value) => pad.top + plotHeight - (value - yMin) / (yMax - yMin) * plotHeight;
+          for (let tick = 0; tick <= 4; tick += 1) {
+            const value = yMin + (yMax - yMin) * tick / 4;
+            const position = y(value);
+            add("line", { x1: pad.left, y1: position, x2: width - pad.right, y2: position, class: "chart-grid" });
+            add("text", { x: pad.left - 9, y: position + 4, "text-anchor": "end", class: "chart-axis-label" }, value.toFixed(1));
+          }
+          [["median", "中位数", 14], ["p90", "P90", -6]].forEach(([key, label, labelOffset]) => {
+            const position = y(data[key]);
+            add("line", { x1: pad.left, y1: position, x2: width - pad.right, y2: position, class: `chart-reference chart-reference-${key}` });
+            add("text", { x: pad.left + 7, y: position + labelOffset, class: "chart-reference-label" }, `${label} ${data[key].toFixed(3)}`);
+          });
+          if (points.length > 1) {
+            add("polyline", {
+              points: points.map((point, index) => `${x(index)},${y(point.value)}`).join(" "),
+              class: "chart-trend",
+            });
+          }
+          points.forEach((point, index) => {
+            const cx = x(index);
+            const cy = y(point.value);
+            const circle = add("circle", {
+              cx, cy, r: points.length > 100 ? 3 : 4,
+              class: `chart-point chart-point-${point.outcome}${point.intervened ? " chart-point-intervened" : ""}`,
+              tabindex: "0",
+              role: "img",
+              "aria-label": `Episode ${point.episode}，平滑度 ${point.value.toFixed(6)}，${point.outcome}${point.intervened ? "，遥操介入" : ""}`,
+            });
+            circle.addEventListener("mouseenter", () => showTooltip(point, cx, cy));
+            circle.addEventListener("mouseleave", hideTooltip);
+            circle.addEventListener("focus", () => showTooltip(point, cx, cy));
+            circle.addEventListener("blur", hideTooltip);
+          });
+          tickIndices(points.length).forEach((index) => {
+            add("text", { x: x(index), y: height - 21, "text-anchor": "middle", class: "chart-axis-label" }, `Ep ${points[index].episode}`);
+          });
+          add("text", { x: 17, y: pad.top + plotHeight / 2, transform: `rotate(-90 17 ${pad.top + plotHeight / 2})`, "text-anchor": "middle", class: "chart-axis-title" }, "平滑度 S");
+          add("text", { x: pad.left + plotWidth / 2, y: height - 2, "text-anchor": "middle", class: "chart-axis-title" }, "Episode");
+        };
+        windowSelect?.addEventListener("change", render);
+        startInput?.addEventListener("input", render);
+        render();
+      });
+    </script>
+  {% endif %}
+{% endblock %}

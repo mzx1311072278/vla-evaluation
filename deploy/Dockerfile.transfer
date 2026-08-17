@@ -1,0 +1,14 @@
+# Transfer worker: reuses the web image and adds rsync + openssh-client so the
+# rsync-over-ssh dataset transfer path is available. paramiko (in the base image)
+# is used for known_hosts / SFTP handling.
+FROM vla-eval-web:latest
+
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends rsync openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+USER vlaeval
+
+ENTRYPOINT ["/app/deploy/entrypoint.sh"]
+CMD ["python", "-m", "vla_eval.cli", "worker", "--queue", "transfers"]

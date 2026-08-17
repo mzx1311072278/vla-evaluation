@@ -1,0 +1,34 @@
+# Web (FastAPI/uvicorn) image. Also serves as the base for the transfer worker.
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+# openssh-client is required by paramiko for remote dataset transfers;
+# curl drives the Docker HEALTHCHECK.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssh-client curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . /app
+
+RUN python -m pip install --upgrade pip \
+    && python -m pip install .
+
+# Non-root service account (fixed uid 1001 for stable host-volume ownership).
+RUN groupadd --system --gid 1001 vlaeval \
+    && useradd --system --uid 1001 --gid vlaeval --home-dir /app --shell /usr/sbin/nologin vlaeval \
+    && chmod +x /app/deploy/entrypoint.sh
+
+USER vlaeval
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsS http://localhost:8000/health || exit 1
+
+ENTRYPOINT ["/app/deploy/entrypoint.sh"]
+CMD ["uvicorn", "vla_eval.server:create_app_from_env", "--factory", "--host", "0.0.0.0", "--port", "8000"]

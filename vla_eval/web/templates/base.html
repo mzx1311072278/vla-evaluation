@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}VLA Evaluation{% endblock %}</title>
+    <link rel="stylesheet" href="/static/app.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4" defer></script>
+    <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
+  </head>
+  <body class="{% if current_user %}authenticated{% else %}signed-out{% endif %}">
+    {% if current_user %}
+      <header class="app-header">
+        <div class="header-primary">
+          <a class="brand" href="/datasets">VLA Evaluation</a>
+          <nav aria-label="主导航">
+            <a href="/datasets">数据集</a>
+            <a href="/imports">导入任务</a>
+            <a href="/evaluations">评测任务</a>
+          </nav>
+        </div>
+        <form class="logout" method="post" action="/logout">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="icon-button header-action" type="submit" title="退出" aria-label="退出"><i data-lucide="log-out"></i></button>
+        </form>
+      </header>
+    {% endif %}
+    <main>{% block content %}{% endblock %}</main>
+    <script>
+      document.addEventListener("DOMContentLoaded", () => {
+        if (window.lucide) window.lucide.createIcons();
+        document.addEventListener("htmx:afterSwap", () => {
+          if (window.lucide) window.lucide.createIcons();
+        });
+        document.addEventListener("click", async (event) => {
+          const button = event.target.closest("[data-copy]");
+          if (!button || !navigator.clipboard) return;
+          await navigator.clipboard.writeText(button.dataset.copy);
+        });
+      });
+    </script>
+  </body>
+</html>

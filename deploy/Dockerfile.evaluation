@@ -1,0 +1,43 @@
+# Evaluation worker image with GPU support.
+# Based on a verified NVIDIA CUDA runtime image (verify/pin the tag on the host).
+# torch/transformers ship their own CUDA runtime in the wheels; this base provides
+# the driver shim that the NVIDIA Container Toolkit wires in at run time.
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+# Ubuntu 22.04 ships Python 3.10; install 3.11 from the deadsnakes PPA.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl gnupg software-properties-common \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv python3.11-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3.11 -m ensurepip \
+    && python3.11 -m pip install --upgrade pip \
+    && update-alternatives --install /usr/local/bin/python python /usr/bin/python3.11 1
+
+# Note: bare `pip` is intentionally not aliased. /usr/bin/pip3 belongs to the
+# system Python 3.10, so use `python -m pip` (which targets 3.11) everywhere.
+
+WORKDIR /app
+COPY . /app
+
+# One image serves both VLM backends: the local GPU model (torch) and the
+# optional OpenAI-compatible API client (httpx). For an API-only deployment with
+# no local GPU, build a slim image with ".[vlm-api]" instead and drop the
+# nvidia/cuda base.
+RUN python -m pip install ".[gpu,vlm-api]"
+
+RUN groupadd --system --gid 1001 vlaeval \
+    && useradd --system --uid 1001 --gid vlaeval --home-dir /app --shell /usr/sbin/nologin vlaeval \
+    && chmod +x /app/deploy/entrypoint.sh
+
+USER vlaeval
+
+ENTRYPOINT ["/app/deploy/entrypoint.sh"]
+CMD ["python", "-m", "vla_eval.cli", "worker", "--queue", "evaluations"]

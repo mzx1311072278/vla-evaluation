@@ -1,0 +1,898 @@
+"""Resumable remote dataset transfer and atomic inbox publication."""
+
+from __future__ import annotations
+
+import codecs
+import ctypes
+import errno
+import math
+import os
+import re
+import selectors
+import shlex
+import stat
+import subprocess
+import sys
+import time
+import unicodedata
+from collections import deque
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Final, Literal
+
+from vla_eval.config import LocalSource, RemoteSource
+from vla_eval.datasets import DatasetInspection, inspect_dataset
+from vla_eval.local import build_local_rsync_argv, resolve_local_source_directory
+from vla_eval.remote import (
+    build_rsync_argv,
+    normalize_remote_relative_path,
+    validate_remote_source_files,
+    validate_staging_path,
+)
+
+CONNECTING: Final = "CONNECTING"
+TRANSFERRING: Final = "TRANSFERRING"
+VERIFYING: Final = "VERIFYING"
+PREFLIGHT: Final = "PREFLIGHT"
+READY: Final = "READY"
+FAILED: Final = "FAILED"
+IMPORT_STATE_ORDER: Final = (CONNECTING, TRANSFERRING, VERIFYING, PREFLIGHT, READY)
+
+_PERCENT_ONLY_PATTERN = re.compile(r"\s*(\d{1,3})%\s*\Z")
+_PROGRESS2_PATTERN = re.compile(r"\s*[\d,.]+\s+(\d{1,3})%\s+[\d,.]+\s*[A-Za-z]+/s(?:\s+.*)?\s*\Z")
+_BEARER_CREDENTIAL_PATTERN = re.compile(r"(?i)(?:\bauthorization\s*:\s*)?\bbearer\s+\S+")
+_SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)\b(api[-_]?key|password|passwd|secret|token|credential)\b"
+    r"(\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|\S+)"
+)
+_MAX_TAIL_LINES = 200
+_MAX_TAIL_LINE_LENGTH = 500
+_MAX_VALIDATION_ERRORS = 8
+_MAX_VALIDATION_ERROR_LENGTH = 240
+_PROCESS_WAIT_SECONDS = 2.0
+_PROCESS_POLL_SECONDS = 0.1
+_MAX_PENDING_OUTPUT = 8192
+_PENDING_OVERLAP = 512
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+_RENAME_EXCL = 0x00000004
+
+StateCallback = Callable[[str], None]
+ProgressCallback = Callable[[float], None]
+CancellationCallback = Callable[[], bool]
+Transfer = Callable[[Sequence[str], ProgressCallback], None]
+Inspector = Callable[[Path], DatasetInspection]
+
+
+def _ignore_state(_state: str) -> None:
+    return None
+
+
+def _ignore_progress(_progress: float) -> None:
+    return None
+
+
+def _not_cancelled() -> bool:
+    return False
+
+
+def _ignore_pending_size(_size: int) -> None:
+    return None
+
+
+@dataclass(frozen=True)
+class ImportCallbacks:
+    on_state: StateCallback = _ignore_state
+    on_progress: ProgressCallback = _ignore_progress
+    is_cancelled: CancellationCallback = _not_cancelled
+
+
+class _ProgressReporter:
+    def __init__(self, callbacks: ImportCallbacks) -> None:
+        self.callbacks = callbacks
+        self.last_progress = 0.0
+
+    def poll(self) -> None:
+        if self.callbacks.is_cancelled():
+            raise TransferError("import cancelled")
+
+    def __call__(self, value: float) -> None:
+        self.poll()
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            numeric = self.last_progress
+        self.last_progress = max(
+            self.last_progress,
+            min(100.0, max(0.0, numeric)),
+        )
+        self.callbacks.on_progress(self.last_progress)
+
+
+@dataclass(frozen=True)
+class ImportSpec:
+    job_id: str
+    source_name: str
+    remote_root: str
+    remote_relative_path: str
+    staging_path: Path
+    target_path: Path
+    mode: Literal["injected", "production"] = "injected"
+    source: RemoteSource | None = None
+    local_source: LocalSource | None = None
+    trusted_credentials_root: Path | None = None
+    trusted_staging_root: Path | None = None
+    trusted_inbox_root: Path | None = None
+
+
+@dataclass(frozen=True)
+class ImportResult:
+    dataset_path: Path
+    inspection: DatasetInspection
+
+
+class TransferError(RuntimeError):
+    """A retryable transfer failure with bounded, sanitized diagnostic output."""
+
+    def __init__(self, message: str, safe_tail: Sequence[str] = ()) -> None:
+        super().__init__(_sanitize_text(message))
+        self.safe_tail = tuple(_sanitize_text(line) for line in safe_tail)[-_MAX_TAIL_LINES:]
+
+
+class DatasetValidationError(RuntimeError):
+    """A non-retryable dataset preflight failure."""
+
+    def __init__(self, errors: Sequence[str]) -> None:
+        bounded = tuple(
+            _sanitize_text(str(error))[:_MAX_VALIDATION_ERROR_LENGTH]
+            for error in errors[:_MAX_VALIDATION_ERRORS]
+        )
+        if not bounded:
+            bounded = ("dataset did not pass preflight validation",)
+        self.errors = bounded
+        super().__init__("; ".join(bounded))
+
+
+_DEFAULT_INSPECTOR = object()
+_DEFAULT_CALLBACKS = ImportCallbacks()
+
+
+def _sanitize_text(value: str, secrets: Sequence[str] = ()) -> str:
+    sanitized = "".join(
+        character
+        for character in str(value)
+        if unicodedata.category(character) not in {"Cc", "Cf", "Cs"}
+    )
+    for secret in sorted((secret for secret in secrets if secret), key=len, reverse=True):
+        sanitized = sanitized.replace(secret, "[redacted]")
+    sanitized = _BEARER_CREDENTIAL_PATTERN.sub("[redacted bearer credential]", sanitized)
+    sanitized = _SENSITIVE_ASSIGNMENT_PATTERN.sub(r"\1\2[redacted]", sanitized)
+    return sanitized[:_MAX_TAIL_LINE_LENGTH]
+
+
+def _secret_path_variants(value: str) -> set[str]:
+    variants = {value}
+    without_separator = value.rstrip("/\\")
+    if without_separator:
+        variants.update({without_separator, f"{without_separator}/"})
+    if value.startswith("/"):
+        normalized = os.path.normpath(without_separator or value)
+        variants.update({normalized, f"{normalized}/"})
+    return variants
+
+
+def _argv_secrets(argv: Sequence[str]) -> tuple[str, ...]:
+    secrets: set[str] = set()
+    for argument in argv:
+        if len(argument) > 4:
+            secrets.update(_secret_path_variants(argument))
+        try:
+            tokens = shlex.split(argument)
+        except ValueError:
+            tokens = []
+        for index, token in enumerate(tokens):
+            if token == "-i" and index + 1 < len(tokens):
+                secrets.update(_secret_path_variants(tokens[index + 1]))
+            if token.startswith("UserKnownHostsFile="):
+                secrets.update(_secret_path_variants(token.partition("=")[2]))
+            if token.startswith("/"):
+                secrets.update(_secret_path_variants(token))
+    return tuple(secrets)
+
+
+def _terminate_process(process: subprocess.Popen[str]) -> list[Exception]:
+    errors: list[Exception] = []
+    try:
+        process.terminate()
+    except Exception as error:  # noqa: BLE001 - aggregate arbitrary cleanup failures
+        errors.append(error)
+    try:
+        process.wait(timeout=_PROCESS_WAIT_SECONDS)
+        return errors
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception as error:  # noqa: BLE001 - cleanup must continue through kill
+        errors.append(error)
+    try:
+        process.kill()
+    except Exception as error:  # noqa: BLE001 - aggregate arbitrary cleanup failures
+        errors.append(error)
+    try:
+        process.wait(timeout=_PROCESS_WAIT_SECONDS)
+    except Exception as error:  # noqa: BLE001 - aggregate arbitrary cleanup failures
+        errors.append(error)
+    return errors
+
+
+def _normalize_argv(argv: Sequence[str]) -> list[str]:
+    if isinstance(argv, (str, bytes)):
+        raise TransferError("rsync argv must be a nonempty sequence of strings")
+    try:
+        normalized = list(argv)
+    except (TypeError, ValueError) as error:
+        raise TransferError("rsync argv must be a nonempty sequence of strings") from error
+    if not normalized:
+        raise TransferError("rsync argv must be a nonempty sequence of strings")
+    for argument in normalized:
+        if not isinstance(argument, str) or not argument:
+            raise TransferError("rsync argv entries must be nonempty strings")
+        if any(unicodedata.category(character) in {"Cc", "Cf", "Cs"} for character in argument):
+            raise TransferError("rsync argv entries must not contain control characters")
+    return normalized
+
+
+def _fallback_stream(
+    output: object,
+    descriptor: int,
+    feed_text: Callable[[str], None],
+    on_poll: Callable[[], None],
+) -> None:
+    try:
+        os.set_blocking(descriptor, False)
+    except (AttributeError, OSError, ValueError) as error:
+        raise TransferError("rsync output pipe does not support safe polling") from error
+    encoding = getattr(output, "encoding", None) or "utf-8"
+    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+    next_poll = time.monotonic() + _PROCESS_POLL_SECONDS
+    while True:
+        now = time.monotonic()
+        if now >= next_poll:
+            on_poll()
+            next_poll = time.monotonic() + _PROCESS_POLL_SECONDS
+        try:
+            chunk = os.read(descriptor, 4096)
+        except BlockingIOError:
+            sleep_seconds = max(0.0, next_poll - time.monotonic())
+            if sleep_seconds:
+                time.sleep(sleep_seconds)
+            continue
+        except InterruptedError:
+            continue
+        if not chunk:
+            feed_text(decoder.decode(b"", final=True))
+            return
+        feed_text(decoder.decode(chunk))
+
+
+def _selector_stream(
+    output: object,
+    descriptor: int,
+    feed_text: Callable[[str], None],
+    on_poll: Callable[[], None],
+) -> None:
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(descriptor, selectors.EVENT_READ)
+    except (KeyError, OSError, ValueError):
+        selector.close()
+        _fallback_stream(output, descriptor, feed_text, on_poll)
+        return
+    encoding = getattr(output, "encoding", None) or "utf-8"
+    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+    primary: BaseException | None = None
+    next_poll = time.monotonic() + _PROCESS_POLL_SECONDS
+    try:
+        while True:
+            timeout = max(0.0, next_poll - time.monotonic())
+            events = selector.select(timeout)
+            if not events:
+                on_poll()
+                next_poll = time.monotonic() + _PROCESS_POLL_SECONDS
+                continue
+            if time.monotonic() >= next_poll:
+                on_poll()
+                next_poll = time.monotonic() + _PROCESS_POLL_SECONDS
+            chunk = os.read(descriptor, 4096)
+            if not chunk:
+                break
+            feed_text(decoder.decode(chunk))
+        feed_text(decoder.decode(b"", final=True))
+    except BaseException as error:  # noqa: BLE001 - preserve interrupts during cleanup
+        primary = error
+    try:
+        selector.close()
+    except Exception as close_error:
+        if primary is not None:
+            raise BaseExceptionGroup(
+                "streaming and selector cleanup both failed",
+                [primary, close_error],
+            ) from primary
+        raise
+    if primary is not None:
+        raise primary
+
+
+def _wait_for_exit(
+    process: subprocess.Popen[str],
+    on_poll: Callable[[], None],
+) -> int:
+    while True:
+        try:
+            return process.wait(timeout=_PROCESS_POLL_SECONDS)
+        except subprocess.TimeoutExpired:
+            on_poll()
+
+
+def run_rsync(
+    argv: Sequence[str],
+    on_progress: ProgressCallback,
+    *,
+    on_poll: Callable[[], None] | None = None,
+    on_pending_size: Callable[[int], None] | None = None,
+) -> None:
+    """Run one argv-only rsync process and stream progress2 updates."""
+    normalized_argv = _normalize_argv(argv)
+    secrets = _argv_secrets(normalized_argv)
+    try:
+        process = subprocess.Popen(
+            normalized_argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            shell=False,
+        )
+    except FileNotFoundError as error:
+        raise TransferError("rsync executable was not found; install rsync and retry") from error
+    except PermissionError as error:
+        raise TransferError("rsync could not be started due to a permission error") from error
+    except (OSError, ValueError, TypeError, IndexError) as error:
+        raise TransferError("rsync could not be started") from error
+
+    output = process.stdout
+    if output is None:
+        cleanup_errors = _terminate_process(process)
+        failure = TransferError("rsync output pipe was unavailable")
+        if cleanup_errors:
+            raise ExceptionGroup(
+                "rsync output setup and process cleanup both failed",
+                [failure, *cleanup_errors],
+            ) from failure
+        raise failure
+
+    tail: deque[str] = deque(maxlen=_MAX_TAIL_LINES)
+    pending = ""
+    pending_was_truncated = False
+    last_progress = 0.0
+    poll_callback = on_poll if on_poll is not None else getattr(on_progress, "poll", _not_cancelled)
+    pending_size_callback = on_pending_size or _ignore_pending_size
+
+    def consume_record(record: str, *, parse_progress: bool = True) -> None:
+        nonlocal last_progress
+        if record:
+            tail.append(_sanitize_text(record, secrets))
+        if not parse_progress or "|" in record:
+            return
+        match = _PERCENT_ONLY_PATTERN.fullmatch(record)
+        if match is None:
+            match = _PROGRESS2_PATTERN.fullmatch(record)
+        if match is None:
+            return
+        value = min(100.0, max(0.0, float(match.group(1))))
+        last_progress = max(last_progress, value)
+        on_progress(last_progress)
+
+    def feed_text(chunk: str) -> None:
+        nonlocal pending, pending_was_truncated
+        records = re.split(r"[\r\n]", pending + chunk)
+        for index, record in enumerate(records[:-1]):
+            if index == 0 and pending_was_truncated:
+                pending_was_truncated = False
+            else:
+                consume_record(record)
+        pending = records[-1]
+        if len(pending) > _MAX_PENDING_OUTPUT:
+            if not pending_was_truncated:
+                tail.append("[truncated newline-free output]")
+            pending_was_truncated = True
+            pending = pending[-_PENDING_OVERLAP:]
+        pending_size_callback(len(pending))
+
+    try:
+        try:
+            descriptor = output.fileno()
+        except (AttributeError, OSError, TypeError, ValueError) as error:
+            raise TransferError(
+                "rsync output pipe does not expose a pollable descriptor"
+            ) from error
+        else:
+            _selector_stream(output, descriptor, feed_text, poll_callback)
+        if not pending_was_truncated:
+            consume_record(pending)
+        returncode = _wait_for_exit(process, poll_callback)
+    except BaseException as primary:
+        cleanup_errors = _terminate_process(process)
+        try:
+            output.close()
+        except Exception as close_error:  # noqa: BLE001 - aggregate cleanup with primary
+            cleanup_errors.append(close_error)
+        if cleanup_errors:
+            raise BaseExceptionGroup(
+                "rsync execution and cleanup both failed",
+                [primary, *cleanup_errors],
+            ) from primary
+        raise
+    try:
+        output.close()
+    except Exception as close_error:
+        raise TransferError("rsync output cleanup failed") from close_error
+
+    if returncode != 0:
+        raise TransferError(f"rsync exited with status {returncode}", tuple(tail))
+
+
+_DEFAULT_RUN_RSYNC = run_rsync
+
+
+def _absolute_path(value: Path, field_name: str) -> Path:
+    try:
+        path = Path(value)
+    except TypeError as error:
+        raise ValueError(f"{field_name} must be a filesystem path") from error
+    if not path.is_absolute():
+        raise ValueError(f"{field_name} must be absolute")
+    if ".." in path.parts:
+        raise ValueError(f"{field_name} must not contain '..' components")
+    return Path(os.path.abspath(path))
+
+
+def _is_contained(candidate: Path, root: Path) -> bool:
+    return candidate == root or root in candidate.parents
+
+
+def _path_components(path: Path) -> list[Path]:
+    current = Path(path.anchor)
+    components = [current]
+    for part in path.parts[1:]:
+        current /= part
+        components.append(current)
+    return components
+
+
+def _validate_no_symlink_directory(path: Path, field_name: str) -> None:
+    for component in _path_components(path):
+        try:
+            component_stat = os.lstat(component)
+        except OSError as error:
+            raise ValueError(f"{field_name} must be an existing directory") from error
+        if stat.S_ISLNK(component_stat.st_mode):
+            raise ValueError(f"{field_name} must not contain symlink components")
+    if not path.is_dir():
+        raise ValueError(f"{field_name} must be an existing directory")
+
+
+def _validate_protected_directory(
+    path: Path, field_name: str, *, required_access: int = os.W_OK | os.X_OK
+) -> None:
+    for component in _path_components(path):
+        component_stat = os.lstat(component)
+        if stat.S_ISLNK(component_stat.st_mode):
+            raise ValueError(f"{field_name} must not contain symlink components")
+        if not stat.S_ISDIR(component_stat.st_mode):
+            raise ValueError(f"{field_name} components must be directories")
+        if component_stat.st_uid not in {0, os.geteuid()}:
+            raise ValueError(f"{field_name} must be owned by root or the service user")
+        if component_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise ValueError(f"{field_name} must not be group or other writable")
+    if not os.access(path, required_access):
+        raise ValueError(f"{field_name} has insufficient service access")
+
+
+def validate_trusted_directory(path: Path, field_name: str) -> Path:
+    """Validate an existing service-owned directory and all of its ancestors."""
+    candidate = _absolute_path(path, field_name)
+    _validate_protected_directory(candidate, field_name)
+    return candidate
+
+
+def validate_trusted_readable_directory(path: Path, field_name: str) -> Path:
+    """Validate a protected directory that only needs read/search access."""
+    candidate = _absolute_path(path, field_name)
+    _validate_protected_directory(candidate, field_name, required_access=os.R_OK | os.X_OK)
+    return candidate
+
+
+def validate_published_target(target: Path, trusted_inbox_root: Path) -> Path:
+    """Validate a published dataset path without following untrusted ancestors."""
+    root = _absolute_path(trusted_inbox_root, "trusted inbox root")
+    candidate = _absolute_path(target, "published dataset target")
+    if candidate == root or not _is_contained(candidate, root):
+        raise ValueError("published dataset target must be within the trusted inbox root")
+
+    _validate_protected_directory(root, "trusted inbox root")
+    for component in _path_components(candidate)[len(_path_components(root)) :]:
+        try:
+            component_stat = os.lstat(component)
+        except OSError as error:
+            raise ValueError("published dataset target must be an existing directory") from error
+        if stat.S_ISLNK(component_stat.st_mode):
+            if component == candidate:
+                raise ValueError("published dataset target must not be a symbolic link")
+            raise ValueError("published dataset target must not contain symlink components")
+        if not stat.S_ISDIR(component_stat.st_mode):
+            raise ValueError("published dataset target components must be directories")
+        if component_stat.st_uid not in {0, os.geteuid()}:
+            raise ValueError("published dataset target must be owned by root or the service user")
+        if component_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise ValueError("published dataset target must not be group or other writable")
+
+    resolved_root = root.resolve(strict=True)
+    resolved_candidate = candidate.resolve(strict=True)
+    if not _is_contained(resolved_candidate, resolved_root):
+        raise ValueError("published dataset target escaped the trusted inbox root")
+    return candidate
+
+
+def _create_under_root(destination: Path, root: Path, field_name: str) -> None:
+    if not _is_contained(destination, root):
+        raise ValueError(f"{field_name} must be within its trusted root")
+    _validate_protected_directory(root, f"trusted {field_name} root")
+    current = root
+    for part in destination.relative_to(root).parts:
+        current /= part
+        try:
+            current.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        component_stat = os.lstat(current)
+        if stat.S_ISLNK(component_stat.st_mode) or not stat.S_ISDIR(component_stat.st_mode):
+            raise ValueError(f"{field_name} must contain only directories")
+    _validate_protected_directory(destination, field_name)
+
+
+def _raise_rename_error(destination: Path) -> None:
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(
+            error_number,
+            "import target already exists",
+            destination,
+        )
+    if error_number in {errno.ENOSYS, errno.ENOTSUP}:
+        raise OSError(
+            error_number,
+            "atomic no-replace rename is unavailable on this platform",
+            destination,
+        )
+    raise OSError(error_number, os.strerror(error_number), destination)
+
+
+def _rename_no_replace(source: Path, destination: Path) -> None:
+    """Atomically rename without replacing an existing destination."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    encoded_source = os.fsencode(source)
+    encoded_destination = os.fsencode(destination)
+    if sys.platform.startswith("linux"):
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "atomic no-replace rename requires Linux renameat2",
+                destination,
+            )
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            _AT_FDCWD,
+            encoded_source,
+            _AT_FDCWD,
+            encoded_destination,
+            _RENAME_NOREPLACE,
+        )
+    elif sys.platform == "darwin":
+        renamex_np = getattr(libc, "renamex_np", None)
+        if renamex_np is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "atomic no-replace rename requires macOS renamex_np",
+                destination,
+            )
+        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex_np.restype = ctypes.c_int
+        result = renamex_np(encoded_source, encoded_destination, _RENAME_EXCL)
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            "atomic no-replace rename is not supported on this platform",
+            destination,
+        )
+    if result != 0:
+        _raise_rename_error(destination)
+
+
+def _ensure_safe_injected_directory(path: Path, field_name: str) -> None:
+    path = _absolute_path(path, field_name)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path.anchor, flags)
+    try:
+        for part in path.parts[1:]:
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+            try:
+                child_descriptor = os.open(part, flags, dir_fd=descriptor)
+            except OSError as error:
+                raise ValueError(
+                    f"{field_name} must not contain symlink or non-directory components"
+                ) from error
+            os.close(descriptor)
+            descriptor = child_descriptor
+    finally:
+        os.close(descriptor)
+
+
+def _validate_spec(spec: ImportSpec) -> tuple[Path, Path]:
+    if not spec.job_id.strip() or not spec.source_name.strip():
+        raise ValueError("job and source names must not be empty")
+    normalize_remote_relative_path(spec.remote_relative_path)
+    remote_root = PurePosixPath(spec.remote_root)
+    if not remote_root.is_absolute() or str(remote_root) != spec.remote_root:
+        raise ValueError("remote root must be an absolute canonical POSIX path")
+    staging = _absolute_path(spec.staging_path, "staging path")
+    target = _absolute_path(spec.target_path, "target path")
+    if staging == target or _is_contained(target, staging) or _is_contained(staging, target):
+        raise ValueError("staging and target paths must be separate")
+    if target == Path(target.anchor):
+        raise ValueError("filesystem root cannot be an import target")
+    return staging, target
+
+
+def _prepare_paths(spec: ImportSpec, staging: Path, target: Path, production: bool) -> None:
+    if production:
+        assert spec.trusted_staging_root is not None
+        assert spec.trusted_inbox_root is not None
+        staging_root = _absolute_path(spec.trusted_staging_root, "trusted staging root")
+        inbox_root = _absolute_path(spec.trusted_inbox_root, "trusted inbox root")
+        if staging == staging_root:
+            raise ValueError("staging path must be a strict descendant of trusted staging root")
+        _create_under_root(staging, staging_root, "staging path")
+        _create_under_root(target.parent, inbox_root, "inbox path")
+    else:
+        _ensure_safe_injected_directory(staging.parent, "staging parent")
+        _ensure_safe_injected_directory(target.parent, "target parent")
+        _validate_no_symlink_directory(staging.parent, "staging parent")
+        _validate_no_symlink_directory(target.parent, "target parent")
+
+
+def _require_production_context(spec: ImportSpec) -> None:
+    if spec.trusted_staging_root is None or spec.trusted_inbox_root is None:
+        raise ValueError("production trust context requires staging and inbox roots")
+    sources = (spec.source, spec.local_source)
+    if sum(source is not None for source in sources) != 1:
+        raise ValueError("production trust context requires exactly one transport source")
+    if spec.source is not None:
+        if spec.trusted_credentials_root is None:
+            raise ValueError("remote production trust context requires credentials root")
+        if spec.source.name != spec.source_name:
+            raise ValueError("remote source does not match source name")
+    else:
+        assert spec.local_source is not None
+        if spec.trusted_credentials_root is not None:
+            raise ValueError("local production trust context must not include credentials")
+        if spec.local_source.name != spec.source_name:
+            raise ValueError("local source does not match source name")
+
+
+def _is_production_mode(spec: ImportSpec, transfer: Transfer) -> bool:
+    context = (
+        spec.source,
+        spec.local_source,
+        spec.trusted_credentials_root,
+        spec.trusted_staging_root,
+        spec.trusted_inbox_root,
+    )
+    if spec.mode == "production":
+        _require_production_context(spec)
+        return True
+    if spec.mode != "injected":
+        raise ValueError("import mode must be 'injected' or 'production'")
+    if any(value is not None for value in context):
+        raise ValueError("injected mode must not include production context")
+    if transfer is _DEFAULT_RUN_RSYNC or transfer is run_rsync:
+        raise ValueError("injected mode requires an explicit custom transfer")
+    return False
+
+
+def _ensure_target_available(target: Path) -> None:
+    if os.path.lexists(target):
+        raise FileExistsError(f"import target already exists: {target.name}")
+
+
+def _ensure_same_filesystem(staging: Path, target_parent: Path) -> None:
+    if staging.stat().st_dev != target_parent.stat().st_dev:
+        raise OSError("staging and target parent must be on the same filesystem")
+
+
+def _ensure_source_separate(source: Path, staging: Path, target: Path) -> None:
+    for destination in (staging, target):
+        if (
+            source == destination
+            or _is_contained(destination, source)
+            or _is_contained(source, destination)
+        ):
+            raise ValueError("local source, staging, and target paths must be separate")
+
+
+def _verify_staging(spec: ImportSpec, staging: Path, production: bool) -> None:
+    if production:
+        assert spec.trusted_staging_root is not None
+        validate_staging_path(staging, spec.trusted_staging_root)
+    else:
+        _validate_no_symlink_directory(staging, "staging path")
+    if not any(staging.iterdir()):
+        raise TransferError("transfer completed without receiving dataset files")
+
+
+def _verify_target_parent(spec: ImportSpec, target: Path, production: bool) -> None:
+    _ensure_target_available(target)
+    if production:
+        assert spec.trusted_inbox_root is not None
+        root = _absolute_path(spec.trusted_inbox_root, "trusted inbox root")
+        if not _is_contained(target, root):
+            raise ValueError("import target must be within trusted inbox root")
+        _validate_protected_directory(target.parent, "target parent")
+        resolved_root = root.resolve(strict=True)
+        resolved_parent = target.parent.resolve(strict=True)
+        if not _is_contained(resolved_parent, resolved_root):
+            raise ValueError("resolved import target must be within trusted inbox root")
+    else:
+        _validate_no_symlink_directory(target.parent, "target parent")
+
+
+def _emit_state(callbacks: ImportCallbacks, state: str) -> None:
+    if callbacks.is_cancelled():
+        raise TransferError("import cancelled")
+    callbacks.on_state(state)
+
+
+def _verify_published_target(spec: ImportSpec, target: Path, production: bool) -> None:
+    if not target.exists():
+        raise OSError("published dataset target is missing")
+    if production:
+        assert spec.trusted_inbox_root is not None
+        validate_published_target(target, spec.trusted_inbox_root)
+
+
+def _publish_and_report_ready(
+    spec: ImportSpec,
+    staging: Path,
+    target: Path,
+    production: bool,
+    callbacks: ImportCallbacks,
+) -> None:
+    _rename_no_replace(staging, target)
+    try:
+        _verify_published_target(spec, target, production)
+        callbacks.on_state(READY)
+    except BaseException as publish_error:
+        try:
+            _rename_no_replace(target, staging)
+        except BaseException as rollback_error:  # noqa: BLE001 - preserve rollback failures
+            raise BaseExceptionGroup(
+                "dataset publication and rollback both failed",
+                [publish_error, rollback_error],
+            ) from publish_error
+        raise
+
+
+def execute_import(
+    spec: ImportSpec,
+    *,
+    transfer: Transfer = run_rsync,
+    inspector: Inspector | object = _DEFAULT_INSPECTOR,
+    callbacks: ImportCallbacks = _DEFAULT_CALLBACKS,
+) -> ImportResult:
+    """Transfer, preflight, and atomically publish one remote dataset."""
+    if not callable(transfer):
+        raise TypeError("transfer must be callable")
+    if inspector is not _DEFAULT_INSPECTOR and not callable(inspector):
+        raise TypeError("inspector must be callable")
+
+    production = False
+    failure_callback_needed = False
+    injected_transfer_started = False
+    try:
+        production = _is_production_mode(spec, transfer)
+        staging, target = _validate_spec(spec)
+        _emit_state(callbacks, CONNECTING)
+        failure_callback_needed = True
+        _prepare_paths(spec, staging, target, production)
+        _verify_target_parent(spec, target, production)
+        filesystem_probe = staging if staging.exists() else staging.parent
+        _ensure_same_filesystem(filesystem_probe, target.parent)
+
+        _emit_state(callbacks, TRANSFERRING)
+        if production:
+            assert spec.trusted_staging_root is not None
+            if spec.source is not None:
+                assert spec.trusted_credentials_root is not None
+                validate_remote_source_files(
+                    spec.source,
+                    trusted_credentials_root=spec.trusted_credentials_root,
+                )
+                validate_staging_path(staging, spec.trusted_staging_root)
+                argv = build_rsync_argv(
+                    spec.source,
+                    spec.remote_root,
+                    spec.remote_relative_path,
+                    staging,
+                    trusted_staging_root=spec.trusted_staging_root,
+                )
+            else:
+                assert spec.local_source is not None
+                validate_staging_path(staging, spec.trusted_staging_root)
+                local_source_path = resolve_local_source_directory(
+                    spec.local_source,
+                    spec.remote_root,
+                    spec.remote_relative_path,
+                )
+                _ensure_source_separate(local_source_path, staging, target)
+                argv = build_local_rsync_argv(local_source_path, staging)
+        else:
+            argv = []
+
+        report_progress = _ProgressReporter(callbacks)
+        injected_transfer_started = not production
+        transfer(argv, report_progress)
+        _emit_state(callbacks, VERIFYING)
+        _verify_staging(spec, staging, production)
+        _verify_target_parent(spec, target, production)
+
+        _emit_state(callbacks, PREFLIGHT)
+        if inspector is _DEFAULT_INSPECTOR:
+            inspection = inspect_dataset(staging, allowed_root=staging)
+        else:
+            inspection = inspector(staging)
+        if not inspection.ready:
+            raise DatasetValidationError(inspection.errors)
+
+        _verify_staging(spec, staging, production)
+        _verify_target_parent(spec, target, production)
+        _ensure_same_filesystem(staging, target.parent)
+        report_progress.poll()
+        _publish_and_report_ready(spec, staging, target, production, callbacks)
+        failure_callback_needed = False
+        return ImportResult(dataset_path=target, inspection=inspection)
+    except BaseException as original:
+        if not production and injected_transfer_started and not os.path.lexists(spec.target_path):
+            staging_path = Path(spec.staging_path)
+            if staging_path.is_absolute() and not os.path.lexists(staging_path):
+                try:
+                    _ensure_safe_injected_directory(staging_path, "staging path")
+                except (OSError, ValueError) as placeholder_error:
+                    original.add_note(f"staging placeholder was not created: {placeholder_error}")
+        if failure_callback_needed:
+            try:
+                callbacks.on_state(FAILED)
+            except Exception as failed_callback_error:  # noqa: BLE001 - preserve both callbacks
+                raise BaseExceptionGroup(
+                    "import and FAILED callback both failed",
+                    [original, failed_callback_error],
+                ) from original
+        raise

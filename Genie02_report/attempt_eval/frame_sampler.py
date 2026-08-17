@@ -1,9 +1,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
-import cv2
-from PIL import Image
+
+class SamplingDependencyError(RuntimeError):
+    """Raised when no required video/image backend can be imported."""
+
+
+def _pillow_image() -> Any:
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise SamplingDependencyError("Pillow image backend is unavailable") from exc
+    return Image
 
 
 def _sample_times(start: float, end: float, interval: float, max_frames: int) -> list[float]:
@@ -32,12 +42,13 @@ def _sample_times(start: float, end: float, interval: float, max_frames: int) ->
     return times
 
 
-def _resize(image: Image.Image, max_image_size: int) -> Image.Image:
+def _resize(image: Any, max_image_size: int) -> Any:
+    image_module = _pillow_image()
     width, height = image.size
     scale = min(1.0, max_image_size / max(width, height))
     if scale >= 1.0:
         return image
-    return image.resize((int(width * scale), int(height * scale)), Image.Resampling.LANCZOS)
+    return image.resize((int(width * scale), int(height * scale)), image_module.Resampling.LANCZOS)
 
 
 def _dense_start(from_timestamp: float, to_timestamp: float, dense_region: str) -> float:
@@ -58,6 +69,7 @@ def _sample_episode_frames_with_pyav(
     max_frames: int,
     max_image_size: int,
 ) -> list[tuple[Path, float]]:
+    _pillow_image()
     import av
 
     target_times = _sample_times(from_timestamp, to_timestamp, sample_interval, max_frames)
@@ -88,6 +100,12 @@ def _sample_episode_frames_with_cv2(
     max_frames: int,
     max_image_size: int,
 ) -> list[tuple[Path, float]]:
+    try:
+        import cv2
+    except ImportError as exc:
+        raise SamplingDependencyError("OpenCV video decoder is unavailable") from exc
+
+    image_module = _pillow_image()
     cap = cv2.VideoCapture(str(video_file))
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_file}")
@@ -100,7 +118,7 @@ def _sample_episode_frames_with_cv2(
             if not ok:
                 continue
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            image = _resize(Image.fromarray(frame), max_image_size)
+            image = _resize(image_module.fromarray(frame), max_image_size)
             out = output_dir / f"frame_{len(saved):03d}.jpg"
             image.save(out, quality=92)
             saved.append((out, timestamp))
@@ -119,6 +137,7 @@ def _sample_one_region(
     max_image_size: int,
 ) -> list[tuple[Path, float]]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    pyav_missing = False
     try:
         saved = _sample_episode_frames_with_pyav(
             video_file,
@@ -132,20 +151,31 @@ def _sample_one_region(
         if saved:
             return saved
     except ImportError:
+        pyav_missing = True
+    except SamplingDependencyError:
+        raise
+    except Exception:  # noqa: BLE001, S110 - OpenCV is the fallback for PyAV decode errors.
         pass
-    except Exception:
-        pass
-    saved = _sample_episode_frames_with_cv2(
-        video_file,
-        output_dir,
-        from_timestamp,
-        to_timestamp,
-        sample_interval,
-        max_frames,
-        max_image_size,
-    )
+    try:
+        saved = _sample_episode_frames_with_cv2(
+            video_file,
+            output_dir,
+            from_timestamp,
+            to_timestamp,
+            sample_interval,
+            max_frames,
+            max_image_size,
+        )
+    except SamplingDependencyError as exc:
+        if pyav_missing:
+            raise SamplingDependencyError(
+                "No supported video decoder is available; install PyAV or OpenCV with Pillow"
+            ) from exc
+        raise
     if saved:
         return saved
+    if pyav_missing:
+        return []
     return _sample_episode_frames_with_pyav(
         video_file,
         output_dir,
@@ -196,7 +226,8 @@ def sample_episode_frames(
         max_image_size,
     )
     return _split_samples(
-        [("global", *item) for item in global_samples] + [("dense", *item) for item in dense_samples],
+        [("global", *item) for item in global_samples]
+        + [("dense", *item) for item in dense_samples],
         from_timestamp,
         output_dir,
     )

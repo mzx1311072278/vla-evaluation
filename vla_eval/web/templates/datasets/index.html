@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}数据集 | VLA Evaluation{% endblock %}
+{% block content %}
+  <section>
+    <div class="page-heading">
+      <div><p class="eyebrow">数据管理</p><h1>数据集</h1></div>
+      <a class="button" href="/imports/new">导入数据</a>
+    </div>
+    <form class="list-toolbar" method="get" action="/datasets">
+      <label class="toolbar-search" for="dataset-search">关键词
+        <input id="dataset-search" name="q" type="search" value="{{ controls.q }}" placeholder="名称或路径">
+      </label>
+      <label for="dataset-sort">排序
+        <select id="dataset-sort" name="sort">
+          <option value="newest"{% if controls.sort == "newest" %} selected{% endif %}>最新创建</option>
+          <option value="oldest"{% if controls.sort == "oldest" %} selected{% endif %}>最早创建</option>
+          <option value="name_asc"{% if controls.sort == "name_asc" %} selected{% endif %}>名称 A-Z</option>
+          <option value="name_desc"{% if controls.sort == "name_desc" %} selected{% endif %}>名称 Z-A</option>
+        </select>
+      </label>
+      <label class="toolbar-toggle" for="dataset-archived">
+        <input id="dataset-archived" type="checkbox" name="archived" value="1"{% if controls.include_archived %} checked{% endif %}>
+        <span>显示已归档</span>
+      </label>
+      <button type="submit"><i data-lucide="search"></i><span>筛选</span></button>
+      {% if controls.q or controls.sort != "newest" or controls.include_archived %}
+        <a class="clear-filters" href="/datasets"><i data-lucide="x"></i><span>清除</span></a>
+      {% endif %}
+    </form>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>名称</th><th>类型</th><th>状态</th><th>Episode</th><th>大小</th><th class="system-time">导入系统时间</th><th><span class="sr-only">操作</span></th></tr></thead>
+        <tbody>
+          {% for dataset in datasets %}
+            <tr><td class="entity-cell"><a href="/datasets/{{ dataset.id }}">{{ dataset.name }}</a><small class="path">{{ dataset.path }}</small></td>
+              <td>{{ dataset.kind }}</td><td><span class="status status-{{ dataset.status|lower }}">{{ dataset.status }}</span>{% if dataset.status == "ARCHIVED" %}<span class="archive-badge">已归档</span>{% endif %}</td>
+              <td>{{ dataset.episode_count }}</td><td>{{ dataset.size_bytes }} B</td>
+              <td class="system-time">{{ dataset.created_at|beijing_time }}</td>
+              <td><div class="row-actions">
+                <a class="table-action" href="/datasets/{{ dataset.id }}"><i data-lucide="eye"></i><span>查看</span></a>
+                {% if dataset.status == "ARCHIVED" %}
+                  <form class="inline-action-form" method="post" action="/datasets/{{ dataset.id }}/restore">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="return_to" value="{{ current_url }}">
+                    <button class="table-action secondary-button" type="submit" title="恢复数据集"><i data-lucide="archive-restore"></i><span>恢复</span></button>
+                  </form>
+                {% elif dataset.status in ["READY", "PREFLIGHT_FAILED"] %}
+                  <form class="inline-action-form" method="post" action="/datasets/{{ dataset.id }}/archive" onsubmit="return confirm('只从默认列表隐藏，不会删除文件或历史评测。确认归档？')">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="return_to" value="{{ current_url }}">
+                    <button class="table-action secondary-button" type="submit" title="归档数据集"><i data-lucide="archive"></i><span>归档</span></button>
+                  </form>
+                {% endif %}
+              </div></td></tr>
+          {% else %}<tr><td colspan="7" class="empty">暂无数据集</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

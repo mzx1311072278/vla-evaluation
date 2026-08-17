@@ -4,23 +4,38 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 
-from genie02_eval_common import (
-    SCHEMA_VERSION,
-    EvaluationError,
-    finite_float,
-    load_episode_metrics,
-    load_episodes,
-    load_session,
-    parse_session_args,
-    prepare_output_dir,
-    require_session_dir,
-    write_json,
-)
+if __package__:
+    from .genie02_eval_common import (
+        SCHEMA_VERSION,
+        EvaluationError,
+        finite_float,
+        load_episode_metrics,
+        load_episodes,
+        load_session,
+        parse_session_args,
+        prepare_output_dir,
+        require_session_dir,
+        write_json,
+    )
+else:
+    from genie02_eval_common import (
+        SCHEMA_VERSION,
+        EvaluationError,
+        finite_float,
+        load_episode_metrics,
+        load_episodes,
+        load_session,
+        parse_session_args,
+        prepare_output_dir,
+        require_session_dir,
+        write_json,
+    )
 
 
 def _summary(values: list[float]) -> dict[str, Any]:

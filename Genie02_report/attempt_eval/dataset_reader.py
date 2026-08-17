@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
-import re
 
 import pandas as pd
 
@@ -16,6 +16,15 @@ class EpisodeMeta:
     video_file_rel: str
     from_timestamp: float
     to_timestamp: float
+
+
+@dataclass(frozen=True)
+class VideoColumns:
+    episode_index: str
+    length: str
+    file_index: str
+    from_timestamp: str
+    to_timestamp: str
 
 
 def _pick_column(columns: list[str], candidates: list[str], contains: list[str]) -> str:
@@ -33,8 +42,34 @@ def _pick_column(columns: list[str], candidates: list[str], contains: list[str])
     if len(hits) == 1:
         return hits[0]
     if hits:
-        return sorted(hits, key=len)[0]
-    raise ValueError(f"Cannot find column containing {contains}. Available columns:\n- " + "\n- ".join(columns))
+        return min(hits, key=len)
+    raise ValueError(
+        f"Cannot find column containing {contains}. Available columns:\n- " + "\n- ".join(columns)
+    )
+
+
+def resolve_video_columns(columns: list[str], image_key: str) -> VideoColumns:
+    """Resolve every episode/video column accepted by the attempt evaluator."""
+    video_prefix = f"videos/{image_key}"
+    return VideoColumns(
+        episode_index=_pick_column(columns, ["episode_index", "episode_idx"], ["episode"]),
+        length=_pick_column(columns, ["length", "episode_length"], ["length"]),
+        file_index=_pick_column(
+            columns,
+            [f"{video_prefix}/file_index", f"{image_key}/file_index"],
+            [image_key, "file_index"],
+        ),
+        from_timestamp=_pick_column(
+            columns,
+            [f"{video_prefix}/from_timestamp", f"{image_key}/from_timestamp"],
+            [image_key, "from_timestamp"],
+        ),
+        to_timestamp=_pick_column(
+            columns,
+            [f"{video_prefix}/to_timestamp", f"{image_key}/to_timestamp"],
+            [image_key, "to_timestamp"],
+        ),
+    )
 
 
 def _file_index(value: object) -> int:
@@ -84,35 +119,22 @@ def read_episode_metadata(dataset_root: Path, image_key: str) -> list[EpisodeMet
     for column in columns:
         print(f"  - {column}")
 
-    video_prefix = f"videos/{image_key}"
-    episode_col = _pick_column(columns, ["episode_index", "episode_idx"], ["episode"])
-    length_col = _pick_column(columns, ["length", "episode_length"], ["length"])
-    file_col = _pick_column(
-        columns,
-        [f"{video_prefix}/file_index", f"{image_key}/file_index"],
-        [image_key, "file_index"],
-    )
-    from_col = _pick_column(
-        columns,
-        [f"{video_prefix}/from_timestamp", f"{image_key}/from_timestamp"],
-        [image_key, "from_timestamp"],
-    )
-    to_col = _pick_column(
-        columns,
-        [f"{video_prefix}/to_timestamp", f"{image_key}/to_timestamp"],
-        [image_key, "to_timestamp"],
-    )
+    video_columns = resolve_video_columns(columns, image_key)
     success_col = "episode_success" if "episode_success" in columns else None
 
     episodes = []
     for _, row in meta.iterrows():
-        file_index = _file_index(row[file_col])
+        file_index = _file_index(row[video_columns.file_index])
         video_file = _video_path(dataset_root, image_key, str(row["__meta_chunk"]), file_index)
-        success_value = None if success_col is None else str(row[success_col]).strip().lower() == "success"
+        success_value = (
+            None if success_col is None else str(row[success_col]).strip().lower() == "success"
+        )
         episodes.append(
             EpisodeMeta(
-                episode_index=int(row[episode_col]),
-                length=None if pd.isna(row[length_col]) else int(row[length_col]),
+                episode_index=int(row[video_columns.episode_index]),
+                length=(
+                    None if pd.isna(row[video_columns.length]) else int(row[video_columns.length])
+                ),
                 episode_success=success_value,
                 video_file=video_file,
                 video_file_rel=(
@@ -120,8 +142,8 @@ def read_episode_metadata(dataset_root: Path, image_key: str) -> list[EpisodeMet
                     if video_file.is_relative_to(dataset_root)
                     else video_file.as_posix()
                 ),
-                from_timestamp=float(row[from_col]),
-                to_timestamp=float(row[to_col]),
+                from_timestamp=float(row[video_columns.from_timestamp]),
+                to_timestamp=float(row[video_columns.to_timestamp]),
             )
         )
     return sorted(episodes, key=lambda item: item.episode_index)

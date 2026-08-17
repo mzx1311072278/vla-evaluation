@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}评测任务 | VLA Evaluation{% endblock %}
+{% block content %}
+  <section>
+    <div class="page-heading">
+      <div><p class="eyebrow">模型评测</p><h1>评测任务</h1></div>
+    </div>
+    <form class="list-toolbar" method="get" action="/evaluations">
+      {% if dataset_id %}<input type="hidden" name="dataset_id" value="{{ dataset_id }}">{% endif %}
+      <label class="toolbar-search" for="evaluation-search">关键词
+        <input id="evaluation-search" name="q" type="search" value="{{ controls.q }}" placeholder="数据集、配置或任务 ID">
+      </label>
+      <label for="evaluation-state">状态
+        <select id="evaluation-state" name="state">
+          <option value="">全部</option>
+          {% for state in job_states %}<option value="{{ state }}"{% if state == selected_state %} selected{% endif %}>{{ state }}</option>{% endfor %}
+        </select>
+      </label>
+      <label for="evaluation-sort">排序
+        <select id="evaluation-sort" name="sort">
+          <option value="newest"{% if controls.sort == "newest" %} selected{% endif %}>最新创建</option>
+          <option value="oldest"{% if controls.sort == "oldest" %} selected{% endif %}>最早创建</option>
+          <option value="name_asc"{% if controls.sort == "name_asc" %} selected{% endif %}>名称 A-Z</option>
+          <option value="name_desc"{% if controls.sort == "name_desc" %} selected{% endif %}>名称 Z-A</option>
+        </select>
+      </label>
+      <label class="toolbar-toggle" for="evaluation-archived">
+        <input id="evaluation-archived" type="checkbox" name="archived" value="1"{% if controls.include_archived %} checked{% endif %}>
+        <span>显示已归档</span>
+      </label>
+      <button type="submit"><i data-lucide="search"></i><span>筛选</span></button>
+      {% if controls.q or controls.sort != "newest" or controls.include_archived or selected_state or dataset_id %}
+        <a class="clear-filters" href="/evaluations"><i data-lucide="x"></i><span>清除</span></a>
+      {% endif %}
+    </form>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>数据集</th><th>配置</th><th>VLM</th><th>状态</th><th>阶段</th><th>进度</th><th class="system-time">创建时间</th><th><span class="sr-only">操作</span></th></tr></thead>
+        <tbody>
+          {% for job, dataset, job_archive in jobs %}
+            <tr>
+              <td class="entity-cell"><a href="/evaluations/{{ job.id }}">{{ dataset.name }}</a></td>
+              <td>{{ job.profile_name }}</td><td>{{ "已启用" if job.vlm_enabled else "未启用" }}</td>
+              <td><span class="status status-{{ job.state|lower }}">{{ job.state }}</span>{% if job_archive %}<span class="archive-badge">已归档</span>{% endif %}</td>
+              <td>{{ job.stage }}</td><td>{{ "%.0f"|format(job.progress) }}%</td>
+              <td class="system-time">{{ job.created_at|beijing_time }}</td>
+              <td><div class="row-actions">
+                {% if job.state == "SUCCEEDED" %}<a class="table-action" href="/reports/{{ job.id }}"><i data-lucide="file-text"></i><span>报告</span></a>{% else %}<a class="table-action" href="/evaluations/{{ job.id }}"><i data-lucide="eye"></i><span>查看</span></a>{% endif %}
+                {% if job_archive %}
+                  <form class="inline-action-form" method="post" action="/evaluations/{{ job.id }}/restore">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="return_to" value="{{ current_url }}">
+                    <button class="table-action secondary-button" type="submit" title="恢复评测任务"><i data-lucide="archive-restore"></i><span>恢复</span></button>
+                  </form>
+                {% elif job.state in ["SUCCEEDED", "FAILED", "CANCELLED", "INTERRUPTED"] %}
+                  <form class="inline-action-form" method="post" action="/evaluations/{{ job.id }}/archive" onsubmit="return confirm('只从默认列表隐藏，不会删除任务输出或报告。确认归档？')">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="return_to" value="{{ current_url }}">
+                    <button class="table-action secondary-button" type="submit" title="归档评测任务"><i data-lucide="archive"></i><span>归档</span></button>
+                  </form>
+                {% endif %}
+              </div></td>
+            </tr>
+          {% else %}<tr><td colspan="8" class="empty">暂无评测任务</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

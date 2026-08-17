@@ -1,0 +1,46 @@
+# EDIT BEFORE USE.
+#
+# Second VLM interface: instead of loading Qwen2.5-VL locally on a GPU
+# (see genie02-full.yaml, backend: local), this profile calls an
+# OpenAI-compatible vision /chat/completions endpoint. Point base_url at either
+# a cloud provider (e.g. DashScope's compatible mode) or a self-hosted vLLM
+# server that serves Qwen2.5-VL, set `model` to that server's model id, and put
+# the API key in the environment variable named by api_key_env (default
+# VLA_EVAL_VLM_API_KEY). The evaluation worker then needs the `vlm-api` extra
+# (httpx) but NOT torch/CUDA.
+name: genie02-api
+version: 1.0.0
+adapter: genie02
+plugin: genie02-attempt-eval
+image_key: observation.images.right_wrist
+vlm:
+  backend: api
+  prompt_version: genie02-attempt-v1
+  api:
+    base_url: http://vlm-api.example.internal/v1
+    model: qwen2.5-vl-7b-instruct
+    api_key_env: VLA_EVAL_VLM_API_KEY
+    timeout: 60
+    max_retries: 3
+  sampling:
+    max_global_frames: 8
+    global_sample_interval: 2.0
+    max_dense_frames: 8
+    dense_sample_interval: 0.5
+    dense_region: full
+  max_image_size: 336
+  max_new_tokens: 256
+review:
+  mode: manual_review
+  confidence_threshold: 0.7
+  min_episode_duration: 3.0
+  min_sampled_frames: 3
+outputs:
+  required:
+    - episode_metrics.csv
+    - metrics_core.json
+    - report_*.md
+  optional:
+    - smoothness_curve.svg
+    - attempt_eval/attempt_summary.json
+    - attempt_eval/attempt_summary.csv

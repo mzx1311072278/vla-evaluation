@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}{{ dataset.name }} | 数据集{% endblock %}
+{% block content %}
+  <section>
+    <div class="page-heading">
+      <div><p class="eyebrow">数据集</p><h1>{{ dataset.name }}</h1></div>
+      <div class="commands">
+        {% if dataset.status == "READY" %}<a class="button" href="/evaluations/new?dataset_id={{ dataset.id }}">开始评测</a>
+        {% else %}<span class="button disabled" aria-disabled="true">暂不可评测</span>{% endif %}
+        {% if dataset.status == "ARCHIVED" %}
+          <form class="inline-action-form" method="post" action="/datasets/{{ dataset.id }}/restore">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="return_to" value="/datasets/{{ dataset.id }}">
+            <button class="secondary-button" type="submit"><i data-lucide="archive-restore"></i><span>恢复</span></button>
+          </form>
+        {% elif dataset.status in ["READY", "PREFLIGHT_FAILED"] %}
+          <form class="inline-action-form" method="post" action="/datasets/{{ dataset.id }}/archive" onsubmit="return confirm('只从默认列表隐藏，不会删除文件或历史评测。确认归档？')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="return_to" value="/datasets/{{ dataset.id }}">
+            <button class="secondary-button" type="submit"><i data-lucide="archive"></i><span>归档</span></button>
+          </form>
+        {% endif %}
+      </div>
+    </div>
+    <dl class="summary-grid">
+      <div><dt>状态</dt><dd><span class="status status-{{ dataset.status|lower }}">{{ dataset.status }}</span>{% if dataset.status == "ARCHIVED" %}<span class="archive-badge">已归档</span>{% endif %}</dd></div>
+      <div><dt>类型</dt><dd>{{ dataset.kind }}</dd></div>
+      <div><dt>Episode</dt><dd>{{ dataset.episode_count }}</dd></div>
+      <div><dt>大小</dt><dd>{{ dataset.size_bytes }} B</dd></div>
+      <div><dt>导入系统时间</dt><dd>{{ dataset.created_at|beijing_time }}</dd></div>
+      <div><dt>最后更新时间</dt><dd>{{ dataset.updated_at|beijing_time }}</dd></div>
+      {% if dataset_archived_at %}<div><dt>归档时间</dt><dd>{{ dataset_archived_at|beijing_time }}</dd></div>{% endif %}
+    </dl>
+    <section class="detail-band">
+      <h2>存储路径</h2>
+      <div class="path-row"><code class="path">{{ dataset.path }}</code><button class="icon-button" type="button" data-copy="{{ dataset.path }}" title="复制路径" aria-label="复制路径"><i data-lucide="copy"></i></button></div>
+    </section>
+    <section class="detail-band">
+      <h2>预检摘要</h2>
+      {% set errors = dataset.inspection_json.get('errors', []) %}
+      {% if errors %}<ul class="error-list">{% for error in errors %}<li>{{ error }}</li>{% endfor %}</ul>
+      {% else %}<p class="muted">未发现预检问题。</p>{% endif %}
+    </section>
+    <section class="detail-band">
+      <h2>附件</h2>
+      <form method="post" action="/datasets/{{ dataset.id }}/attachments" enctype="multipart/form-data" class="attachment-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label for="attachment">选择附件<input id="attachment" name="file" type="file" accept=".json,.yaml,.yml,.csv" required></label>
+        <button type="submit">上传附件</button>
+      </form>
+    </section>
+    <section class="detail-band">
+      <div class="section-heading"><h2>最近评测</h2><a href="/evaluations?dataset_id={{ dataset.id }}">查看全部</a></div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>配置</th><th>状态</th><th>阶段</th><th>进度</th><th><span class="sr-only">操作</span></th></tr></thead>
+          <tbody>
+            {% for job in recent_evaluations %}
+              <tr>
+                <td><a href="/evaluations/{{ job.id }}">{{ job.profile_name }}</a><small>{{ job.created_at|beijing_time }}</small></td>
+                <td><span class="status status-{{ job.state|lower }}">{{ job.state }}</span></td>
+                <td>{{ job.stage }}</td><td>{{ "%.0f"|format(job.progress) }}%</td>
+                <td><a href="/evaluations/{{ job.id }}">查看</a></td>
+              </tr>
+            {% else %}<tr><td colspan="5" class="empty">暂无评测任务</td></tr>{% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </section>
+{% endblock %}

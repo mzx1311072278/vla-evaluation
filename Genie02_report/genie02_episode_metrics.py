@@ -1,17 +1,44 @@
 #!/usr/bin/env python3
 """根据 Genie02 A 侧数据生成 episode_metrics.csv。"""
+
 from __future__ import annotations
+
 import csv
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
+
 import numpy as np
-from genie02_eval_common import EPISODE_METRIC_FIELDS, EvaluationError, finite_float
-from genie02_eval_common import load_episodes, load_session, parse_session_args
-from genie02_eval_common import read_json, resolve_path
-from genie02_eval_common import prepare_output_dir, require_session_dir
+
+if __package__:
+    from .genie02_eval_common import (
+        EPISODE_METRIC_FIELDS,
+        EvaluationError,
+        finite_float,
+        load_episodes,
+        load_session,
+        parse_session_args,
+        prepare_output_dir,
+        read_json,
+        require_session_dir,
+        resolve_path,
+    )
+else:
+    from genie02_eval_common import (
+        EPISODE_METRIC_FIELDS,
+        EvaluationError,
+        finite_float,
+        load_episodes,
+        load_session,
+        parse_session_args,
+        prepare_output_dir,
+        read_json,
+        require_session_dir,
+        resolve_path,
+    )
 TIME_KEYS = ("smooth_send_t", "sent_t", "timestamp")
 VALUE_TIME_KEYS = (
     ("smooth_send_y", "smooth_send_t"),
@@ -49,7 +76,7 @@ def _trajectory_directories(session: dict[str, Any], session_dir: Path) -> list[
             unique.append(path)
     return unique
 
-@lru_cache(maxsize=None)
+@cache
 def _action_names_for_path(path: Path) -> list[str]:
     """读取轨迹目录 meta.json 中的 action_names；不存在时返回空列表。"""
     meta_path = path.parent / "meta.json"
@@ -59,7 +86,7 @@ def _action_names_for_path(path: Path) -> list[str]:
     names = meta.get("action_names", [])
     return [name for name in names if isinstance(name, str)]
 
-@lru_cache(maxsize=None)
+@cache
 def _lerobot_action_names_for_path(path: Path, key: str) -> list[str]:
     """读取 LeRobot meta/info.json 中的向量列名。"""
     root = path.parents[2] if len(path.parents) >= 3 else path.parent

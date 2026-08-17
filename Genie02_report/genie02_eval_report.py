@@ -8,18 +8,30 @@ defined by ``Genie02 真机评测指标与行动计划``.
 from __future__ import annotations
 
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
-from genie02_episode_metrics import generate_episode_metrics
-from genie02_eval_common import (
-    EvaluationError,
-    parse_session_args,
-    prepare_output_dir,
-    require_session_dir,
-)
-from genie02_markdown_report import generate_markdown_report
-from genie02_metrics_core import generate_metrics_core
+if __package__:
+    from .genie02_episode_metrics import generate_episode_metrics
+    from .genie02_eval_common import (
+        EvaluationError,
+        parse_session_args,
+        prepare_output_dir,
+        require_session_dir,
+    )
+    from .genie02_markdown_report import generate_markdown_report
+    from .genie02_metrics_core import generate_metrics_core
+else:
+    from genie02_episode_metrics import generate_episode_metrics
+    from genie02_eval_common import (
+        EvaluationError,
+        parse_session_args,
+        prepare_output_dir,
+        require_session_dir,
+    )
+    from genie02_markdown_report import generate_markdown_report
+    from genie02_metrics_core import generate_metrics_core
 
 
 def generate_report(
