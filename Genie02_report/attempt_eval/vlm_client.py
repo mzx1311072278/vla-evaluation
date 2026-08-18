@@ -21,18 +21,20 @@ def _prompt_with_frame_times(frame_timestamps: list[dict[str, Any]], prompt: str
         "global frames：全局过程，用于理解 episode 起止和大致阶段。",
     ]
     for item in [item for item in frame_timestamps if item.get("frame_type") == "global"]:
+        camera = f", camera={item['camera_key']}" if item.get("camera_key") else ""
         lines.append(
             f"{item['frame']}: episode_time={item['episode_time']}s, "
-            f"video_time={item['video_time']}s"
+            f"video_time={item['video_time']}s{camera}"
         )
     lines += [
         "",
         "dense frames：局部细节，用于优先判断夹爪闭合、接触、夹住或滑落。",
     ]
     for item in [item for item in frame_timestamps if item.get("frame_type") == "dense"]:
+        camera = f", camera={item['camera_key']}" if item.get("camera_key") else ""
         lines.append(
             f"{item['frame']}: episode_time={item['episode_time']}s, "
-            f"video_time={item['video_time']}s"
+            f"video_time={item['video_time']}s{camera}"
         )
     return prompt + "\n\n" + "\n".join(lines)
 
@@ -83,7 +85,53 @@ def fallback_result(
         "parse_error": parse_error,
         "raw_response": raw_response,
         "auto_warning": sorted(set(warnings)),
+        "input_token_count": None,
+        "context_token_limit": None,
+        "cuda_peak_memory_allocated_bytes": None,
+        "cuda_peak_memory_reserved_bytes": None,
     }
+
+
+def _context_token_limit(config: dict[str, Any], model_family: str) -> int:
+    if model_family == "qwen3_vl":
+        text_config = config.get("text_config")
+        value = text_config.get("max_position_embeddings") if isinstance(text_config, dict) else None
+    else:
+        value = config.get("max_position_embeddings")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("checkpoint config is missing a valid context token limit")
+    return value
+
+
+def _input_token_count(input_ids: Any) -> int:
+    shape = getattr(input_ids, "shape", None)
+    if shape is not None and len(shape) >= 2:
+        return int(shape[-1])
+    return len(input_ids[0])
+
+
+def _safe_exception_name(error: Exception) -> str:
+    value = "".join(
+        character
+        for character in type(error).__name__
+        if character.isascii() and (character.isalnum() or character == "_")
+    )[:64]
+    return value or "Exception"
+
+
+def _attach_resource_metrics(
+    result: dict[str, Any],
+    *,
+    input_token_count: int | None,
+    context_token_limit: int | None,
+    cuda_allocated: int | None,
+    cuda_reserved: int | None,
+) -> dict[str, Any]:
+    result["input_token_count"] = input_token_count
+    result["context_token_limit"] = context_token_limit
+    result["cuda_peak_memory_allocated_bytes"] = cuda_allocated
+    result["cuda_peak_memory_reserved_bytes"] = cuda_reserved
+    return result
 
 
 def _is_non_grasp_attempt(attempt: dict[str, Any]) -> bool:
@@ -193,6 +241,7 @@ class LocalVLMClient:
     def __init__(
         self,
         model_path: Path,
+        model_family: str = "qwen2_5_vl",
         max_new_tokens: int = 256,
         prompt_version: str = PROMPT_VERSION,
     ):
@@ -201,6 +250,18 @@ class LocalVLMClient:
             error = FileNotFoundError("local VLM model path does not exist")
             error.add_note(str(self.model_path))
             raise ModelLoadError("The configured model could not be loaded.") from error
+        try:
+            config = json.loads((self.model_path / "config.json").read_text(encoding="utf-8"))
+            model_type = config.get("model_type")
+            if model_type != model_family:
+                raise ValueError(
+                    f"configured model family {model_family} does not match checkpoint "
+                    f"model_type {model_type}"
+                )
+            self.context_token_limit = _context_token_limit(config, model_family)
+        except Exception as error:
+            raise ModelLoadError("The configured model could not be loaded.") from error
+        self.model_family = model_family
         self.max_new_tokens = max_new_tokens
         self.prompt = prompt_for_version(prompt_version)
 
@@ -210,26 +271,23 @@ class LocalVLMClient:
 
         try:
             import torch
-            from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+            from transformers import AutoModelForImageTextToText, AutoProcessor
 
             self.torch = torch
             if torch.cuda.is_available():
                 print("CUDA available: using GPU for VLM inference.")
-                device_map = "auto"
-                torch_dtype = "auto"
+                model_kwargs = {"dtype": "auto", "device_map": "auto"}
             else:
                 print("CUDA not available: using CPU. VLM inference will be very slow.")
-                device_map = None
-                torch_dtype = torch.float32
+                model_kwargs = {"dtype": torch.float32}
 
             self.processor = AutoProcessor.from_pretrained(self.model_path, local_files_only=True)
-            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            self.model = AutoModelForImageTextToText.from_pretrained(
                 self.model_path,
-                torch_dtype=torch_dtype,
-                device_map=device_map,
                 local_files_only=True,
+                **model_kwargs,
             )
-            if device_map is None:
+            if not torch.cuda.is_available():
                 self.model.to("cpu")
         except Exception as error:
             raise ModelLoadError("The configured model could not be loaded.") from error
@@ -253,39 +311,93 @@ class LocalVLMClient:
     ) -> tuple[dict[str, Any], bool]:
         from qwen_vl_utils import process_vision_info
 
-        content = [{"type": "image", "image": str(path.resolve())} for path in frame_paths]
-        content.append(
-            {"type": "text", "text": _prompt_with_frame_times(frame_timestamps, self.prompt)}
-        )
-        messages = [{"role": "user", "content": content}]
+        cuda = self.torch.cuda
+        cuda_available = bool(cuda.is_available())
+        reset_peak = getattr(cuda, "reset_peak_memory_stats", None)
+        if cuda_available and callable(reset_peak):
+            reset_peak()
+        input_token_count: int | None = None
+        cuda_allocated: int | None = None
+        cuda_reserved: int | None = None
+        result: dict[str, Any] | None = None
+        valid = False
 
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
         image_inputs = video_inputs = inputs = generated = None
-        image_inputs, video_inputs = process_vision_info(messages)
-        inputs = self.processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
-        if self.torch.cuda.is_available():
-            inputs = inputs.to("cuda")
-
         try:
-            with self.torch.inference_mode():
-                generated = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens)
-            generated = [out[len(inp) :] for inp, out in zip(inputs.input_ids, generated)]
-            raw = self.processor.batch_decode(generated, skip_special_tokens=True)[0].strip()
+            content = [{"type": "image", "image": str(path.resolve())} for path in frame_paths]
+            content.append(
+                {"type": "text", "text": _prompt_with_frame_times(frame_timestamps, self.prompt)}
+            )
+            messages = [{"role": "user", "content": content}]
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            image_inputs, video_inputs = process_vision_info(
+                messages,
+                image_patch_size=self.processor.image_processor.patch_size,
+            )
+            inputs = self.processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                do_resize=False,
+                padding=True,
+                return_tensors="pt",
+            )
+            inputs = inputs.to(self.model.device)
+            input_token_count = _input_token_count(inputs.input_ids)
+            if input_token_count + self.max_new_tokens > self.context_token_limit:
+                result = fallback_result(
+                    "",
+                    "context_length_exceeded",
+                    "input and output token budget exceeds the model context limit",
+                )
+            else:
+                with self.torch.inference_mode():
+                    generated = self.model.generate(
+                        **inputs,
+                        max_new_tokens=self.max_new_tokens,
+                        do_sample=False,
+                    )
+                generated = [out[len(inp) :] for inp, out in zip(inputs.input_ids, generated)]
+                raw = self.processor.batch_decode(
+                    generated,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )[0].strip()
+                parsed, ok, parse_error = extract_json(raw)
+                if not ok or parsed is None:
+                    warning = "empty_vlm_response" if not raw else "invalid_vlm_json"
+                    result = fallback_result(raw, warning, parse_error)
+                else:
+                    result = validate_vlm_result(parsed, raw, episode_duration)
+                    valid = bool(result.get("vlm_valid"))
+        except Exception as error:  # noqa: BLE001 - sanitize per-Episode inference errors.
+            result = fallback_result(
+                "",
+                "inference_error",
+                f"inference_error:{_safe_exception_name(error)}",
+            )
         finally:
+            if cuda_available:
+                maximum_allocated = getattr(cuda, "max_memory_allocated", None)
+                maximum_reserved = getattr(cuda, "max_memory_reserved", None)
+                if callable(maximum_allocated):
+                    cuda_allocated = int(maximum_allocated())
+                if callable(maximum_reserved):
+                    cuda_reserved = int(maximum_reserved())
             image_inputs = video_inputs = inputs = generated = None
-            if self.torch.cuda.is_available():
-                self.torch.cuda.empty_cache()
-        parsed, ok, parse_error = extract_json(raw)
-        if not ok or parsed is None:
-            warning = "empty_vlm_response" if not raw else "invalid_vlm_json"
-            return fallback_result(raw, warning, parse_error), False
-        result = validate_vlm_result(parsed, raw, episode_duration)
-        return result, bool(result.get("vlm_valid"))
+            if cuda_available:
+                cuda.empty_cache()
+        if result is None:
+            raise RuntimeError("VLM analysis completed without a result")
+        return (
+            _attach_resource_metrics(
+                result,
+                input_token_count=input_token_count,
+                context_token_limit=self.context_token_limit,
+                cuda_allocated=cuda_allocated,
+                cuda_reserved=cuda_reserved,
+            ),
+            valid,
+        )

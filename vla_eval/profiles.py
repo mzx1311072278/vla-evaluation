@@ -29,6 +29,7 @@ _PLUGINS = frozenset({"genie02-attempt-eval"})
 _PROMPT_VERSIONS = SUPPORTED_PROMPT_VERSIONS
 _REQUIRED_OUTPUTS = frozenset({"episode_metrics.csv", "metrics_core.json", _REPORT_PATTERN})
 _VLM_BACKENDS = frozenset({"local", "api"})
+_LOCAL_VLM_MODEL_FAMILIES = frozenset({"qwen2_5_vl", "qwen3_vl"})
 _ENV_VAR = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
@@ -93,6 +94,7 @@ class VLMProfile:
     max_image_size: int
     max_new_tokens: int
     backend: str = "local"
+    model_family: str | None = "qwen2_5_vl"
     model_path: str | None = None
     api: VLMApiProfile | None = None
 
@@ -243,7 +245,7 @@ def load_profile(path: str | Path) -> Profile:
     _fields_optional(
         vlm,
         {"prompt_version", "sampling", "max_image_size", "max_new_tokens"},
-        {"backend", "model_path", "api"},
+        {"backend", "model_family", "model_path", "api"},
         "vlm",
     )
     backend = _enum_identifier(vlm.get("backend", "local"), "vlm.backend", _VLM_BACKENDS)
@@ -268,9 +270,16 @@ def load_profile(path: str | Path) -> Profile:
             raise ValueError("vlm.api must not be set when backend=local")
         if "model_path" not in vlm:
             raise ValueError("vlm is missing required fields: model_path")
+        model_family: str | None = _enum_identifier(
+            vlm.get("model_family", "qwen2_5_vl"),
+            "vlm.model_family",
+            _LOCAL_VLM_MODEL_FAMILIES,
+        )
         model_path: str | None = _string(vlm["model_path"], "vlm.model_path")
         api_profile: VLMApiProfile | None = None
     else:
+        if "model_family" in vlm:
+            raise ValueError("vlm.model_family must not be set when backend=api")
         if "api" not in vlm:
             raise ValueError("vlm is missing required fields: api")
         api_raw = _mapping(vlm["api"], "vlm.api")
@@ -300,6 +309,7 @@ def load_profile(path: str | Path) -> Profile:
             timeout=_number(api_raw.get("timeout", 60.0), "vlm.api.timeout", 1, 600),
             max_retries=_integer(api_raw.get("max_retries", 3), "vlm.api.max_retries", 0, 10),
         )
+        model_family = None
         model_path = _optional_string(vlm.get("model_path"), "vlm.model_path")
 
     review = _mapping(raw["review"], "review")
@@ -334,6 +344,7 @@ def load_profile(path: str | Path) -> Profile:
         image_key=_string(raw["image_key"], "image_key"),
         vlm=VLMProfile(
             backend=backend,
+            model_family=model_family,
             model_path=model_path,
             api=api_profile,
             prompt_version=_enum_identifier(

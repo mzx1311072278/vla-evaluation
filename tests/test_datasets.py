@@ -503,6 +503,42 @@ def test_inspect_validates_referenced_lerobot_data_and_video(tmp_path: Path):
     assert any("data" in error and "does not exist" in error for error in missing_both.errors)
 
 
+def test_inspect_lerobot_discovers_sorted_camera_keys(tmp_path: Path):
+    root = _write_lerobot(tmp_path / "run")
+    info_path = root / "meta/info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["features"] = {
+        "observation.images.right_wrist": {"dtype": "video", "shape": [3, 8, 8]},
+        "observation.images.state": {"dtype": "image", "shape": [3, 8, 8]},
+    }
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+    metadata_path = root / "meta/episodes/chunk-000/file-000.parquet"
+    metadata = pd.read_parquet(metadata_path)
+    for key in ("observation.images.right_wrist", "observation.images.front"):
+        metadata[f"videos/{key}/file_index"] = 0
+        metadata[f"videos/{key}/from_timestamp"] = 0.0
+        metadata[f"videos/{key}/to_timestamp"] = 0.1
+        video = root / f"videos/{key}/chunk-000/file-000.mp4"
+        video.parent.mkdir(parents=True, exist_ok=True)
+        video.write_bytes(b"video-placeholder")
+    metadata.to_parquet(metadata_path)
+
+    result = inspect_dataset(root, allowed_root=tmp_path)
+
+    assert result.ready is True
+    assert result.camera_keys == (
+        "observation.images.front",
+        "observation.images.right_wrist",
+    )
+
+
+def test_inspect_non_video_dataset_has_no_camera_keys(tmp_path: Path):
+    result = inspect_dataset(_write_native_session(tmp_path / "run"), allowed_root=tmp_path)
+
+    assert result.ready is True
+    assert result.camera_keys == ()
+
+
 def test_inspect_reconciles_lerobot_episode_length_with_data(tmp_path: Path):
     root = _write_lerobot(tmp_path / "run")
     pd.DataFrame(
@@ -712,7 +748,30 @@ def test_video_column_resolver_supports_all_reader_schemas():
         assert resolved.length == expected["length"]
         assert resolved.file_index == expected["file_index"]
         assert resolved.from_timestamp == expected["from_timestamp"]
-        assert resolved.to_timestamp == expected["to_timestamp"]
+    assert resolved.to_timestamp == expected["to_timestamp"]
+
+
+def test_episode_reader_groups_selected_camera_videos(tmp_path: Path):
+    from Genie02_report.attempt_eval.dataset_reader import read_episode_metadata
+
+    root = _write_lerobot(tmp_path / "run")
+    metadata_path = root / "meta/episodes/chunk-000/file-000.parquet"
+    metadata = pd.read_parquet(metadata_path)
+    keys = ("observation.images.front", "observation.images.right_wrist")
+    for key in keys:
+        metadata[f"videos/{key}/file_index"] = 0
+        metadata[f"videos/{key}/from_timestamp"] = 0.0
+        metadata[f"videos/{key}/to_timestamp"] = 0.1
+        video = root / f"videos/{key}/chunk-000/file-000.mp4"
+        video.parent.mkdir(parents=True, exist_ok=True)
+        video.write_bytes(b"video-placeholder")
+    metadata.to_parquet(metadata_path)
+
+    episodes = read_episode_metadata(root, keys)
+
+    assert len(episodes) == 1
+    assert [video.camera_key for video in episodes[0].camera_videos] == list(keys)
+    assert episodes[0].video_file == episodes[0].camera_videos[0].video_file
 
 
 def test_inspect_lerobot_uses_shared_video_column_resolution(tmp_path: Path):

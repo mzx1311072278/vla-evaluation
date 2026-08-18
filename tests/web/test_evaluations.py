@@ -3,6 +3,8 @@ import re
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from urllib.parse import urlencode
 
 import pytest
@@ -20,8 +22,8 @@ def _listed_evaluation_ids(html: str) -> list[str]:
     return list(dict.fromkeys(matches))
 
 
-def _evaluation_form(csrf: str, dataset_id: str, **overrides: str) -> dict[str, str]:
-    values: dict[str, str] = {
+def _evaluation_form(csrf: str, dataset_id: str, **overrides: Any) -> dict[str, Any]:
+    values: dict[str, Any] = {
         "csrf_token": csrf,
         "dataset_id": dataset_id,
         "profile": "genie02-full",
@@ -593,7 +595,14 @@ def test_submit_evaluation_persists_provenance_and_enqueues_worker(
     assert job.state == "QUEUED"
     assert job.stage == "PENDING"
     assert job.created_by == user.id
-    assert job.params_json == {"vlm_enabled": True}
+    assert job.params_json == {
+        "vlm_enabled": True,
+        "camera_keys": [
+            "observation.images.front",
+            "observation.images.left_wrist",
+            "observation.images.right_wrist",
+        ],
+    }
     assert job.provenance_json
     assert job.provenance_json["dataset_fingerprint"] == ready_dataset.fingerprint
     assert job.provenance_json["profile_name"] == "genie02-full"
@@ -602,6 +611,7 @@ def test_submit_evaluation_persists_provenance_and_enqueues_worker(
     assert job.provenance_json["git_sha"] == ""
     assert job.provenance_json["vlm_model_path"]
     assert job.provenance_json["vlm_backend"] == "local"
+    assert job.provenance_json["vlm_model_family"] == "qwen2_5_vl"
     assert "vlm_api_model" not in job.provenance_json
     assert job.provenance_json["prompt_version"]
     assert job.provenance_json["adapter"] == "genie02"
@@ -630,7 +640,7 @@ def test_submit_evaluation_persists_provenance_and_enqueues_worker(
             "attempt_eval/attempt_summary.csv",
         ],
     }
-    assert job.provenance_json["params"] == {"vlm_enabled": True}
+    assert job.provenance_json["params"] == job.params_json
 
     assert fake_queues.evaluation.count == 1
     call = fake_queues.evaluation.enqueued[0]
@@ -661,6 +671,7 @@ def test_submit_evaluation_records_api_backend_provenance(
     assert job.profile_name == "genie02-api"
     provenance = job.provenance_json
     assert provenance["vlm_backend"] == "api"
+    assert provenance["vlm_model_family"] is None
     assert provenance["vlm_model_path"] is None
     assert provenance["vlm_api_base_url"] == "http://vlm-api.example.internal/v1"
     assert provenance["vlm_api_model"] == "qwen2.5-vl-7b-instruct"
@@ -669,6 +680,29 @@ def test_submit_evaluation_records_api_backend_provenance(
     assert provenance["vlm_api_max_retries"] == 3
     assert fake_queues.evaluation.count == 1
     assert fake_queues.evaluation.enqueued[0].args == (job_id,)
+
+
+def test_submit_evaluation_records_qwen3_model_family_provenance(
+    auth_client, db_engine: Engine, fake_queues, ready_dataset
+):
+    response = auth_client.post(
+        "/evaluations",
+        data=_evaluation_form(
+            auth_client.csrf,
+            ready_dataset.id,
+            profile="genie02-qwen3-vl",
+            vlm_enabled="true",
+        ),
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    job_id = response.headers["location"].removeprefix("/evaluations/")
+    job = reload_job(db_engine, job_id)
+    assert job.profile_name == "genie02-qwen3-vl"
+    assert job.provenance_json["vlm_model_family"] == "qwen3_vl"
+    assert job.provenance_json["vlm_model_path"].endswith("Qwen3-VL-8B-Instruct")
+    assert fake_queues.evaluation.count == 1
 
 
 def test_duplicate_successful_run_redirects_to_existing_evaluation(
@@ -1258,6 +1292,121 @@ def test_evaluation_new_page_preselects_dataset(auth_client, ready_dataset):
     assert response.status_code == 200
     assert ready_dataset.name in response.text
     assert "genie02-full" in response.text
+    assert response.text.count('<input type="checkbox" name="camera_keys"') == 3
+    assert "未选择时分析数据集全部摄像头" in response.text
+    assert "observation.images.front" in response.text
+
+
+def test_evaluation_new_page_discovers_cameras_for_historical_dataset(
+    auth_client, db_engine, ready_dataset, monkeypatch
+):
+    with session_scope(db_engine) as session:
+        stored = session.get_one(Dataset, ready_dataset.id)
+        stored.inspection_json = {"errors": []}
+    monkeypatch.setattr(
+        "vla_eval.web.routes_evaluations.inspect_dataset",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            ready=True,
+            fingerprint=ready_dataset.fingerprint,
+            camera_keys=("observation.images.overhead",),
+        ),
+    )
+
+    response = auth_client.get(f"/evaluations/new?dataset_id={ready_dataset.id}")
+
+    assert response.status_code == 200
+    assert "observation.images.overhead" in response.text
+
+
+def test_submit_vlm_without_camera_selection_persists_all_dataset_cameras(
+    auth_client, db_engine: Engine, ready_dataset
+):
+    response = auth_client.post(
+        "/evaluations",
+        data=_evaluation_form(auth_client.csrf, ready_dataset.id, vlm_enabled="true"),
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    job = reload_job(db_engine, response.headers["location"].rsplit("/", 1)[-1])
+    expected = [
+        "observation.images.front",
+        "observation.images.left_wrist",
+        "observation.images.right_wrist",
+    ]
+    assert job.params_json == {"vlm_enabled": True, "camera_keys": expected}
+    assert job.provenance_json["camera_keys"] == expected
+    assert job.provenance_json["params"] == job.params_json
+
+
+def test_submit_vlm_canonicalizes_selected_cameras_in_dataset_order(
+    auth_client, db_engine: Engine, ready_dataset
+):
+    form = _evaluation_form(auth_client.csrf, ready_dataset.id, vlm_enabled="true")
+    form["camera_keys"] = [
+        "observation.images.right_wrist",
+        "observation.images.front",
+        "observation.images.right_wrist",
+    ]
+
+    response = auth_client.post("/evaluations", data=form, follow_redirects=False)
+
+    assert response.status_code == 303
+    job = reload_job(db_engine, response.headers["location"].rsplit("/", 1)[-1])
+    assert job.params_json["camera_keys"] == [
+        "observation.images.front",
+        "observation.images.right_wrist",
+    ]
+
+
+def test_submit_evaluation_rejects_unknown_or_more_than_three_cameras(
+    auth_client, db_engine: Engine, ready_dataset
+):
+    unknown = _evaluation_form(auth_client.csrf, ready_dataset.id, vlm_enabled="true")
+    unknown["camera_keys"] = "observation.images.unknown"
+    unknown_response = auth_client.post("/evaluations", data=unknown)
+
+    with session_scope(db_engine) as session:
+        stored = session.get_one(Dataset, ready_dataset.id)
+        stored.inspection_json = {
+            "errors": [],
+            "camera_keys": ["camera.a", "camera.b", "camera.c", "camera.d"],
+        }
+    too_many = _evaluation_form(auth_client.csrf, ready_dataset.id, vlm_enabled="true")
+    too_many_response = auth_client.post("/evaluations", data=too_many)
+
+    assert unknown_response.status_code == 422
+    assert too_many_response.status_code == 422
+
+
+def test_submit_without_vlm_ignores_camera_selection(auth_client, db_engine, ready_dataset):
+    form = _evaluation_form(auth_client.csrf, ready_dataset.id, vlm_enabled="false")
+    form["camera_keys"] = "observation.images.front"
+
+    response = auth_client.post("/evaluations", data=form, follow_redirects=False)
+
+    assert response.status_code == 303
+    job = reload_job(db_engine, response.headers["location"].rsplit("/", 1)[-1])
+    assert job.params_json == {"vlm_enabled": False, "camera_keys": []}
+
+
+def test_evaluation_detail_displays_persisted_camera_keys(
+    auth_client, db_engine, ready_dataset
+):
+    with session_scope(db_engine) as session:
+        job = EvaluationJob(
+            dataset_id=ready_dataset.id,
+            profile_name="genie02-full",
+            params_json={"camera_keys": ["observation.images.front"]},
+        )
+        session.add(job)
+        session.flush()
+        job_id = job.id
+
+    response = auth_client.get(f"/evaluations/{job_id}")
+
+    assert response.status_code == 200
+    assert "observation.images.front" in response.text
 
 
 def test_evaluation_new_page_rejects_missing_dataset_param(auth_client):

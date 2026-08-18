@@ -77,6 +77,10 @@ def test_analyze_success_validates_result_and_sends_expected_payload(
     assert result["episode_success"] is True
     assert result["confidence"] == 0.9
     assert result["vlm_valid"] is True
+    assert result["input_token_count"] is None
+    assert result["context_token_limit"] is None
+    assert result["cuda_peak_memory_allocated_bytes"] is None
+    assert result["cuda_peak_memory_reserved_bytes"] is None
 
     request = seen[0]
     assert str(request.url) == "https://vlm.example.internal/v1/chat/completions"

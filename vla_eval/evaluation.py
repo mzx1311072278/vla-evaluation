@@ -323,8 +323,8 @@ def _validate_attempt_indices(results: list[dict[str, Any]], expected: frozenset
 def _build_api_client_factory(api: VLMApiProfile) -> Callable[..., Any]:
     """Build a ``client_factory`` that constructs the API VLM client.
 
-    The vendored runner calls ``factory(config.model_path, max_new_tokens=...,
-    prompt_version=...)`` positionally. The API backend ignores that
+    The vendored runner calls ``factory(config.model_path, model_family=...,
+    max_new_tokens=..., prompt_version=...)``. The API backend ignores that
     ``model_path`` (it takes its model name from the profile's ``api`` block) and
     reads its connection details from ``api``. Lazy-importing ``ApiVLMClient``
     keeps httpx out of module load, matching this module's existing
@@ -334,7 +334,11 @@ def _build_api_client_factory(api: VLMApiProfile) -> Callable[..., Any]:
     from vla_eval.vlm_api import ApiVLMClient
 
     def factory(
-        _model_path: Any, *, max_new_tokens: int, prompt_version: str
+        _model_path: Any,
+        *,
+        model_family: str,
+        max_new_tokens: int,
+        prompt_version: str,
     ) -> ApiVLMClient:
         return ApiVLMClient(
             base_url=api.base_url,
@@ -354,6 +358,7 @@ def run_profile_vlm(
     output_dir: Path,
     profile: Profile,
     callbacks: EvaluationCallbacks,
+    camera_keys: tuple[str, ...] | None = None,
 ) -> Path:
     """Run the optional Task 7 service without importing GPU packages at module import time."""
     from Genie02_report.attempt_eval.run_episode_attempt_eval import (
@@ -375,8 +380,10 @@ def run_profile_vlm(
     config = AttemptEvalConfig(
         dataset_root=dataset_path,
         model_path=model_path,
+        model_family=profile.vlm.model_family or "qwen2_5_vl",
         prompt_version=profile.vlm.prompt_version,
         image_key=profile.image_key,
+        image_keys=tuple(camera_keys or (profile.image_key,)),
         output_dir=output_dir,
         max_image_size=profile.vlm.max_image_size,
         max_global_frames=sampling.max_global_frames,
@@ -430,6 +437,7 @@ def run_evaluation(
     callbacks: EvaluationCallbacks,
     resume_from: str = "METRICS",
     initial_progress: float = 0.0,
+    camera_keys: tuple[str, ...] | None = None,
 ) -> EvaluationResult:
     """Run METRICS, optional VLM, then REPORT with resumable stage boundaries."""
     if resume_from not in {"METRICS", "VLM", "REPORT"}:
@@ -438,6 +446,15 @@ def run_evaluation(
         raise TypeError("vlm_enabled must be a boolean")
     if resume_from == "VLM" and not vlm_enabled:
         raise ValueError("resume_from='VLM' requires vlm_enabled=True")
+    if vlm_enabled and camera_keys is not None and not camera_keys:
+        raise ValueError("camera_keys must contain at least one camera when VLM is enabled")
+    resolved_camera_keys = tuple(camera_keys if camera_keys is not None else ())
+    if vlm_enabled and camera_keys is None:
+        resolved_camera_keys = (profile.image_key,)
+    if len(resolved_camera_keys) > 3 or any(
+        not isinstance(value, str) or not value for value in resolved_camera_keys
+    ):
+        raise ValueError("camera_keys must contain at most three non-empty strings")
     progress = _ProgressEmitter(callbacks.on_progress, _validate_initial_progress(initial_progress))
     stage_callbacks = EvaluationCallbacks(
         on_stage=callbacks.on_stage,
@@ -469,7 +486,21 @@ def run_evaluation(
     if vlm_enabled and resume_from in {"METRICS", "VLM"}:
         stage_callbacks.on_stage("VLM")
         stage_callbacks.on_progress(30.0)
-        vlm_path = run_profile_vlm(dataset, output / "attempt_eval", profile, stage_callbacks)
+        if camera_keys is None:
+            vlm_path = run_profile_vlm(
+                dataset,
+                output / "attempt_eval",
+                profile,
+                stage_callbacks,
+            )
+        else:
+            vlm_path = run_profile_vlm(
+                dataset,
+                output / "attempt_eval",
+                profile,
+                stage_callbacks,
+                camera_keys=resolved_camera_keys,
+            )
         stage_callbacks.on_progress(90.0)
     elif vlm_enabled:
         vlm_path = output / "attempt_eval" / "attempt_summary.json"

@@ -213,12 +213,30 @@ curl -fsS http://127.0.0.1:8000/health
 
 ### 方式 A：4090 本地模型
 
-使用 `config/profiles/genie02-full.yaml`：
+本地后端提供两个独立 Profile：
+
+- `genie02-full`：Qwen2.5-VL-7B-Instruct，`model_family: qwen2_5_vl`。
+- `genie02-qwen3-vl`：Qwen3-VL-8B-Instruct，`model_family: qwen3_vl`。
+
+两者都要求：
 
 - `vlm.backend: local`。
 - `vlm.model_path` 必须是 Evaluation Worker 容器内可见的模型目录。
-- 创建评测时选择 `genie02-full` 并启用 VLM。
+- 创建评测时选择对应 Profile 并启用 VLM。
 - 运算在 Evaluation Worker 所在的 4090 上完成。
+
+不要把 Qwen3 纯文本模型配置为 VLM；必须使用 Qwen3-VL Instruct checkpoint。
+
+### 任务级摄像头选择与资源保护
+
+启用 VLM 后，新建评测页面会列出数据集检查阶段发现的摄像头。摄像头列表会随任务保存，任务开始后不会再次根据当前页面选择重新发现：
+
+- 不勾选时默认使用数据集的全部摄像头；单个任务最多 3 路。若数据集超过 3 路，必须明确勾选不超过 3 路后提交。
+- 同一个 Episode 的所选视角会合并到一次 VLM 请求中；每路仍独立使用当前抽帧上限（默认全局 8 帧 + dense 8 帧），所以 3 路最多会发送 48 张图片。
+- 本地后端在 Processor 完成后读取真实 `input_ids` 长度，并检查 `input_tokens + max_new_tokens <= context_limit`。超限的 Episode 会记录 `context_length_exceeded`，不会调用 `generate`。
+- 本地后端每个 Episode 记录 `cuda_peak_memory_allocated_bytes` 和 `cuda_peak_memory_reserved_bytes`；API 后端无法观测 Worker 显存，这四个资源字段按不可用处理。
+
+建议第一次在 RTX 4090 上用只包含 1 个 Episode 的测试数据集做三路 smoke test，确认 Evaluation Worker 日志、Episode JSON 中的 `sampled_frame_count_by_camera` 和显存峰值，再扩大任务范围。上下文 token 没有超限不代表显存一定足够，真实峰值仍以 Worker 记录为准。
 
 ### 方式 B：OpenAI 兼容 API
 
@@ -318,8 +336,9 @@ VLA_EVAL_GIT_SHA=<git rev-parse HEAD 的输出>
 
 - 把本机、SMB 或 NAS 数据挂载到宿主机 `/mnt/vla-datasets`。
 - Compose 会以只读方式把它挂载到 Transfer Worker。
-- 使用本地 VLM 时，把模型放到 `/srv/vla-eval/models/Qwen2.5-VL-7B-Instruct`。
-- Evaluation Worker 中的对应路径是 `/srv/vla-eval/data/models/Qwen2.5-VL-7B-Instruct`。
+- 使用 Qwen2.5-VL 时，把模型放到 `/srv/vla-eval/models/Qwen2.5-VL-7B-Instruct`。
+- 使用 Qwen3-VL 时，把模型放到 `/srv/vla-eval/models/Qwen3-VL-8B-Instruct`。
+- Evaluation Worker 中的对应路径统一位于 `/srv/vla-eval/data/models/`。
 
 系统不会直接在 `/mnt/vla-datasets` 上评测。它先复制到 staging，通过预检后发布到 `/srv/vla-eval/data/inbox`。
 
@@ -434,7 +453,7 @@ docker compose down
 
 - 确认创建任务时已启用 VLM。
 - 确认所选 Profile 的 `vlm.backend` 是 `local` 或 `api`。
-- 本地后端检查模型路径和 CUDA。
+- 本地后端检查模型族、模型路径、`config.json`、CUDA 和 GPU 依赖。
 - API 后端检查 `base_url`、模型 ID、`VLA_EVAL_VLM_API_KEY` 和 Evaluation Worker 是否已重启。
 - “VLM 已配置”不等于“VLM 本次启用”，也不等于“VLM 结果产物已生成”。
 

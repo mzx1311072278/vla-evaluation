@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import math
 from collections.abc import Callable
@@ -30,7 +31,9 @@ else:
 class AttemptEvalConfig:
     dataset_root: Path
     model_path: Path
+    model_family: str = "qwen2_5_vl"
     image_key: str = "observation.images.right_wrist"
+    image_keys: tuple[str, ...] = ()
     output_dir: Path = Path("outputs/attempt_eval")
     max_image_size: int = 336
     max_global_frames: int = 8
@@ -53,6 +56,14 @@ class AttemptEvalConfig:
                 raise TypeError(f"{name} must be a pathlib.Path")
         if not isinstance(self.image_key, str) or not self.image_key.strip():
             raise ValueError("image_key must be a non-empty string")
+        if not isinstance(self.image_keys, tuple):
+            raise TypeError("image_keys must be a tuple")
+        if any(not isinstance(value, str) or not value.strip() for value in self.image_keys):
+            raise ValueError("image_keys must contain non-empty strings")
+        if len(self.image_keys) > 3:
+            raise ValueError("image_keys must contain at most three cameras")
+        if self.model_family not in {"qwen2_5_vl", "qwen3_vl"}:
+            raise ValueError("model_family must be one of: qwen2_5_vl, qwen3_vl")
         if not isinstance(self.prompt_version, str):
             raise TypeError("prompt_version must be a string")
         if self.prompt_version not in SUPPORTED_PROMPT_VERSIONS:
@@ -141,7 +152,8 @@ def run_attempt_evaluation(
     output_dir = config.output_dir.expanduser()
     _, frame_root = ensure_output_dirs(output_dir)
     if episodes is None:
-        episodes = _read_episode_metadata(config.dataset_root, config.image_key)
+        metadata_key = config.image_keys if config.image_keys else config.image_key
+        episodes = _read_episode_metadata(config.dataset_root, metadata_key)
     if config.limit is not None:
         episodes = episodes[: config.limit]
 
@@ -161,25 +173,39 @@ def run_attempt_evaluation(
     try:
         for done, episode in enumerate(episodes, start=1):
             _raise_if_cancelled(should_cancel)
-            duration = max(0.0, episode.to_timestamp - episode.from_timestamp)
             sampled_frames: list[Path] = []
             frame_timestamps: list[dict[str, Any]] = []
+            camera_streams = _episode_camera_streams(episode, config)
+            duration = max(max(0.0, end - start) for *_prefix, start, end in camera_streams)
+            sampled_frame_count_by_camera = {
+                camera_key: 0 for camera_key, *_rest in camera_streams
+            }
             vlm_json_valid = True
             try:
-                sampled_frames, frame_timestamps = _sample_episode_frames(
-                    episode.video_file,
-                    frame_root / f"episode_{episode.episode_index:03d}",
-                    episode.from_timestamp,
-                    episode.to_timestamp,
-                    max_image_size=config.max_image_size,
-                    max_global_frames=config.max_global_frames,
-                    global_sample_interval=config.global_sample_interval,
-                    max_dense_frames=config.max_dense_frames,
-                    dense_sample_interval=config.dense_sample_interval,
-                    dense_region=config.dense_region,
-                )
+                episode_frame_root = frame_root / f"episode_{episode.episode_index:03d}"
+                for camera_key, video_file, _relative, start, end in camera_streams:
+                    camera_dir = _camera_dir_name(camera_key)
+                    camera_frames, camera_timestamps = _sample_episode_frames(
+                        video_file,
+                        episode_frame_root / camera_dir,
+                        start,
+                        end,
+                        max_image_size=config.max_image_size,
+                        max_global_frames=config.max_global_frames,
+                        global_sample_interval=config.global_sample_interval,
+                        max_dense_frames=config.max_dense_frames,
+                        dense_sample_interval=config.dense_sample_interval,
+                        dense_region=config.dense_region,
+                    )
+                    sampled_frames.extend(camera_frames)
+                    sampled_frame_count_by_camera[camera_key] = len(camera_frames)
+                    for item in camera_timestamps:
+                        timestamp = dict(item)
+                        timestamp["camera_key"] = camera_key
+                        timestamp["frame"] = f"{camera_dir}/{item['frame']}"
+                        frame_timestamps.append(timestamp)
                 if not sampled_frames:
-                    raise RuntimeError("No frames sampled from episode video segment")
+                    raise RuntimeError("No frames sampled from selected episode cameras")
             except Exception as exc:
                 if _is_evaluation_cancelled(exc):
                     raise
@@ -214,6 +240,7 @@ def run_attempt_evaluation(
                     if vlm is None:
                         vlm = factory(
                             config.model_path,
+                            model_family=config.model_family,
                             max_new_tokens=config.max_new_tokens,
                             prompt_version=config.prompt_version,
                         )
@@ -230,6 +257,9 @@ def run_attempt_evaluation(
                     result = merge_result(episode, vlm_result)
 
             result["sampled_frame_count"] = len(sampled_frames)
+            result["camera_keys"] = [item[0] for item in camera_streams]
+            result["video_files"] = {item[0]: item[2] for item in camera_streams}
+            result["sampled_frame_count_by_camera"] = sampled_frame_count_by_camera
             result["frame_timestamps"] = frame_timestamps
             result["global_frame_count"] = sum(
                 1 for item in frame_timestamps if item.get("frame_type") == "global"
@@ -265,13 +295,49 @@ def run_attempt_evaluation(
     return results
 
 
-def _read_episode_metadata(dataset_root: Path, image_key: str) -> list[EpisodeMeta]:
+def _read_episode_metadata(dataset_root: Path, image_key: str | tuple[str, ...]) -> list[EpisodeMeta]:
     if __package__:
         from .dataset_reader import read_episode_metadata
     else:
         from dataset_reader import read_episode_metadata
 
     return read_episode_metadata(dataset_root, image_key)
+
+
+def _episode_camera_streams(
+    episode: EpisodeMeta, config: AttemptEvalConfig
+) -> tuple[tuple[str, Path, str, float, float], ...]:
+    streams = getattr(episode, "camera_videos", ())
+    if streams:
+        return tuple(
+            (
+                stream.camera_key,
+                stream.video_file,
+                stream.video_file_rel,
+                stream.from_timestamp,
+                stream.to_timestamp,
+            )
+            for stream in streams
+        )
+    camera_key = config.image_keys[0] if config.image_keys else config.image_key
+    return (
+        (
+            camera_key,
+            episode.video_file,
+            episode.video_file_rel,
+            episode.from_timestamp,
+            episode.to_timestamp,
+        ),
+    )
+
+
+def _camera_dir_name(camera_key: str) -> str:
+    readable = "".join(
+        character if character.isascii() and character.isalnum() else "_"
+        for character in camera_key
+    ).strip("_")[:48]
+    digest = hashlib.sha256(camera_key.encode("utf-8")).hexdigest()[:8]
+    return f"{readable or 'camera'}-{digest}"
 
 
 def _sample_episode_frames(*args: Any, **kwargs: Any) -> tuple[list[Path], list[dict[str, Any]]]:
@@ -355,6 +421,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model_path", required=True, type=Path, help="Local VLM model path.")
     parser.add_argument(
+        "--model_family",
+        choices=["qwen2_5_vl", "qwen3_vl"],
+        default="qwen2_5_vl",
+        help="Local VLM checkpoint architecture.",
+    )
+    parser.add_argument(
         "--image_key", default="observation.images.right_wrist", help="Video image key."
     )
     parser.add_argument(
@@ -426,6 +498,7 @@ def _config_from_args(args: argparse.Namespace) -> AttemptEvalConfig:
     return AttemptEvalConfig(
         dataset_root=args.dataset_root,
         model_path=args.model_path,
+        model_family=args.model_family,
         image_key=args.image_key,
         output_dir=args.output_dir,
         max_image_size=args.max_image_size,
@@ -479,6 +552,10 @@ def base_result(episode: EpisodeMeta) -> dict[str, Any]:
         "auto_warning": [],
         "review_mode": "manual_review",
         "reason": "",
+        "input_token_count": None,
+        "context_token_limit": None,
+        "cuda_peak_memory_allocated_bytes": None,
+        "cuda_peak_memory_reserved_bytes": None,
     }
 
 

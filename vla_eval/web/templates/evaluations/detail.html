@@ -53,6 +53,7 @@
       <h2>来源信息</h2>
       <dl class="summary-grid">
         <div><dt>配置版本</dt><dd>{{ job.profile_version }}</dd></div>
+        <div><dt>摄像头</dt><dd>{% set camera_keys = job.params_json.get('camera_keys', []) %}{% if camera_keys %}{% for camera_key in camera_keys %}<code>{{ camera_key }}</code>{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}—{% endif %}</dd></div>
         <div><dt>VLM 模型</dt><dd>{{ job.provenance_json.get('vlm_model_path', '—') }}</dd></div>
         <div><dt>Prompt 版本</dt><dd>{{ job.provenance_json.get('prompt_version', '—') }}</dd></div>
         <div><dt>应用版本</dt><dd>{{ job.provenance_json.get('app_version', '—') }}</dd></div>

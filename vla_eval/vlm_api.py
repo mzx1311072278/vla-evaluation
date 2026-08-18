@@ -42,6 +42,14 @@ from vla_eval.exceptions import ModelLoadError
 logger = logging.getLogger(__name__)
 
 
+def _with_unavailable_resource_metrics(result: dict[str, Any]) -> dict[str, Any]:
+    result["input_token_count"] = None
+    result["context_token_limit"] = None
+    result["cuda_peak_memory_allocated_bytes"] = None
+    result["cuda_peak_memory_reserved_bytes"] = None
+    return result
+
+
 class ApiVLMClient:
     """VLM client that calls an OpenAI-compatible vision endpoint over HTTP.
 
@@ -172,7 +180,9 @@ class ApiVLMClient:
             raw = response.json()["choices"][0]["message"]["content"]
         except (ValueError, KeyError, IndexError, TypeError):
             return (
-                fallback_result("", "invalid_vlm_response", "VLM API response was malformed"),
+                _with_unavailable_resource_metrics(
+                    fallback_result("", "invalid_vlm_response", "VLM API response was malformed")
+                ),
                 False,
             )
         if not isinstance(raw, str):
@@ -180,9 +190,11 @@ class ApiVLMClient:
         parsed, ok, parse_error = extract_json(raw)
         if not ok or parsed is None:
             warning = "empty_vlm_response" if not raw else "invalid_vlm_json"
-            return fallback_result(raw, warning, parse_error), False
+            return _with_unavailable_resource_metrics(
+                fallback_result(raw, warning, parse_error)
+            ), False
         result = validate_vlm_result(parsed, raw, episode_duration)
-        return result, bool(result.get("vlm_valid"))
+        return _with_unavailable_resource_metrics(result), bool(result.get("vlm_valid"))
 
     def close(self) -> None:
         try:

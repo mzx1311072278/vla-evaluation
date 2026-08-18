@@ -121,6 +121,14 @@ def ready_dataset(db_engine: Engine, data_root: Path) -> Dataset:
             fingerprint=inspection.fingerprint,
             size_bytes=inspection.size_bytes,
             episode_count=1,
+            inspection_json={
+                "errors": [],
+                "camera_keys": [
+                    "observation.images.front",
+                    "observation.images.left_wrist",
+                    "observation.images.right_wrist",
+                ],
+            },
         )
         session.add(value)
         session.flush()
