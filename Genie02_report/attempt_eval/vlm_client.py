@@ -93,7 +93,7 @@ def fallback_result(
 
 
 def _context_token_limit(config: dict[str, Any], model_family: str) -> int:
-    if model_family == "qwen3_vl":
+    if model_family in {"qwen3_vl", "qwen3_5"}:
         text_config = config.get("text_config")
         value = text_config.get("max_position_embeddings") if isinstance(text_config, dict) else None
     else:
@@ -329,8 +329,14 @@ class LocalVLMClient:
                 {"type": "text", "text": _prompt_with_frame_times(frame_timestamps, self.prompt)}
             )
             messages = [{"role": "user", "content": content}]
+            # Qwen3.8 (qwen3_5) defaults to thinking mode on; its reasoning tokens
+            # would exhaust max_new_tokens before the JSON answer is produced, so
+            # disable it per request. Older templates do not know this kwarg.
+            template_kwargs = (
+                {"enable_thinking": False} if self.model_family == "qwen3_5" else {}
+            )
             text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+                messages, tokenize=False, add_generation_prompt=True, **template_kwargs
             )
             image_inputs, video_inputs = process_vision_info(
                 messages,

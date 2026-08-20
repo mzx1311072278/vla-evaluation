@@ -29,7 +29,7 @@ _PLUGINS = frozenset({"genie02-attempt-eval"})
 _PROMPT_VERSIONS = SUPPORTED_PROMPT_VERSIONS
 _REQUIRED_OUTPUTS = frozenset({"episode_metrics.csv", "metrics_core.json", _REPORT_PATTERN})
 _VLM_BACKENDS = frozenset({"local", "api"})
-_LOCAL_VLM_MODEL_FAMILIES = frozenset({"qwen2_5_vl", "qwen3_vl"})
+_LOCAL_VLM_MODEL_FAMILIES = frozenset({"qwen2_5_vl", "qwen3_vl", "qwen3_5"})
 _ENV_VAR = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 

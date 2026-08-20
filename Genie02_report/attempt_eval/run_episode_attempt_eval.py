@@ -62,8 +62,8 @@ class AttemptEvalConfig:
             raise ValueError("image_keys must contain non-empty strings")
         if len(self.image_keys) > 3:
             raise ValueError("image_keys must contain at most three cameras")
-        if self.model_family not in {"qwen2_5_vl", "qwen3_vl"}:
-            raise ValueError("model_family must be one of: qwen2_5_vl, qwen3_vl")
+        if self.model_family not in {"qwen2_5_vl", "qwen3_vl", "qwen3_5"}:
+            raise ValueError("model_family must be one of: qwen2_5_vl, qwen3_vl, qwen3_5")
         if not isinstance(self.prompt_version, str):
             raise TypeError("prompt_version must be a string")
         if self.prompt_version not in SUPPORTED_PROMPT_VERSIONS:
@@ -422,7 +422,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model_path", required=True, type=Path, help="Local VLM model path.")
     parser.add_argument(
         "--model_family",
-        choices=["qwen2_5_vl", "qwen3_vl"],
+        choices=["qwen2_5_vl", "qwen3_vl", "qwen3_5"],
         default="qwen2_5_vl",
         help="Local VLM checkpoint architecture.",
     )

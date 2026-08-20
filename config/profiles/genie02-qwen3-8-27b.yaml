@@ -1,0 +1,35 @@
+# TEMPLATE ONLY — services read runtime copies from data/profiles (VLA_EVAL_PROFILES_ROOT). Edits here do NOT take effect.
+name: genie02-qwen3-8-27b
+version: 1.0.0
+adapter: genie02
+plugin: genie02-attempt-eval
+image_key: observation.images.right_wrist
+vlm:
+  backend: local
+  # Qwen3.8-27B ships model_type "qwen3_5" (Qwen3.5 architecture foundation);
+  # the strict checkpoint check in vlm_client.py requires this exact value.
+  model_family: qwen3_5
+  model_path: /czj/model/Qwen3.8-27B
+  prompt_version: genie02-attempt-v1
+  sampling:
+    max_global_frames: 16
+    global_sample_interval: 1
+    max_dense_frames: 16
+    dense_sample_interval: 0.5
+    dense_region: full
+  max_image_size: 336
+  max_new_tokens: 256
+review:
+  mode: manual_review
+  confidence_threshold: 0.7
+  min_episode_duration: 3.0
+  min_sampled_frames: 3
+outputs:
+  required:
+    - episode_metrics.csv
+    - metrics_core.json
+    - report_*.md
+  optional:
+    - smoothness_curve.svg
+    - attempt_eval/attempt_summary.json
+    - attempt_eval/attempt_summary.csv
