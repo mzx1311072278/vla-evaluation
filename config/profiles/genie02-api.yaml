@@ -1,3 +1,4 @@
+# TEMPLATE ONLY — services read runtime copies from data/profiles (VLA_EVAL_PROFILES_ROOT). Edits here do NOT take effect.
 # EDIT BEFORE USE.
 #
 # Second VLM interface: instead of loading Qwen2.5-VL locally on a GPU
